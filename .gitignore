@@ -186,3 +186,4 @@ car_racing/runs/
 api/
 car_racing/generate_game_env.py
 checkpoints/
+runs/

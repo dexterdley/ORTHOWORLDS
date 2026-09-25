@@ -26,6 +26,8 @@ import lpips
 from torchvision.models.video import r3d_18, R3D_18_Weights
 from scipy import linalg
 
+from utils import _build_registry
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ==========================================
@@ -169,84 +171,6 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
-def _build_registry():
-    """Return a list of (display_name, factory_fn) tuples.
-    Each factory_fn must return a fully-wrapped env that exposes:
-        env.reset()  -> (obs, info)
-        env.step(a)  -> (obs, reward, term, trunc, info)
-        env.render() -> (im_top_down, im_rear, im_side, im_fpv)  [H x W x 3 uint8]
-        env.action_space.sample()
-        env.close()
-    """
-    registry = []
-
-    def _try(name, factory):
-        registry.append((name, factory))
-    # ------------------------------------------------------------------
-    # Bipedal Walker (wraps gymnasium's BipedalWalker-v3)
-    try:
-        import gymnasium
-        from game_envs.bipedal_orthographic import BipedalOrthographicWrapper
-        _try("Bipedal Walker",
-             lambda: BipedalOrthographicWrapper(
-                 gymnasium.make("BipedalWalker-v3", render_mode="rgb_array")))
-    except Exception as e:
-        print(f"[WARN] Could not register Bipedal Walker: {e}")
-
-    # ------------------------------------------------------------------
-    # Lunar Lander (wraps gymnasium's LunarLander-v3)
-    try:
-        import gymnasium
-        from game_envs.lunar_orthographic import LunarOrthographicWrapper
-        _try("Lunar Lander",
-             lambda: LunarOrthographicWrapper(
-                 gymnasium.make("LunarLander-v3", render_mode="rgb_array")))
-    except Exception as e:
-        print(f"[WARN] Could not register Lunar Lander: {e}")
-        
-    # ------------------------------------------------------------------
-    # Mario Escape
-    try:
-        from game_envs.mario_orthographic import (
-            MarioEscapeEnv, MarioOrthographicWrapper)
-        _try("Mario Escape",
-             lambda: MarioOrthographicWrapper(MarioEscapeEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Mario Escape: {e}")
-
-    # ------------------------------------------------------------------
-    # MultiCar Racing (wraps gymnasium's CarRacing-v3)
-    try:
-        import gymnasium
-        from game_envs.multicar_racing_orthographic import MultiCarOrthographicWrapper
-        _try("MultiCar Racing",
-             lambda: MultiCarOrthographicWrapper(
-                 gymnasium.make("CarRacing-v3", render_mode="rgb_array")))
-    except Exception as e:
-        print(f"[WARN] Could not register MultiCar Racing: {e}")
-
-    # ------------------------------------------------------------------
-    # Drone Dogfight
-    try:
-        from game_envs.drone_dogfight_orthographic import (
-            DroneDogfightEnv, DroneDogfightOrthographicWrapper)
-        _try("Drone Dogfight",
-             lambda: DroneDogfightOrthographicWrapper(DroneDogfightEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Drone Dogfight: {e}")
-
-    # ------------------------------------------------------------------
-    # Excavator
-    try:
-        from game_envs.excavator_orthographic import (
-            ExcavatorEnv, ExcavatorOrthographicWrapper)
-        _try("Excavator",
-             lambda: ExcavatorOrthographicWrapper(ExcavatorEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Excavator: {e}")
-        
-    return registry
 
 class TransitionSequenceBuffer:
     def __init__(self, capacity, img_h, img_w, action_len):
