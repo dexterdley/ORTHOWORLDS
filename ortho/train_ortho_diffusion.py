@@ -26,7 +26,7 @@ import lpips
 from torchvision.models.video import r3d_18, R3D_18_Weights
 from scipy import linalg
 
-from utils import _build_registry
+from utils import _build_registry, set_seed
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -159,18 +159,6 @@ def compute_fvd(real_videos: torch.Tensor, fake_videos: torch.Tensor) -> float:
     sigma_f += np.eye(sigma_f.shape[0]) * eps
 
     return _frechet_distance(mu_r, sigma_r, mu_f, sigma_f)
-
-
-def set_seed(seed):
-    """Set random seed for reproducibility across random, numpy, PyTorch, and CUDA."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
 class TransitionSequenceBuffer:
     def __init__(self, capacity, img_h, img_w, action_len):
