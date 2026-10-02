@@ -283,7 +283,7 @@ class TransitionSequenceBuffer:
 
 def collect_rollouts(env, agent, buffer, n_steps, seed):
     obs, _ = env.reset(seed=seed)
-    state = torch.tensor(obs, dtype=torch.float32, device=device)
+    state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
 
     for _ in tqdm(range(n_steps)):
 
@@ -321,6 +321,7 @@ def collect_rollouts(env, agent, buffer, n_steps, seed):
         
         if done:
             obs, _ = env.reset()
+        state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
 
     env.close()
 

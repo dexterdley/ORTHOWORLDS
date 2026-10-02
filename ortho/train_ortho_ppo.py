@@ -1,5 +1,4 @@
 # Standard library imports
-from diffusers.pipelines.deprecated.spectrogram_diffusion import pipeline_spectrogram_diffusion
 import math
 import random
 import os
@@ -21,132 +20,11 @@ from torch.utils.checkpoint import checkpoint as ckpt_fn
 from IPython.display import display, clear_output
 from tqdm import tqdm
 from PIL import Image
-
-def _build_registry():
-    """Return a list of (display_name, factory_fn) tuples.
-    Each factory_fn must return a fully-wrapped env that exposes:
-        env.reset()  -> (obs, info)
-        env.step(a)  -> (obs, reward, term, trunc, info)
-        env.render() -> (im_top_down, im_rear, im_side, im_fpv)  [H x W x 3 uint8]
-        env.action_space.sample()
-        env.close()
-    """
-    registry = []
-
-    def _try(name, factory):
-        registry.append((name, factory))
-    # ------------------------------------------------------------------
-    # Bipedal Walker (wraps gymnasium's BipedalWalker-v3)
-    try:
-        import gymnasium
-        from game_envs.bipedal_orthographic import BipedalOrthographicWrapper
-        _try("Bipedal Walker",
-             lambda: BipedalOrthographicWrapper(
-                 gymnasium.make("BipedalWalker-v3", render_mode="rgb_array")))
-    except Exception as e:
-        print(f"[WARN] Could not register Bipedal Walker: {e}")
-
-    # ------------------------------------------------------------------
-    # Lunar Lander (wraps gymnasium's LunarLander-v3)
-    try:
-        import gymnasium
-        from game_envs.lunar_orthographic import LunarOrthographicWrapper
-        _try("Lunar Lander",
-             lambda: LunarOrthographicWrapper(
-                 gymnasium.make("LunarLander-v3", render_mode="rgb_array")))
-    except Exception as e:
-        print(f"[WARN] Could not register Lunar Lander: {e}")
-        
-    # ------------------------------------------------------------------
-    # Mario Escape
-    try:
-        from game_envs.mario_orthographic import (
-            MarioEscapeEnv, MarioOrthographicWrapper)
-        _try("Mario Escape",
-             lambda: MarioOrthographicWrapper(MarioEscapeEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Mario Escape: {e}")
-
-    # ------------------------------------------------------------------
-    # MultiCar Racing (wraps gymnasium's CarRacing-v3)
-    try:
-        import gymnasium
-        from game_envs.multicar_racing_orthographic import MultiCarOrthographicWrapper
-        _try("MultiCar Racing",
-             lambda: MultiCarOrthographicWrapper(
-                 gymnasium.make("CarRacing-v3", render_mode="rgb_array")))
-    except Exception as e:
-        print(f"[WARN] Could not register MultiCar Racing: {e}")
-
-    # ------------------------------------------------------------------
-    # Drone Dogfight
-    try:
-        from game_envs.drone_dogfight_orthographic import (
-            DroneDogfightEnv, DroneDogfightOrthographicWrapper)
-        _try("Drone Dogfight",
-             lambda: DroneDogfightOrthographicWrapper(DroneDogfightEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Drone Dogfight: {e}")
-
-    # ------------------------------------------------------------------
-    # Excavator
-    try:
-        from game_envs.excavator_orthographic import (
-            ExcavatorEnv, ExcavatorOrthographicWrapper)
-        _try("Excavator",
-             lambda: ExcavatorOrthographicWrapper(ExcavatorEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Excavator: {e}")
-        
-    return registry
+from utils import _build_registry, ActorCritic
 
 # ------------------------------------------------------------------
 # PPO (Proximal Policy Optimization) Implementation
 # ------------------------------------------------------------------
-
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_space, hidden_dim=256):
-        super().__init__()
-        self.is_discrete = hasattr(action_space, 'n')
-        
-        # Shared feature extractor
-        self.feature_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()
-        )
-        
-        # Value head (Critic)
-        self.value_head = nn.Linear(hidden_dim, 1)
-        
-        # Policy head (Actor)
-        if self.is_discrete:
-            self.action_dim = action_space.n
-            self.actor_head = nn.Linear(hidden_dim, self.action_dim)
-        else:
-            self.action_dim = action_space.shape[0]
-            self.actor_mean = nn.Linear(hidden_dim, self.action_dim)
-            self.actor_log_std = nn.Parameter(torch.zeros(1, self.action_dim))
-
-    def forward(self, state):
-        features = self.feature_net(state)
-        value = self.value_head(features)
-        
-        if self.is_discrete:
-            logits = self.actor_head(features)
-            dist = torch.distributions.Categorical(logits=logits)
-        else:
-            mean = torch.tanh(self.actor_mean(features))
-            std = torch.exp(self.actor_log_std.expand_as(mean))
-            dist = torch.distributions.Normal(mean, std)
-            
-        return dist, value
-
-    def get_value(self, state):
-        features = self.feature_net(state)
-        return self.value_head(features)
-
 
 class PPOBuffer:
     def __init__(self, size, state_dim, action_dim, is_discrete=False, gamma=0.99, gae_lambda=0.95):

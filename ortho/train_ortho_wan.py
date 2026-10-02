@@ -23,75 +23,20 @@ from tqdm import tqdm
 import numpy as np
 import cv2
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from torchvision.utils import make_grid, save_image
 
 # HuggingFace & Diffusers imports
-from diffusers.utils import export_to_video
-from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed
+from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent
+from buffer import OrthoTransitionBuffer
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_space, hidden_dim=256):
-        super().__init__()
-        self.is_discrete = hasattr(action_space, 'n')
-        
-        # Shared feature extractor
-        self.feature_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()
-        )
-        
-        # Value head (Critic)
-        self.value_head = nn.Linear(hidden_dim, 1)
-        
-        # Policy head (Actor)
-        if self.is_discrete:
-            self.action_dim = action_space.n
-            self.actor_head = nn.Linear(hidden_dim, self.action_dim)
-        else:
-            self.action_dim = action_space.shape[0]
-            self.actor_mean = nn.Linear(hidden_dim, self.action_dim)
-            self.actor_log_std = nn.Parameter(torch.zeros(1, self.action_dim))
-
-    def forward(self, state):
-        features = self.feature_net(state)
-        value = self.value_head(features)
-        
-        if self.is_discrete:
-            logits = self.actor_head(features)
-            dist = torch.distributions.Categorical(logits=logits)
-        else:
-            mean = torch.tanh(self.actor_mean(features))
-            std = torch.exp(self.actor_log_std.expand_as(mean))
-            dist = torch.distributions.Normal(mean, std)
-            
-        return dist, value
-
-    def get_value(self, state):
-        features = self.feature_net(state)
-        return self.value_head(features)
-
-def load_agent(ckpt_path, state_dim, action_space, device):
-    """Instantiate ActorCritic and load state dict from checkpoint."""
-    ac = ActorCritic(state_dim, action_space).to(device)
-    if os.path.exists(ckpt_path):
-        ac.load_state_dict(torch.load(ckpt_path, map_location=device))
-        print((f"  [LOADED] PPO Agent weights from {ckpt_path}"))
-    else:
-        print((f"  [WARN] PPO Agent Checkpoint '{ckpt_path}' not found!"))
-    ac.eval()
-    return ac
 
 # ==========================================
-# WAN 2.1 VAE LATENT NORMALIZATION HELPERS
+# WAN 2.1 HELPERS
 # ==========================================
 def _get_wan_latent_stats(vae, target_device, target_dtype):
     """Retrieves per-channel mean and std from AutoencoderKLWan config."""
@@ -152,7 +97,6 @@ def train_ortho_flow_step(
     prompt_embeds,
     shift=3.0,
     ctx_noise_max=0.15,
-    return_pred_x0=False,
 ):
     """
     Single transition Flow-Matching step (used inside multi-step trajectory rollout).
@@ -170,12 +114,9 @@ def train_ortho_flow_step(
 
     # 2. Context noise augmentation on conditioning views `latents_t`
     latents_t_fp32 = latents_t.float()
-    if ctx_noise_max > 0.0:
-        tau_ctx = torch.rand((b, 1, 1, 1, 1), device=latents_t.device, dtype=torch.float32) * ctx_noise_max
-        ctx_noise = torch.randn_like(latents_t_fp32)
-        cond_latents_t = ((1.0 - tau_ctx) * latents_t_fp32 + tau_ctx * ctx_noise).to(dtype=transformer.dtype)
-    else:
-        cond_latents_t = latents_t.to(dtype=transformer.dtype)
+    tau_ctx = torch.rand((b, 1, 1, 1, 1), device=latents_t.device, dtype=torch.float32) * ctx_noise_max
+    ctx_noise = torch.randn_like(latents_t_fp32)
+    cond_latents_t = ((1.0 - tau_ctx) * latents_t_fp32 + tau_ctx * ctx_noise).to(dtype=transformer.dtype)
 
     # 3. Noise all 4 target views at t+1 simultaneously
     latents_next_fp32 = latents_next.float()
@@ -206,17 +147,13 @@ def train_ortho_flow_step(
     ]
     loss = sum(per_view_losses) / float(num_views)
 
-    if return_pred_x0:
-        # Reconstruct 1-step denoised prediction: x_0_hat = x_tau - tau * v_pred
-        with torch.no_grad():
-            pred_x0 = (noisy_latents_next_fp32 - tau_exp * pred_velocity.detach()).clamp(-6.0, 6.0)
-            # Weight confidence by (1 - tau) so highly noisy steps blend smoothly with GT
-            confidence = (1.0 - tau_exp).clamp(0.2, 1.0)
-            rollout_latent = (confidence * pred_x0 + (1.0 - confidence) * latents_next_fp32).to(dtype=transformer.dtype)
-        return loss, [l.item() for l in per_view_losses], rollout_latent
-
-    return loss, [l.item() for l in per_view_losses]
-
+    # Reconstruct 1-step denoised prediction: x_0_hat = x_tau - tau * v_pred
+    with torch.no_grad():
+        pred_x0 = (noisy_latents_next_fp32 - tau_exp * pred_velocity.detach()).clamp(-6.0, 6.0)
+        # Weight confidence by (1 - tau) so highly noisy steps blend smoothly with GT
+        confidence = (1.0 - tau_exp).clamp(0.2, 1.0)
+        rollout_latent = (confidence * pred_x0 + (1.0 - confidence) * latents_next_fp32).to(dtype=transformer.dtype)
+    return loss, [l.item() for l in per_view_losses], rollout_latent
 
 def train_ortho_trajectory_step(
     transformer,
@@ -224,13 +161,13 @@ def train_ortho_trajectory_step(
     latents_next_seq,
     prompt_embeds_seq,
     shift=3.0,
-    ar_prob=0.5,
+    teacher_forcing_prob=0.5,
     ctx_noise_max=0.15,
 ):
     """
     Unrolls a multi-step trajectory of length `seq_len` during training.
     - At step s=0, conditions on ground-truth `latents_t0`.
-    - At step s>0, with probability `ar_prob`, conditions on the model's own predicted
+    - At step s>0, with probability `teacher_forcing_prob`, conditions on the model's own predicted
       latent from step s-1 (student forcing) so the model learns to recover from its
       own rollout errors over multi-step horizons.
     - Backpropagates `(loss_s / seq_len)` at each step so peak VRAM remains constant.
@@ -239,7 +176,7 @@ def train_ortho_trajectory_step(
     num_views = latents_t0.shape[2]
 
     curr_latents = latents_t0
-    total_loss_val = 0.0
+    total_loss = 0.0
     avg_per_view = [0.0] * num_views
 
     for s in range(seq_len):
@@ -255,44 +192,41 @@ def train_ortho_trajectory_step(
                 prompt_embeds=prompt_embeds,
                 shift=shift,
                 ctx_noise_max=ctx_noise_max,
-                return_pred_x0=True,
             )
         else:
-            step_loss, step_view_losses = train_ortho_flow_step(
+            step_loss, step_view_losses, _ = train_ortho_flow_step(
                 transformer=transformer,
                 latents_t=curr_latents,
                 latents_next=target_latents,
                 prompt_embeds=prompt_embeds,
                 shift=shift,
                 ctx_noise_max=ctx_noise_max,
-                return_pred_x0=False,
             )
 
         # Normalize loss across trajectory length and backpropagate immediately to save VRAM
         scaled_loss = step_loss / float(seq_len)
         scaled_loss.backward()
 
-        total_loss_val += step_loss.item() / float(seq_len)
+        total_loss += step_loss.item() / float(seq_len)
         for v_idx in range(num_views):
             avg_per_view[v_idx] += step_view_losses[v_idx] / float(seq_len)
 
         # Prepare context for step s + 1 (Student Forcing vs. Teacher Forcing per sample)
         if not is_last_step:
-            if ar_prob > 0.0:
+            if teacher_forcing_prob > 0.0:
                 b = curr_latents.shape[0]
-                use_ar_mask = (torch.rand((b, 1, 1, 1, 1), device=curr_latents.device) < ar_prob).to(dtype=transformer.dtype)
+                use_ar_mask = (torch.rand((b, 1, 1, 1, 1), device=curr_latents.device) < teacher_forcing_prob).to(dtype=transformer.dtype)
                 curr_latents = use_ar_mask * pred_next_latents + (1.0 - use_ar_mask) * target_latents
             else:
                 curr_latents = target_latents
 
-    return total_loss_val, avg_per_view
-
+    return total_loss, avg_per_view
 
 # ==========================================
 # AUTOREGRESSIVE VIDEO ROLLOUT & SAMPLING
 # ==========================================
 @torch.no_grad()
-def sample_next_views_latents(transformer, latents_t, prompt_embeds, steps=20, shift=3.0):
+def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, shift=3.0):
     """
     Simultaneously denoises all 4 orthographic views at t+1 via reverse Euler Flow Matching.
     Input:
@@ -326,8 +260,6 @@ def sample_next_views_latents(transformer, latents_t, prompt_embeds, steps=20, s
 
         x_tau = x_tau - dt * pred_velocity
 
-    # Clamp extreme latent outliers before feeding into next autoregressive step
-    x_tau = x_tau.clamp(-6.0, 6.0)
     return x_tau.to(dtype=transformer.dtype)
 
 
@@ -365,7 +297,7 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
         ).to(device)
         prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
 
-        next_latents = sample_next_views_latents(
+        next_latents = predict_next_view_latents(
             transformer=transformer,
             latents_t=curr_latents,
             prompt_embeds=prompt_embeds,
@@ -414,14 +346,10 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
     transformer.eval()
 
     if env_names is None:
-        unique_envs = list(dict.fromkeys([e for e in buffer.env_names[:buffer.size] if e is not None]))
-    elif isinstance(env_names, str):
-        unique_envs = [env_names]
+        envs = (e for e in buffer.env_names[:buffer.size] if e is not None)
+        unique_envs = list(dict.fromkeys(envs))
     else:
-        unique_envs = list(env_names)
-
-    if not unique_envs:
-        unique_envs = ["Bipedal Walker"]
+        unique_envs = [env_names] if isinstance(env_names, str) else list(env_names)
 
     print(f"\n[VALIDATION] Running autoregressive video rollouts for epoch {epoch} across envs: {', '.join(unique_envs[:2])}...")
 
@@ -459,186 +387,19 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
         print(f"  [Epoch {epoch}] [{env_name}] Autoregressive Video PSNR: {psnr_mean:.2f} dB "
               f"(Top-Down: {psnr_top_down:.2f}dB, Rear: {psnr_rear:.2f}dB, Side: {psnr_side:.2f}dB, FPV: {psnr_fpv:.2f}dB)")
 
-        if env_idx == 0:
-            writer.add_video("Test/Top-Down", vid_top_down_01, epoch, fps=fps)
-            writer.add_video("Test/Rear",     vid_rear_01,     epoch, fps=fps)
-            writer.add_video("Test/Side",     vid_side_01,     epoch, fps=fps)
-            writer.add_video("Test/FPV",      vid_fpv_01,      epoch, fps=fps)
-
-        if len(unique_envs) > 1:
-            writer.add_video(f"Test/{clean_tag}/Top-Down", vid_top_down_01, epoch, fps=fps)
-            writer.add_video(f"Test/{clean_tag}/Rear",     vid_rear_01,     epoch, fps=fps)
-            writer.add_video(f"Test/{clean_tag}/Side",     vid_side_01,     epoch, fps=fps)
-            writer.add_video(f"Test/{clean_tag}/FPV",      vid_fpv_01,      epoch, fps=fps)
+        # Always write per-env tagged videos; also alias as generic Test/ for the first env
+        writer.add_video(f"Test/{clean_tag}/Top-Down", vid_top_down_01, epoch, fps=fps)
+        writer.add_video(f"Test/{clean_tag}/Rear",     vid_rear_01,     epoch, fps=fps)
+        writer.add_video(f"Test/{clean_tag}/Side",     vid_side_01,     epoch, fps=fps)
+        writer.add_video(f"Test/{clean_tag}/FPV",      vid_fpv_01,      epoch, fps=fps)
 
     transformer.train()
-
-
-# ==========================================
-# MULTI-VIEW TRANSITION REPLAY BUFFER
-# ==========================================
-class OrthoTransitionBuffer:
-    """Stores paired orthographic views (t and t+1) with actions across multiple environments."""
-    def __init__(self, capacity=4000, img_h=128, img_w=128, max_action_len=8, env_name="Bipedal Walker"):
-        self.capacity = capacity
-        self.img_h = img_h
-        self.img_w = img_w
-        self.max_action_len = max_action_len
-        self.default_env_name = env_name
-        self.ptr = 0
-        self.size = 0
-
-        # 4 Views at time t (top, side, rear, fpv/3D)
-        self.views_t = np.zeros((capacity, 4, 3, img_h, img_w), dtype=np.uint8)
-        # 4 Views at time t+1
-        self.views_next = np.zeros((capacity, 4, 3, img_h, img_w), dtype=np.uint8)
-        # Actions & Dones
-        self.actions = np.zeros((capacity, max_action_len), dtype=np.float32)
-        self.action_lens = np.zeros(capacity, dtype=np.int32)
-        self.dones = np.zeros(capacity, dtype=bool)
-        # Environment name per transition
-        self.env_names = [None] * capacity
-
-    def _resize(self, img):
-        if img.shape[0] != self.img_h or img.shape[1] != self.img_w:
-            return cv2.resize(img, (self.img_w, self.img_h), interpolation=cv2.INTER_AREA)
-        return img
-
-    def push(self, top_t, side_t, rear_t, fpv_t,
-             top_next, side_next, rear_next, fpv_next,
-             action, done, env_name=None):
-
-        vt = [self._resize(x) for x in [top_t, side_t, rear_t, fpv_t]]
-        vn = [self._resize(x) for x in [top_next, side_next, rear_next, fpv_next]]
-
-        # Convert HWC uint8 -> CHW uint8
-        self.views_t[self.ptr] = np.stack([np.transpose(v, (2, 0, 1)) for v in vt])
-        self.views_next[self.ptr] = np.stack([np.transpose(v, (2, 0, 1)) for v in vn])
-
-        # Safely assign action vector or scalar
-        act_arr = np.array(action, dtype=np.float32)
-        if act_arr.ndim == 0:
-            self.actions[self.ptr, :] = 0.0
-            self.actions[self.ptr, 0] = float(act_arr)
-            self.action_lens[self.ptr] = 1
-        else:
-            length = min(len(act_arr), self.max_action_len)
-            self.actions[self.ptr, :] = 0.0
-            self.actions[self.ptr, :length] = act_arr[:length]
-            self.action_lens[self.ptr] = length
-
-        self.dones[self.ptr] = done
-        self.env_names[self.ptr] = env_name or self.default_env_name
-
-        self.ptr = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
-    def _get_valid_trajectory_starts(self, seq_len, env_filter=None):
-        """Finds all start indices `i` with `seq_len` contiguous steps in the same episode."""
-        valid_starts = []
-        limit = self.size - seq_len + 1
-        for i in range(max(0, limit)):
-            # Do not cross the circular buffer write pointer if buffer has wrapped
-            if self.size == self.capacity and (i < self.ptr < i + seq_len):
-                continue
-            target_env = env_filter or self.env_names[i]
-            if self.env_names[i] != target_env:
-                continue
-            # Ensure all steps belong to the same env and don't reset before the final step
-            valid = True
-            for k in range(seq_len - 1):
-                if self.env_names[i + k + 1] != target_env or self.dones[i + k]:
-                    valid = False
-                    break
-            if valid:
-                valid_starts.append(i)
-        return valid_starts
-
-    def sample_batch(self, batch_size, target_device=device, env_filter=None):
-        if env_filter is not None:
-            valid_idxs = [i for i in range(self.size) if self.env_names[i] == env_filter]
-            if not valid_idxs:
-                valid_idxs = list(range(self.size))
-            idxs = np.random.choice(valid_idxs, size=batch_size)
-        else:
-            idxs = np.random.randint(0, self.size, size=batch_size)
-
-        vt = torch.from_numpy(self.views_t[idxs]).float().to(target_device) / 127.5 - 1.0
-        vn = torch.from_numpy(self.views_next[idxs]).float().to(target_device) / 127.5 - 1.0
-
-        acts = [
-            torch.from_numpy(self.actions[i, :self.action_lens[i]]).float().to(target_device)
-            for i in idxs
-        ]
-        sample_envs = [self.env_names[i] for i in idxs]
-
-        return vt, vn, acts, sample_envs
-
-    def sample_trajectory_batch(self, batch_size, seq_len=4, target_device=device, env_filter=None):
-        """
-        Samples a batch of contiguous multi-step trajectories of length `seq_len`.
-        Returns:
-          vt_0:     (B, 4, 3, H, W) initial views at step 0 in [-1, 1]
-          vn_seq:   list of `seq_len` tensors, each (B, 4, 3, H, W) in [-1, 1]
-          acts_seq: list of `seq_len` action lists (each of length B)
-          envs_seq: list of `seq_len` env_name lists (each of length B)
-        """
-        valid_starts = self._get_valid_trajectory_starts(seq_len, env_filter=env_filter)
-        if not valid_starts:
-            max_start = max(1, self.size - seq_len)
-            start_idxs = np.random.randint(0, max_start, size=batch_size)
-        else:
-            start_idxs = np.random.choice(valid_starts, size=batch_size)
-
-        vt_0 = torch.from_numpy(self.views_t[start_idxs]).float().to(target_device) / 127.5 - 1.0
-
-        vn_seq = []
-        acts_seq = []
-        envs_seq = []
-
-        for s in range(seq_len):
-            step_idxs = np.minimum(start_idxs + s, self.size - 1)
-            vn_s = torch.from_numpy(self.views_next[step_idxs]).float().to(target_device) / 127.5 - 1.0
-            acts_s = [
-                torch.from_numpy(self.actions[idx, :self.action_lens[idx]]).float().to(target_device)
-                for idx in step_idxs
-            ]
-            envs_s = [self.env_names[idx] for idx in step_idxs]
-
-            vn_seq.append(vn_s)
-            acts_seq.append(acts_s)
-            envs_seq.append(envs_s)
-        return vt_0, vn_seq, acts_seq, envs_seq
-
-    def sample_sequence(self, seq_len=16, env_filter=None):
-        """Samples a contiguous sequence of transitions without crossing episode resets."""
-        candidates = self._get_valid_trajectory_starts(seq_len, env_filter=env_filter)
-
-        if not candidates:
-            for i in range(max(0, self.size - seq_len)):
-                if env_filter is None or self.env_names[i] == env_filter:
-                    candidates.append(i)
-
-        if not candidates:
-            start_idx = random.randint(0, max(0, self.size - seq_len)) if self.size > seq_len else 0
-        else:
-            start_idx = random.choice(candidates)
-
-        actual_len = min(seq_len, max(1, self.size - start_idx)) if self.size > 0 else 0
-        idxs = list(range(start_idx, start_idx + actual_len))
-        vt_seq = self.views_t[idxs]
-        vn_seq = self.views_next[idxs]
-        act_seq = [self.actions[i, :self.action_lens[i]] for i in idxs]
-        env_seq = [self.env_names[i] for i in idxs]
-
-        return vt_seq, vn_seq, act_seq, env_seq
-
 
 def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker"):
     """Collects multi-camera rollouts from a gym environment into buffer."""
     print(f"Collecting {n_steps} rollout steps from '{env_name}'...")
     obs, _ = env.reset(seed=seed)
-    state = torch.tensor(obs, dtype=torch.float32, device=device)
+    state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
 
     collected = 0
     for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
@@ -666,12 +427,13 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
         )
         collected += 1
         if done:
-                obs, _ = env.reset()
+            obs, _ = env.reset()
         else:
             obs = next_obs
+        state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
     env.close()
 
-def collect_all_envs_rollouts(registry, buffer, steps_per_env=150):
+def collect_all_envs_rollouts(registry, buffer, rollout_steps=150):
     """Loops through all registered environments and populates the multi-env buffer."""
     print("=" * 60)
     print(f"Collecting rollouts across all {len(registry)} environments...")
@@ -681,7 +443,15 @@ def collect_all_envs_rollouts(registry, buffer, steps_per_env=150):
     for idx, (name, factory) in enumerate(registry):
         print(f"\n[{idx + 1}/{len(registry)}] Initializing environment: {name}")
         env = factory()
-        collect_rollouts(env, buffer, n_steps=steps_per_env, env_name=name)
+
+        obs, info = env.reset()
+        state_dim = int(np.prod(obs.shape if hasattr(obs, 'shape') else env.observation_space.shape))
+        clean_name = "".join(c for c in name if c.isalnum() or c in ('_', '-')).lower()
+        ckpt_path = os.path.join("checkpoints", f"ppo_{clean_name}.pt")
+        
+        print(f"Loading PPO agent from: {ckpt_path}")
+        agent = load_agent(ckpt_path, state_dim, env.action_space, device)
+        collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=name)
         active_envs.append((name, env))
 
     unique_recorded = list(dict.fromkeys([e for e in buffer.env_names[:buffer.size] if e is not None]))
@@ -696,7 +466,7 @@ def main(args):
     set_seed(args.seed)
     print("=" * 60)
     print("  Wan2.1 Orthographic Multi-View World Model (LoRA)")
-    print(f"  Multi-Step Trajectory Training (seq_len={args.train_seq_len}, ar_prob={args.ar_prob})")
+    print(f"  Multi-Step Trajectory Training (seq_len={args.train_seq_len}, teacher_forcing_prob={args.teacher_forcing_prob})")
     print("=" * 60)
 
     # 1. Environments & Replay Buffer
@@ -709,7 +479,7 @@ def main(args):
     active_envs = []
     if args.env.lower() == "all":
         active_envs = collect_all_envs_rollouts(
-            registry, buffer, steps_per_env=args.steps_per_env
+            registry, buffer, rollout_steps=args.rollout_steps
         )
     else:
         matched_name = next((k for k in reg_dict if k.lower() == args.env.lower()), None)
@@ -759,36 +529,32 @@ def main(args):
         epoch_loss = 0.0
         # Ramp up autoregressive student-forcing probability across epochs
         progress = epoch / max(1, args.epochs - 1)
-        curr_ar_prob = args.ar_prob * min(1.0, progress * 1.5)
+        curr_teacher_forcing_prob = args.teacher_forcing_prob * min(1.0, progress * 1.5)
 
-        pbar = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch+1}/{args.epochs} (AR={curr_ar_prob:.2f})")
+        pbar = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch+1}/{args.epochs} (Teacher Prob.={curr_teacher_forcing_prob:.2f})")
 
         for _ in pbar:
             # Sample batch of contiguous trajectories of length `args.train_seq_len`
-            vt_0, vn_seq, acts_seq, envs_seq = buffer.sample_trajectory_batch(
+            # views_t:       (B, 4, 3, H, W) — anchor frame at t=0
+            # views_next_seq: list[T] of (B, 4, 3, H, W) — target frames t=1..T
+            views_t, views_next_seq, actions_seq, env_names_seq = buffer.sample_trajectory_batch(
                 batch_size=args.batch_size,
                 seq_len=args.train_seq_len,
             )
 
-            ### TBD ###
-            '''
-            WHEN COMEBACK CHECK TRAINING STEP, BUFFER AND SAMPLE SEEMS OK
-            ALSO NEED TO TRAIN OUT ALL PPO AGENTS
-            '''
-
             with torch.no_grad():
-                # Encode initial conditioning views at t=0
-                latents_t0 = encode_views_to_latents(vae, vt_0, out_dtype=model.dtype)
+                # Encode views at t=0
+                latents_t = encode_views_to_latents(vae, views_t, out_dtype=model.dtype)
 
                 # Encode target views and text prompts for each step along the trajectory
                 latents_next_seq = []
                 prompt_embeds_seq = []
 
                 for s in range(args.train_seq_len):
-                    lat_s = encode_views_to_latents(vae, vn_seq[s], out_dtype=model.dtype)
-                    latents_next_seq.append(lat_s)
+                    latents_s = encode_views_to_latents(vae, views_next_seq[s], out_dtype=model.dtype)
+                    latents_next_seq.append(latents_s)
 
-                    prompts_s = compose_player_prompts(acts_seq[s], env_name=envs_seq[s])
+                    prompts_s = compose_player_prompts(actions_seq[s], env_name=env_names_seq[s])
                     text_inputs = tokenizer(
                         prompts_s, padding="max_length", max_length=64, truncation=True, return_tensors="pt"
                     ).to(device)
@@ -798,12 +564,12 @@ def main(args):
             optimizer.zero_grad(set_to_none=True)
 
             # Unroll multi-step trajectory with student forcing & context noise
-            loss_val, per_view_losses = train_ortho_trajectory_step(
+            loss, per_view_losses = train_ortho_trajectory_step(
                 transformer=model,
-                latents_t0=latents_t0,
+                latents_t0=latents_t,
                 latents_next_seq=latents_next_seq,
                 prompt_embeds_seq=prompt_embeds_seq,
-                ar_prob=curr_ar_prob,
+                teacher_forcing_prob=curr_teacher_forcing_prob,
                 ctx_noise_max=args.ctx_noise_max,
             )
 
@@ -811,18 +577,18 @@ def main(args):
             optimizer.step()
             scheduler.step()
 
-            epoch_loss += loss_val
+            epoch_loss += loss
             global_step += 1
 
-            writer.add_scalar("Train/Loss", loss_val, global_step)
+            writer.add_scalar("Train/Loss", loss, global_step)
             writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
-            writer.add_scalar("Train/AR_Prob", curr_ar_prob, global_step)
+            writer.add_scalar("Train/Teacher_Student_Prob", curr_teacher_forcing_prob, global_step)
             for v_idx, v_name in enumerate(view_names):
                 writer.add_scalar(f"Train/Loss_{v_name}", per_view_losses[v_idx], global_step)
 
-            env_summary = "+".join(list(dict.fromkeys(envs_seq[0]))[:2])
+            env_summary = "+".join(list(dict.fromkeys(env_names_seq[0]))[:2])
             pbar.set_postfix({
-                "Loss": f"{loss_val:.4f}",
+                "Loss": f"{loss:.4f}",
                 "Top": f"{per_view_losses[0]:.3f}",
                 "FPV": f"{per_view_losses[3]:.3f}",
                 "Envs": env_summary,
@@ -863,18 +629,16 @@ def main(args):
         except Exception:
             pass
 
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Orthographic Game Views")
     parser.add_argument("--env", type=str, default="all", help="Environment to train on: 'all' to train across all envs, or a specific name like 'Bipedal Walker'")
-    parser.add_argument("--steps_per_env", type=int, default=1000, help="Rollout steps to collect per environment when env='all'")
     parser.add_argument("--rollout_steps", type=int, default=2048, help="Rollout steps when training on a single environment")
     parser.add_argument("--buffer_capacity", type=int, default=40000, help="Capacity of multi-environment transition buffer")
     parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", help="HuggingFace model ID")
     parser.add_argument("--lora_rank", type=int, default=32, help="LoRA rank dimension")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per gradient step")
     parser.add_argument("--train_seq_len", type=int, default=16, help="Contiguous trajectory steps unrolled per training update")
-    parser.add_argument("--ar_prob", type=float, default=0.5, help="Max probability of feeding self-predicted latents into next trajectory step")
+    parser.add_argument("--teacher_forcing_prob", type=float, default=1.0, help="Max prob of using self-predicted latents onto next trajectory step")
     parser.add_argument("--ctx_noise_max", type=float, default=0.15, help="Max Gaussian noise added to conditioning context latents to prevent drift")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--steps_per_epoch", type=int, default=200, help="Training steps per epoch")
@@ -886,7 +650,6 @@ def parse_args():
     parser.add_argument("--video_fps", type=int, default=15, help="FPS for TensorBoard video logging")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     return parser.parse_args()
-
 
 if __name__ == "__main__":
     args = parse_args()

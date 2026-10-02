@@ -1,6 +1,8 @@
+import os
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 from diffusers import WanPipeline
 from peft import LoraConfig, get_peft_model
 
@@ -159,6 +161,59 @@ def _build_registry():
         
     return registry
 
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim, action_space, hidden_dim=256):
+        super().__init__()
+        self.is_discrete = hasattr(action_space, 'n')
+        
+        # Shared feature extractor
+        self.feature_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh()
+        )
+        
+        # Value head (Critic)
+        self.value_head = nn.Linear(hidden_dim, 1)
+        
+        # Policy head (Actor)
+        if self.is_discrete:
+            self.action_dim = action_space.n
+            self.actor_head = nn.Linear(hidden_dim, self.action_dim)
+        else:
+            self.action_dim = action_space.shape[0]
+            self.actor_mean = nn.Linear(hidden_dim, self.action_dim)
+            self.actor_log_std = nn.Parameter(torch.zeros(1, self.action_dim))
+
+    def forward(self, state):
+        features = self.feature_net(state)
+        value = self.value_head(features)
+        
+        if self.is_discrete:
+            logits = self.actor_head(features)
+            dist = torch.distributions.Categorical(logits=logits)
+        else:
+            mean = torch.tanh(self.actor_mean(features))
+            std = torch.exp(self.actor_log_std.expand_as(mean))
+            dist = torch.distributions.Normal(mean, std)
+            
+        return dist, value
+
+    def get_value(self, state):
+        features = self.feature_net(state)
+        return self.value_head(features)
+
+def load_agent(ckpt_path, state_dim, action_space, device):
+    """Instantiate ActorCritic and load state dict from checkpoint."""
+    ac = ActorCritic(state_dim, action_space).to(device)
+    if os.path.exists(ckpt_path):
+        ac.load_state_dict(torch.load(ckpt_path, map_location=device))
+        print((f"  [LOADED] PPO Agent weights from {ckpt_path}"))
+    else:
+        print((f"  [WARN] PPO Agent Checkpoint '{ckpt_path}' not found!"))
+    ac.eval()
+    return ac
 
 # ==========================================
 # PER-ENVIRONMENT PROMPT COMPOSER

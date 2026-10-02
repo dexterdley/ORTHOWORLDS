@@ -26,7 +26,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from api.fuxi_api import FuxiAPI
+from api.leihuo_api import LeihuoAPI
 
 DESCRIPTIONS_FILE = os.path.join(HERE, "game_envs", "game_envs_descriptions.md")
 
@@ -154,7 +154,7 @@ def extract_python_code(text):
     return text.strip()
 
 
-async def generate_env_for_game(game_info, model_name="claude-opus-4-6"):
+async def generate_env_for_game(game_info):
     name = game_info["name"]
     clean_name = re.sub(r'[^\w\s]', '', name)
     snake_name = "_".join(w.lower() for w in clean_name.split())
@@ -162,12 +162,11 @@ async def generate_env_for_game(game_info, model_name="claude-opus-4-6"):
     out_path = os.path.join(HERE, "game_envs", out_filename)
 
     print(f"\n🚀 Generating environment for: \033[1;96m{name}\033[0m")
-    print(f"   Model: {model_name}")
     print(f"   Output: game_envs/{out_filename}")
-    print("   Sending request to FuxiAPI...")
+    print("   Sending request to LeihuoAPI...")
 
     prompt = build_system_prompt(game_info)
-    api = FuxiAPI(model_name=model_name)
+    api = LeihuoAPI()
 
     code_raw = await api.get_response(prompt)
     await api.close()
@@ -214,7 +213,6 @@ def main():
     parser = argparse.ArgumentParser(description="Generate new game environments via FuxiAPI.")
     parser.add_argument("--game", type=str, help="Name of game from game_envs_descriptions.md")
     parser.add_argument("--list", action="store_true", help="List all available game descriptions")
-    parser.add_argument("--model", type=str, default="claude-opus-4-6", help="FuxiAPI model name")
 
     args = parser.parse_args()
 
@@ -257,7 +255,7 @@ def main():
             print("Invalid selection.")
             return
 
-    asyncio.run(generate_env_for_game(selected_game, model_name=args.model))
+    asyncio.run(generate_env_for_game(selected_game))
 
 
 if __name__ == "__main__":
