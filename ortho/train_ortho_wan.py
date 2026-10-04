@@ -34,7 +34,6 @@ from buffer import OrthoTransitionBuffer
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
-
 # ==========================================
 # WAN 2.1 HELPERS
 # ==========================================
@@ -351,6 +350,7 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
     else:
         unique_envs = [env_names] if isinstance(env_names, str) else list(env_names)
 
+    # unique_envs = ["Bipedal Walker", "MultiCarRacing"]
     print(f"\n[VALIDATION] Running autoregressive video rollouts for epoch {epoch} across envs: {', '.join(unique_envs[:2])}...")
 
     for env_idx, env_name in enumerate(unique_envs[:2]):
@@ -508,7 +508,7 @@ def main(args):
         trainable_params,
         lr=args.lr,
         betas=(0.9, 0.999),
-        weight_decay=1e-4,
+        weight_decay=1e-5,
     )
 
     total_steps = args.epochs * args.steps_per_epoch
@@ -541,7 +541,6 @@ def main(args):
                 batch_size=args.batch_size,
                 seq_len=args.train_seq_len,
             )
-
             with torch.no_grad():
                 # Encode views at t=0
                 latents_t = encode_views_to_latents(vae, views_t, out_dtype=model.dtype)
@@ -642,7 +641,7 @@ def parse_args():
     parser.add_argument("--ctx_noise_max", type=float, default=0.15, help="Max Gaussian noise added to conditioning context latents to prevent drift")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--steps_per_epoch", type=int, default=200, help="Training steps per epoch")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for LoRA parameters")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for LoRA parameters")
     parser.add_argument("--save_every", type=int, default=2, help="Save checkpoint every N epochs")
     parser.add_argument("--eval_every", type=int, default=1, help="Generate and evaluate views every N epochs")
     parser.add_argument("--eval_steps", type=int, default=20, help="Number of Euler flow matching sampling steps per frame")
