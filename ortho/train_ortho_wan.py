@@ -31,6 +31,9 @@ from torch.utils.tensorboard import SummaryWriter
 from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent
 from buffer import OrthoTransitionBuffer
 
+from stable_baselines3 import PPO
+from huggingface_sb3 import load_from_hub
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
@@ -351,9 +354,9 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
         unique_envs = [env_names] if isinstance(env_names, str) else list(env_names)
 
     # unique_envs = ["Bipedal Walker", "MultiCarRacing"]
-    print(f"\n[VALIDATION] Running autoregressive video rollouts for epoch {epoch} across envs: {', '.join(unique_envs[:2])}...")
+    print(f"\n[VALIDATION] Running autoregressive video rollouts for epoch {epoch} across envs: {', '.join(unique_envs[:3])}...")
 
-    for env_idx, env_name in enumerate(unique_envs[:2]):
+    for env_idx, env_name in enumerate(unique_envs[:3]):
         (vid_top_down_01, vid_rear_01, vid_side_01, vid_fpv_01,
          vid_gt_top_down_01, vid_gt_rear_01, vid_gt_side_01, vid_gt_fpv_01) = autoregressive_rollout(
             transformer=transformer,
@@ -406,13 +409,18 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
         img_top_down, im_rear, im_side, im_fpv = env.render()
         
         with torch.inference_mode():
-            features = agent.feature_net(state)
-            if agent.is_discrete:
-                logits = agent.actor_head(features)
-                action = torch.argmax(logits, dim=-1).item()
+            if hasattr(agent, "predict"):
+                action, _ = agent.predict(obs, deterministic=True)
+            elif hasattr(agent, "feature_net"):
+                features = agent.feature_net(state)
+                if agent.is_discrete:
+                    logits = agent.actor_head(features)
+                    action = torch.argmax(logits, dim=-1).item()
+                else:
+                    mean = torch.tanh(agent.actor_mean(features))
+                    action = mean.squeeze(0).cpu().numpy()
             else:
-                mean = torch.tanh(agent.actor_mean(features))
-                action = mean.squeeze(0).cpu().numpy()
+                action = env.action_space.sample()
         
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
@@ -440,19 +448,35 @@ def collect_all_envs_rollouts(registry, buffer, rollout_steps=150):
     print("=" * 60)
 
     active_envs = []
-    for idx, (name, factory) in enumerate(registry):
-        print(f"\n[{idx + 1}/{len(registry)}] Initializing environment: {name}")
+    for idx, (env_name, factory) in enumerate(registry):
+        print(f"\n[{idx + 1}/{len(registry)}] Initializing environment: {env_name}")
         env = factory()
 
         obs, info = env.reset()
         state_dim = int(np.prod(obs.shape if hasattr(obs, 'shape') else env.observation_space.shape))
-        clean_name = "".join(c for c in name if c.isalnum() or c in ('_', '-')).lower()
-        ckpt_path = os.path.join("checkpoints", f"ppo_{clean_name}.pt")
+        clean_env_name = "".join(c for c in env_name if c.isalnum() or c in ('_', '-')).lower()
+        ckpt_path = os.path.join("checkpoints", f"ppo_{clean_env_name}.pt")
         
-        print(f"Loading PPO agent from: {ckpt_path}")
-        agent = load_agent(ckpt_path, state_dim, env.action_space, device)
-        collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=name)
-        active_envs.append((name, env))
+        if env_name == "Lunar Lander":
+            checkpoint = load_from_hub(
+                repo_id="Adilbai/ppo-LunarLander-v2",
+                filename="ppo-LunarLander-v2.zip"
+            )
+            agent = PPO.load(checkpoint)
+
+        elif env_name == "MultiCar Racing":
+            checkpoint = load_from_hub(
+                repo_id="igpaub/ppo-CarRacing-v2",
+                filename="ppo-CarRacing-v2.zip"
+            )
+            agent = PPO.load(checkpoint)
+
+        else:
+            print(f"Loading PPO agent from: {ckpt_path}")
+            agent = load_agent(ckpt_path, state_dim, env.action_space, device)
+        
+        collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=env_name)
+        active_envs.append((env_name, env))
 
     unique_recorded = list(dict.fromkeys([e for e in buffer.env_names[:buffer.size] if e is not None]))
     print(f"\n[INFO] Buffer populated with {buffer.size} transitions across {len(unique_recorded)} environments: {', '.join(unique_recorded)}")

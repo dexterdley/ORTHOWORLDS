@@ -48,27 +48,6 @@ def _build_registry():
         print(f"[WARN] Could not register Bipedal Walker: {e}")
 
     # ------------------------------------------------------------------
-    # Lunar Lander (wraps gymnasium's LunarLander-v3)
-    try:
-        import gymnasium
-        from game_envs.lunar_orthographic import LunarOrthographicWrapper
-        _try("Lunar Lander",
-             lambda: LunarOrthographicWrapper(
-                 gymnasium.make("LunarLander-v3", render_mode="rgb_array")))
-    except Exception as e:
-        print(f"[WARN] Could not register Lunar Lander: {e}")
-        
-    # ------------------------------------------------------------------
-    # Mario Escape
-    try:
-        from game_envs.mario_orthographic import (
-            MarioEscapeEnv, MarioOrthographicWrapper)
-        _try("Mario Escape",
-             lambda: MarioOrthographicWrapper(MarioEscapeEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Mario Escape: {e}")
-
-    # ------------------------------------------------------------------
     # MultiCar Racing (wraps gymnasium's CarRacing-v3)
     try:
         import gymnasium
@@ -80,84 +59,15 @@ def _build_registry():
         print(f"[WARN] Could not register MultiCar Racing: {e}")
 
     # ------------------------------------------------------------------
-    # Drone Dogfight
+    # Lunar Lander (wraps gymnasium's LunarLander-v3)
     try:
-        from game_envs.drone_dogfight_orthographic import (
-            DroneDogfightEnv, DroneDogfightOrthographicWrapper)
-        _try("Drone Dogfight",
-             lambda: DroneDogfightOrthographicWrapper(DroneDogfightEnv()))
+        import gymnasium
+        from game_envs.lunar_orthographic import LunarOrthographicWrapper
+        _try("Lunar Lander",
+             lambda: LunarOrthographicWrapper(
+                 gymnasium.make("LunarLander-v3", render_mode="rgb_array")))
     except Exception as e:
-        print(f"[WARN] Could not register Drone Dogfight: {e}")
-
-    # ------------------------------------------------------------------
-    # Excavator
-    try:
-        from game_envs.excavator_orthographic import (
-            ExcavatorEnv, ExcavatorOrthographicWrapper)
-        _try("Excavator",
-             lambda: ExcavatorOrthographicWrapper(ExcavatorEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Excavator: {e}")
-
-    # ------------------------------------------------------------------
-    # Tank Duel
-    try:
-        from game_envs.tank_duel_orthographic import (
-            TankDuelEnv, TankDuelOrthographicWrapper)
-        _try("Tank Duel",
-             lambda: TankDuelOrthographicWrapper(TankDuelEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Tank Duel: {e}")
-
-    # ------------------------------------------------------------------
-    # Catapult War
-    try:
-        from game_envs.catapult_war_orthographic import (
-            CatapultWarEnv, CatapultWarOrthographicWrapper)
-        _try("Catapult War",
-             lambda: CatapultWarOrthographicWrapper(CatapultWarEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Catapult War: {e}")
-
-    # ------------------------------------------------------------------
-    # Robot Sumo
-    try:
-        from game_envs.robot_sumo_orthographic import (
-            RobotSumoEnv, RobotSumoOrthographicWrapper)
-        _try("Robot Sumo",
-             lambda: RobotSumoOrthographicWrapper(RobotSumoEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Robot Sumo: {e}")
-
-    # ------------------------------------------------------------------
-    # Mountain Goat
-    try:
-        from game_envs.mountain_goat_orthographic import (
-            MountainGoatEnv, MountainGoatOrthographicWrapper)
-        _try("Mountain Goat",
-             lambda: MountainGoatOrthographicWrapper(MountainGoatEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Mountain Goat: {e}")
-
-    # ------------------------------------------------------------------
-    # Wrecking Ball
-    try:
-        from game_envs.wrecking_ball_orthographic import (
-            WreckingBallEnv, WreckingBallOrthographicWrapper)
-        _try("Wrecking Ball",
-             lambda: WreckingBallOrthographicWrapper(WreckingBallEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Wrecking Ball: {e}")
-
-    # ------------------------------------------------------------------
-    # Toxic Gas Escape
-    try:
-        from game_envs.toxic_gas_escape_orthographic import (
-            ToxicGasEscapeEnv, ToxicGasEscapeOrthographicWrapper)
-        _try("Toxic Gas Escape",
-             lambda: ToxicGasEscapeOrthographicWrapper(ToxicGasEscapeEnv()))
-    except Exception as e:
-        print(f"[WARN] Could not register Toxic Gas Escape: {e}")
+        print(f"[WARN] Could not register Lunar Lander: {e}")
         
     return registry
 
@@ -446,3 +356,36 @@ def load_model(model_id="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", lora_rank=16):
     transformer.to(device)
 
     return transformer, vae, text_encoder, tokenizer
+
+
+def load_base_model(model_id="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"):
+    """
+    Loads Wan2.1-1.3B WITHOUT applying LoRA. Use this in eval scripts before
+    calling PeftModel.from_pretrained() to avoid double-wrapping the transformer,
+    which mangles adapter key paths into 'base_model.model.base_model.model...'.
+
+    Example:
+        transformer, vae, text_encoder, tokenizer = load_base_model(model_id)
+        transformer = PeftModel.from_pretrained(transformer, ckpt_dir)
+        transformer.eval()
+    """
+    print(f"\n[INFO] Loading Wan2.1 base components (no LoRA) from: {model_id}")
+    pipe = WanPipeline.from_pretrained(model_id, torch_dtype=dtype)
+
+    vae = pipe.vae
+    vae.requires_grad_(False)
+    vae.eval()
+    vae.to(device)
+
+    text_encoder = pipe.text_encoder
+    text_encoder.requires_grad_(False)
+    text_encoder.eval()
+    text_encoder.to(device)
+
+    tokenizer = pipe.tokenizer
+
+    transformer = pipe.transformer
+    transformer.requires_grad_(False)
+    transformer.to(device)
+
+    return transformer, vae, text_encoder, tokenizer

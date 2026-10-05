@@ -3,7 +3,7 @@ eval_longrollout.py — Experiment 3.1
 Long-Horizon Rollout Degradation Curve
 
 Evaluates a trained OWM checkpoint (or any model matching the transformer interface)
-by autoregressively rolling out T steps and measuring per-step PSNR / LPIPS / FVD
+by autoregressively rolling out T steps and measuring per-step PSNR / FVD
 against ground truth. Saves:
   - results/exp3_1/metrics.csv        <- per-step numbers for Table / LaTeX
   - results/exp3_1/degradation.png    <- the paper figure
@@ -28,7 +28,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-from utils import _build_registry, load_model, compose_player_prompts, set_seed
+from utils import _build_registry, load_base_model, compose_player_prompts, set_seed
 from buffer import OrthoTransitionBuffer
 from train_ortho_wan import (
     collect_rollouts,
@@ -54,17 +54,6 @@ def psnr(pred: torch.Tensor, gt: torch.Tensor) -> float:
     return 20.0 * math.log10(1.0) - 10.0 * math.log10(mse)
 
 
-def lpips_batch(pred: torch.Tensor, gt: torch.Tensor) -> float:
-    """
-    Perceptual similarity. Reuses the lazy-initialised LPIPS from train_ortho_diffusion.
-    pred, gt: (B, 3, H, W) in [0, 1]  -> converts to [-1, 1] for LPIPS.
-    """
-    from train_ortho_diffusion import compute_lpips
-    pred_11 = pred * 2.0 - 1.0
-    gt_11   = gt   * 2.0 - 1.0
-    return compute_lpips(pred_11, gt_11)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SINGLE MODEL ROLLOUT EVALUATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,11 +72,10 @@ def evaluate_rollout_degradation(
 ):
     """
     Runs `n_rollouts` autoregressive rollouts of length `rollout_steps`.
-    Returns per-step mean PSNR, LPIPS, and collected video clips for FVD.
+    Returns per-step mean PSNR and collected video clips for FVD.
 
     Returns:
         step_psnr  : list[float] of length rollout_steps, per-step mean PSNR
-        step_lpips : list[float] of length rollout_steps, per-step mean LPIPS
         gen_clips  : (n_rollouts, rollout_steps, 3, H, W) - top-down view for FVD
         gt_clips   : (n_rollouts, rollout_steps, 3, H, W)
     """
@@ -95,7 +83,6 @@ def evaluate_rollout_degradation(
 
     # Accumulators: step -> list of per-rollout scalars
     step_psnr_acc  = defaultdict(list)
-    step_lpips_acc = defaultdict(list)
 
     gen_clips_all = []
     gt_clips_all  = []
@@ -128,7 +115,7 @@ def evaluate_rollout_degradation(
             prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
 
             # Predict next frame
-            next_latents = sample_next_views_latents(
+            next_latents = predict_next_view_latents(
                 transformer=transformer,
                 latents_t=curr_latents,
                 prompt_embeds=prompt_embeds,
@@ -141,17 +128,12 @@ def evaluate_rollout_degradation(
 
             # Per-step metrics (mean over all 4 views)
             step_psnr_views  = []
-            step_lpips_views = []
             for v in range(4):
                 pred_v = decoded[0, v].cpu()
                 gt_v   = gt_np[v]
                 step_psnr_views.append(psnr(pred_v, gt_v))
-                step_lpips_views.append(
-                    lpips_batch(pred_v.unsqueeze(0), gt_v.unsqueeze(0))
-                )
-
+                
             step_psnr_acc[step_i].append(np.mean(step_psnr_views))
-            step_lpips_acc[step_i].append(np.mean(step_lpips_views))
 
             # Collect top-down frame (view index 0) for FVD
             gen_frames.append(decoded[0, 0].cpu())
@@ -171,13 +153,12 @@ def evaluate_rollout_degradation(
 
     # Aggregate
     mean_psnr  = [float(np.mean(step_psnr_acc[s]))  for s in range(rollout_steps)]
-    mean_lpips = [float(np.mean(step_lpips_acc[s])) for s in range(rollout_steps)]
 
     gen_clips = torch.stack(gen_clips_all, dim=0)  # (N, T, 3, H, W)
     gt_clips  = torch.stack(gt_clips_all,  dim=0)
 
     transformer.train()
-    return mean_psnr, mean_lpips, gen_clips, gt_clips
+    return mean_psnr, gen_clips, gt_clips
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,42 +167,38 @@ def evaluate_rollout_degradation(
 
 def plot_degradation_curves(results: dict, out_path: str, rollout_steps: int):
     """
-    results: { model_name: {"psnr": [...], "lpips": [...]} }
-    1x2 figure: left = PSNR vs step, right = LPIPS vs step.
+    results: { model_name: {"psnr": [...]} }
+    Single-panel figure: PSNR vs rollout step.
     Vertical dashed lines mark drift onset (first step PSNR < 20 dB).
     """
     steps = list(range(1, rollout_steps + 1))
     COLORS = ["#38bdf8", "#818cf8", "#fb923c", "#4ade80"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+    fig, ax = plt.subplots(1, 1, figsize=(7, 4.5))
     plt.rcParams.update({"font.family": "DejaVu Sans", "axes.spines.top": False,
                           "axes.spines.right": False})
 
-    for ax, metric, ylabel, title in [
-        (axes[0], "psnr",  "PSNR (dB) ↑",  "PSNR vs. Rollout Step"),
-        (axes[1], "lpips", "LPIPS ↓",       "LPIPS vs. Rollout Step"),
-    ]:
-        for i, (model_name, data) in enumerate(results.items()):
-            color = COLORS[i % len(COLORS)]
-            ax.plot(steps, data[metric], label=model_name,
-                    color=color, linewidth=2.2, marker="o", markersize=3.5, zorder=3)
-        ax.set_xlabel("Rollout Step $t$", fontsize=12)
-        ax.set_ylabel(ylabel, fontsize=12)
-        ax.set_title(title, fontsize=12, fontweight="bold")
-        ax.legend(fontsize=9, framealpha=0.4)
-        ax.grid(alpha=0.25, linestyle="--")
-        ax.xaxis.set_major_locator(ticker.MultipleLocator(4))
+    for i, (model_name, data) in enumerate(results.items()):
+        color = COLORS[i % len(COLORS)]
+        ax.plot(steps, data["psnr"], label=model_name,
+                color=color, linewidth=2.2, marker="o", markersize=3.5, zorder=3)
 
-    # Drift onset annotations on PSNR panel
-    ax_psnr = axes[0]
-    ax_psnr.axhline(20.0, color="gray", linestyle=":", linewidth=1.0, label="20 dB threshold")
+    ax.set_xlabel("Rollout Step $t$", fontsize=12)
+    ax.set_ylabel("PSNR (dB) ↑", fontsize=12)
+    ax.set_title("PSNR vs. Rollout Step", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9, framealpha=0.4)
+    ax.grid(alpha=0.25, linestyle="--")
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(4))
+
+    # Drift onset annotations
+    ax.axhline(20.0, color="gray", linestyle=":", linewidth=1.0, label="20 dB threshold")
     for i, (model_name, data) in enumerate(results.items()):
         drift = next((s+1 for s, v in enumerate(data["psnr"]) if v < 20.0), None)
         if drift:
-            ax_psnr.axvline(drift, color=COLORS[i % len(COLORS)],
-                            linestyle="--", alpha=0.6, linewidth=1.2)
-            ax_psnr.text(drift + 0.3, 20.5, f"drift@{drift}", fontsize=7.5,
-                         color=COLORS[i % len(COLORS)])
+            ax.axvline(drift, color=COLORS[i % len(COLORS)],
+                       linestyle="--", alpha=0.6, linewidth=1.2)
+            ax.text(drift + 0.3, 20.5, f"drift@{drift}", fontsize=7.5,
+                    color=COLORS[i % len(COLORS)])
 
     plt.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -235,12 +212,12 @@ def save_csv(results: dict, out_path: str, rollout_steps: int):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
-        header = ["step"] + [f"{m}_{k}" for m in results for k in ["psnr", "lpips"]]
+        header = ["step"] + [f"{m}_{k}" for m in results for k in ["psnr"]]
         writer.writerow(header)
         for s in range(rollout_steps):
             row = [s + 1]
             for data in results.values():
-                row += [f"{data['psnr'][s]:.4f}", f"{data['lpips'][s]:.4f}"]
+                row += [f"{data['psnr'][s]:.4f}"]
             writer.writerow(row)
     print(f"  [SAVED] CSV -> {out_path}")
 
@@ -253,11 +230,12 @@ def main(args):
     set_seed(args.seed)
     os.makedirs("results/exp3_1", exist_ok=True)
 
-    # Load model
-    transformer, vae, text_encoder, tokenizer = load_model(
-        model_id=args.model_id, lora_rank=args.lora_rank
-    )
+    # Load base transformer (no LoRA), then apply saved LoRA adapter on top.
+    # Do NOT use load_model() here — it already calls get_peft_model(), which
+    # causes PeftModel.from_pretrained() to double-wrap the model and mangle
+    # adapter key paths into 'base_model.model.base_model.model...'.
     from peft import PeftModel
+    transformer, vae, text_encoder, tokenizer = load_base_model(model_id=args.model_id)
     transformer = PeftModel.from_pretrained(transformer, args.ckpt_dir)
     transformer.eval()
 
@@ -277,7 +255,7 @@ def main(args):
 
     # Evaluate
     print(f"\nRunning Exp 3.1: {args.n_rollouts} rollouts x {args.rollout_steps} steps [{env_name}]")
-    psnr_vals, lpips_vals, gen_clips, gt_clips = evaluate_rollout_degradation(
+    psnr_vals, gen_clips, gt_clips = evaluate_rollout_degradation(
         transformer=transformer, vae=vae,
         text_encoder=text_encoder, tokenizer=tokenizer,
         buffer=buffer, rollout_steps=args.rollout_steps,
@@ -293,10 +271,9 @@ def main(args):
     print(f"\n  AUC-PSNR:        {np.mean(psnr_vals):.2f} dB")
     print(f"  Drift onset:     step {drift_step}")
     print(f"  Final PSNR:      {psnr_vals[-1]:.2f} dB")
-    print(f"  Final LPIPS:     {lpips_vals[-1]:.4f}")
     print(f"  FVD:             {fvd_val:.2f}")
 
-    results = {"OWM (Ours)": {"psnr": psnr_vals, "lpips": lpips_vals}}
+    results = {"OWM (Ours)": {"psnr": psnr_vals}}
     plot_degradation_curves(results, "results/exp3_1/degradation.png", args.rollout_steps)
     save_csv(results, "results/exp3_1/metrics.csv", args.rollout_steps)
 
@@ -305,7 +282,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Exp 3.1: Long-Horizon Rollout Degradation")
     parser.add_argument("--ckpt_dir",      type=str, default="./checkpoints/wan_ortho_lora_final")
     parser.add_argument("--model_id",      type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
-    parser.add_argument("--lora_rank",     type=int, default=32)
     parser.add_argument("--env_name",      type=str, default=None)
     parser.add_argument("--rollout_steps", type=int, default=32)
     parser.add_argument("--n_rollouts",    type=int, default=50)
