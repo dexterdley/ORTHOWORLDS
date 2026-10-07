@@ -140,7 +140,7 @@ def train_ortho_flow_step(
         encoder_hidden_states=prompt_embeds,
     ).sample
 
-    # 7. Supervise target views at t+1 (indices num_views:2*num_views)
+    # 7. Supervise all 4 target views at t+1 (indices 4:8)
     pred_velocity = model_pred[:, :, num_views : 2 * num_views].float()
 
     per_view_losses = [
@@ -152,7 +152,6 @@ def train_ortho_flow_step(
     # Reconstruct 1-step denoised prediction: x_0_hat = x_tau - tau * v_pred
     with torch.no_grad():
         pred_x0 = (noisy_latents_next_fp32 - tau_exp * pred_velocity.detach()).clamp(-6.0, 6.0)
-        # Weight confidence by (1 - tau) so highly noisy steps blend smoothly with GT
         confidence = (1.0 - tau_exp).clamp(0.2, 1.0)
         rollout_latent = (confidence * pred_x0 + (1.0 - confidence) * latents_next_fp32).to(dtype=transformer.dtype)
     return loss, [l.item() for l in per_view_losses], rollout_latent
@@ -258,8 +257,7 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
             hidden_states=combined,
             timestep=t_tensor,
             encoder_hidden_states=prompt_embeds,
-        ).sample[:, :, num_views : 2 * num_views].float()
-
+        ).sample[:, :, num_views : 2 * num_views].float()  # (B, C, 4, h, w)
         x_tau = x_tau - dt * pred_velocity
 
     return x_tau.to(dtype=transformer.dtype)
@@ -538,11 +536,11 @@ def main(args):
     total_steps = args.epochs * args.steps_per_epoch
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
 
-    log_dir = f"./runs/wan_ortho_multienv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir = f"./runs/wan_single_multienv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging to: {log_dir}")
 
-    view_names = ["Top", "Side", "Rear", "3D_FPV"]
+    view_names = ["3D_FPV"]
 
     # 3. Multi-Step Trajectory Training Loop
     print("\nStarting Multi-Step Trajectory LoRA Fine-Tuning on Wan DiT...")
@@ -565,6 +563,9 @@ def main(args):
                 batch_size=args.batch_size,
                 seq_len=args.train_seq_len,
             )
+            # Take only 3D FPV
+            views_t = views_t[:,-1 : :]
+            views_next_seq = [v[:,-1 : :] for v in views_next_seq]
 
             with torch.no_grad():
                 # Encode views at t=0
@@ -613,8 +614,7 @@ def main(args):
             env_summary = "+".join(list(dict.fromkeys(env_names_seq[0]))[:2])
             pbar.set_postfix({
                 "Loss": f"{loss:.4f}",
-                "Top": f"{per_view_losses[0]:.3f}",
-                "FPV": f"{per_view_losses[3]:.3f}",
+                "FPV": f"{per_view_losses[0]:.3f}",
                 "Envs": env_summary,
             })
 
@@ -638,14 +638,14 @@ def main(args):
 
         # Checkpointing
         if (epoch + 1) % args.save_every == 0:
-            ckpt_dir = f"./checkpoints/wan_ortho_lora_epoch_{epoch+1}"
+            ckpt_dir = f"./checkpoints/wan_single_lora_epoch_{epoch+1}"
             os.makedirs(ckpt_dir, exist_ok=True)
             model.save_pretrained(ckpt_dir)
             print(f"  [SAVED] LoRA checkpoint to {ckpt_dir}")
 
     print("\nTraining Complete! Saving final LoRA weights...")
-    os.makedirs("./checkpoints/wan_ortho_lora_final", exist_ok=True)
-    model.save_pretrained("./checkpoints/wan_ortho_lora_final")
+    os.makedirs("./checkpoints/wan_single_lora_final", exist_ok=True)
+    model.save_pretrained("./checkpoints/wan_single_lora_final")
     writer.close()
     for _, env in active_envs:
         try:
@@ -654,7 +654,7 @@ def main(args):
             pass
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Orthographic Game Views")
+    parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Single Game Views")
     parser.add_argument("--env", type=str, default="all", help="Environment to train on: 'all' to train across all envs, or a specific name like 'Bipedal Walker'")
     parser.add_argument("--rollout_steps", type=int, default=2048, help="Rollout steps when training on a single environment")
     parser.add_argument("--buffer_capacity", type=int, default=40000, help="Capacity of multi-environment transition buffer")
