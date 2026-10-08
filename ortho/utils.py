@@ -46,18 +46,6 @@ def _build_registry():
                  gymnasium.make("BipedalWalker-v3", render_mode="rgb_array")))
     except Exception as e:
         print(f"[WARN] Could not register Bipedal Walker: {e}")
-
-    # ------------------------------------------------------------------
-    # MultiCar Racing (wraps gymnasium's CarRacing-v3)
-    try:
-        import gymnasium
-        from game_envs.multicar_racing_orthographic import MultiCarOrthographicWrapper
-        _try("MultiCar Racing",
-             lambda: MultiCarOrthographicWrapper(
-                 gymnasium.make("CarRacing-v3", render_mode="rgb_array")))
-    except Exception as e:
-        print(f"[WARN] Could not register MultiCar Racing: {e}")
-
     # ------------------------------------------------------------------
     # Lunar Lander (wraps gymnasium's LunarLander-v3)
     try:
@@ -68,6 +56,105 @@ def _build_registry():
                  gymnasium.make("LunarLander-v3", render_mode="rgb_array")))
     except Exception as e:
         print(f"[WARN] Could not register Lunar Lander: {e}")
+    # ------------------------------------------------------------------
+    # MultiCar Racing (wraps gymnasium's CarRacing-v3)
+    try:
+        import gymnasium
+        from game_envs.multicar_racing_orthographic import MultiCarOrthographicWrapper
+        _try("MultiCar Racing",
+             lambda: MultiCarOrthographicWrapper(
+                 gymnasium.make("CarRacing-v3", render_mode="rgb_array")))
+    except Exception as e:
+        print(f"[WARN] Could not register MultiCar Racing: {e}")        
+    # ------------------------------------------------------------------
+    # Mario Escape
+    try:
+        from game_envs.mario_orthographic import (
+            MarioEscapeEnv, MarioOrthographicWrapper)
+        _try("Mario Escape",
+             lambda: MarioOrthographicWrapper(MarioEscapeEnv()))
+    except Exception as e:
+        print(f"[WARN] Could not register Mario Escape: {e}")
+
+    # ------------------------------------------------------------------
+    # Drone Dogfight
+    try:
+        from game_envs.drone_dogfight_orthographic import (
+            DroneDogfightEnv, DroneDogfightOrthographicWrapper)
+        _try("Drone Dogfight",
+             lambda: DroneDogfightOrthographicWrapper(DroneDogfightEnv()))
+    except Exception as e:
+        print(f"[WARN] Could not register Drone Dogfight: {e}")
+
+    # ------------------------------------------------------------------
+    # Excavator
+    try:
+        from game_envs.excavator_orthographic import (
+            ExcavatorEnv, ExcavatorOrthographicWrapper)
+        _try("Excavator",
+             lambda: ExcavatorOrthographicWrapper(ExcavatorEnv()))
+    except Exception as e:
+        print(f"[WARN] Could not register Excavator: {e}")
+
+    # ------------------------------------------------------------------
+    # Tank Duel
+    try:
+        from game_envs.tank_duel_orthographic import (
+            TankDuelEnv, TankDuelOrthographicWrapper)
+        _try("Tank Duel",
+             lambda: TankDuelOrthographicWrapper(TankDuelEnv()))
+    except Exception as e:
+        print(f"[WARN] Could not register Tank Duel: {e}")
+
+    # ------------------------------------------------------------------
+    # Catapult War
+    try:
+        from game_envs.catapult_war_orthographic import (
+            CatapultWarEnv, CatapultWarOrthographicWrapper)
+        _try("Catapult War",
+             lambda: CatapultWarOrthographicWrapper(CatapultWarEnv()))
+    except Exception as e:
+        print(f"[WARN] Could not register Catapult War: {e}")
+
+    # ------------------------------------------------------------------
+    # Robot Sumo
+    try:
+        from game_envs.robot_sumo_orthographic import (
+            RobotSumoEnv, RobotSumoOrthographicWrapper)
+        _try("Robot Sumo",
+             lambda: RobotSumoOrthographicWrapper(RobotSumoEnv()))
+    except Exception as e:
+        print(f"[WARN] Could not register Robot Sumo: {e}")
+
+    # ------------------------------------------------------------------
+    # Mountain Goat
+    try:
+        from game_envs.mountain_goat_orthographic import (
+            MountainGoatEnv, MountainGoatOrthographicWrapper)
+        _try("Mountain Goat",
+             lambda: MountainGoatOrthographicWrapper(MountainGoatEnv()))
+    except Exception as e:
+        print(f"[WARN] Could not register Mountain Goat: {e}")
+
+    # ------------------------------------------------------------------
+    # Wrecking Ball
+    try:
+        from game_envs.wrecking_ball_orthographic import (
+            WreckingBallEnv, WreckingBallOrthographicWrapper)
+        _try("Wrecking Ball",
+             lambda: WreckingBallOrthographicWrapper(WreckingBallEnv()))
+    except Exception as e:
+        print(f"[WARN] Could not register Wrecking Ball: {e}")
+
+    # ------------------------------------------------------------------
+    # Toxic Gas Escape
+    try:
+        from game_envs.toxic_gas_escape_orthographic import (
+            ToxicGasEscapeEnv, ToxicGasEscapeOrthographicWrapper)
+        _try("Toxic Gas Escape",
+             lambda: ToxicGasEscapeOrthographicWrapper(ToxicGasEscapeEnv()))
+    except Exception as e:
+        print(f"[WARN] Could not register Toxic Gas Escape: {e}")
         
     return registry
 
@@ -388,4 +475,4 @@ def load_base_model(model_id="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"):
     transformer.requires_grad_(False)
     transformer.to(device)
 
-    return transformer, vae, text_encoder, tokenizer
+    return transformer, vae, text_encoder, tokenizer

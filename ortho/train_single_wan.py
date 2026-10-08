@@ -344,17 +344,11 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
     Performs autoregressive video rollouts for each view and writes the videos to TensorBoard.
     """
     transformer.eval()
+    unique_envs = ['Bipedal Walker', 'Lunar Lander', 'MultiCar Racing']
+    
+    print(f"\n[VALIDATION] Running autoregressive video rollouts for epoch {epoch} across envs: {', '.join(unique_envs)}...")
 
-    if env_names is None:
-        envs = (e for e in buffer.env_names[:buffer.size] if e is not None)
-        unique_envs = list(dict.fromkeys(envs))
-    else:
-        unique_envs = [env_names] if isinstance(env_names, str) else list(env_names)
-
-    # unique_envs = ["Bipedal Walker", "MultiCarRacing"]
-    print(f"\n[VALIDATION] Running autoregressive video rollouts for epoch {epoch} across envs: {', '.join(unique_envs[:3])}...")
-
-    for env_idx, env_name in enumerate(unique_envs[:3]):
+    for env_idx, env_name in enumerate(unique_envs):
         (vid_top_down_01, vid_rear_01, vid_side_01, vid_fpv_01,
          vid_gt_top_down_01, vid_gt_rear_01, vid_gt_side_01, vid_gt_fpv_01) = autoregressive_rollout(
             transformer=transformer,
@@ -439,14 +433,14 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
         state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
     env.close()
 
-def collect_all_envs_rollouts(registry, buffer, rollout_steps=150):
+def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
     """Loops through all registered environments and populates the multi-env buffer."""
     print("=" * 60)
-    print(f"Collecting rollouts across all {len(registry)} environments...")
+    print(f"Collecting rollouts across all {min(num_envs, len(registry))} environments...")
     print("=" * 60)
 
     active_envs = []
-    for idx, (env_name, factory) in enumerate(registry):
+    for idx, (env_name, factory) in enumerate(registry[:num_envs]):
         print(f"\n[{idx + 1}/{len(registry)}] Initializing environment: {env_name}")
         env = factory()
 
@@ -501,7 +495,7 @@ def main(args):
     active_envs = []
     if args.env.lower() == "all":
         active_envs = collect_all_envs_rollouts(
-            registry, buffer, rollout_steps=args.rollout_steps
+            registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs
         )
     else:
         matched_name = next((k for k in reg_dict if k.lower() == args.env.lower()), None)
@@ -543,7 +537,7 @@ def main(args):
     view_names = ["3D_FPV"]
 
     # 3. Multi-Step Trajectory Training Loop
-    print("\nStarting Multi-Step Trajectory LoRA Fine-Tuning on Wan DiT...")
+    print("\nStarting Multi-Step Trajectory LoRA Fine-Tuning ...")
     global_step = 0
 
     for epoch in range(args.epochs):
@@ -644,8 +638,8 @@ def main(args):
             print(f"  [SAVED] LoRA checkpoint to {ckpt_dir}")
 
     print("\nTraining Complete! Saving final LoRA weights...")
-    os.makedirs("./checkpoints/wan_single_lora_final", exist_ok=True)
-    model.save_pretrained("./checkpoints/wan_single_lora_final")
+    os.makedirs(f"./checkpoints/wan_single_{args.num_envs}_lora_final", exist_ok=True)
+    model.save_pretrained(f"./checkpoints/wan_single_{args.num_envs}_lora_final")
     writer.close()
     for _, env in active_envs:
         try:
@@ -673,6 +667,7 @@ def parse_args():
     parser.add_argument("--rollout_video_steps", type=int, default=16, help="Autoregressive rollout steps for validation videos")
     parser.add_argument("--video_fps", type=int, default=15, help="FPS for TensorBoard video logging")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--num_envs", type=int, default=12, help="Number of training envs")
     return parser.parse_args()
 
 if __name__ == "__main__":

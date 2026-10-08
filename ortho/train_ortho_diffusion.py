@@ -113,7 +113,7 @@ def _extract_video_features(videos: torch.Tensor) -> np.ndarray:
     
     # Upsample spatial dims to at least 112 x 112 if needed
     if H < 112 or W < 112:
-        v = F.interpolate(v.view(N * C, T, H, W).unsqueeze(1),
+        v = F.interpolate(v.reshape(N * C, T, H, W).unsqueeze(1),
                           size=(T, 112, 112), mode='trilinear',
                           align_corners=False).squeeze(1).view(N, C, T, 112, 112)
     

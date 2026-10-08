@@ -571,9 +571,9 @@ def create_comparison_visualizations(gt_frames, multi_frames, single_frames, out
     frames_rgb = []
 
     for t in range(T):
-        gt_np = (gt_frames[t].permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        mv_np = (multi_frames[t].permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        sv_np = (single_frames[t].permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        gt_np = (gt_frames[t].permute(1, 2, 0).float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        mv_np = (multi_frames[t].permute(1, 2, 0).float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        sv_np = (single_frames[t].permute(1, 2, 0).float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
 
         canvas = np.zeros((composite_h, composite_w, 3), dtype=np.uint8)
         canvas[:header_h, :] = (30, 30, 30)
@@ -688,63 +688,68 @@ def main(args):
     agent = load_agent(f"checkpoints/ppo_{clean_name}.pt", state_dim, env.action_space, device)
     collect_rollouts(env, agent, buffer, n_steps=args.buffer_steps, seed=args.seed, env_name=env_name)
     env.close()
+    
+    view_names = ["Top", "Side", "Rear", "3D_FPV"]
 
     # 4. Evaluation Execution
     if multi_transformer is not None and single_view_transformer is not None:
-        # ── HEAD-TO-HEAD COMPARISON ──
-        results, mv_clips, sv_clips, gt_clips, best_vis = compare_multi_vs_single_rollouts(
-            multi_transformer=multi_transformer,
-            single_transformer=single_view_transformer,
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            buffer=buffer,
-            target_view=args.target_view,
-            rollout_steps=args.rollout_steps,
-            n_rollouts=args.n_rollouts,
-            eval_steps=args.eval_steps,
-            env_name=env_name,
-        )
 
-        print("\nComputing FVD scores for video rollouts...")
-        fvd_mv = compute_fvd(gt_clips.float(), mv_clips.float())
-        fvd_sv = compute_fvd(gt_clips.float(), sv_clips.float())
+        for target_view in view_names:
 
-        mv_p = results["Multi-View (OWM)"]["target_psnr"]
-        sv_p = results["Single-View Baseline"]["target_psnr"]
-        auc_m = float(np.mean(mv_p))
-        auc_s = float(np.mean(sv_p))
-        dm = next((s + 1 for s, v in enumerate(mv_p) if v < 20.0), f">{args.rollout_steps}")
-        ds = next((s + 1 for s, v in enumerate(sv_p) if v < 20.0), f">{args.rollout_steps}")
-
-        print("\n" + "=" * 80)
-        print("  COMPARISON SUMMARY: MULTI-VIEW vs SINGLE-VIEW")
-        print("=" * 80)
-        print(f"  {'Metric':<30} | {'Multi-View (OWM)':<18} | {'Single-View':<18} | {'Advantage':<14}")
-        print("  " + "-" * 76)
-        print(f"  {'AUC-PSNR ↑':<30} | {auc_m:<15.2f} dB | {auc_s:<15.2f} dB | {auc_m - auc_s:+11.2f} dB")
-        print(f"  {'Drift Onset (PSNR < 20dB)':<30} | {str(dm):<18} | {str(ds):<18} | {'-'}")
-        print(f"  {'Final Step PSNR ↑':<30} | {mv_p[-1]:<15.2f} dB | {sv_p[-1]:<15.2f} dB | {mv_p[-1] - sv_p[-1]:+11.2f} dB")
-        print(f"  {'FVD (lower is better) ↓':<30} | {fvd_mv:<18.2f} | {fvd_sv:<18.2f} | {fvd_sv - fvd_mv:+11.2f}")
-        mean_cpce = float(np.mean(results["Multi-View (OWM)"]["cpce"]))
-        print(f"  {'Cross-Proj. Consistency (CPCE)':<30} | {mean_cpce:<18.6f} | {'N/A':<18} | {'-'}")
-        auc_occ_m = float(np.mean(results["Multi-View (OWM)"]["occlusion_err"]))
-        auc_occ_s = float(np.mean(results["Single-View Baseline"]["occlusion_err"]))
-        print(f"  {'Occlusion Error ↓':<30} | {auc_occ_m:<18.6f} | {auc_occ_s:<18.6f} | {auc_occ_m - auc_occ_s:+11.6f}")
-        print("=" * 80 + "\n")
-
-        plot_degradation_curves(results, "results/exp3_1/degradation.png", args.rollout_steps, target_view=args.target_view)
-        save_csv(results, "results/exp3_1/metrics.csv", args.rollout_steps, fvd_multi=fvd_mv, fvd_single=fvd_sv)
-
-        if best_vis is not None and args.save_video:
-            create_comparison_visualizations(
-                gt_frames=best_vis[0],
-                multi_frames=best_vis[1],
-                single_frames=best_vis[2],
-                out_dir="results/exp3_1",
-                target_view=args.target_view,
-                fps=15,
+            # ── HEAD-TO-HEAD COMPARISON ──
+            results, mv_clips, sv_clips, gt_clips, best_vis = compare_multi_vs_single_rollouts(
+                multi_transformer=multi_transformer,
+                single_transformer=single_view_transformer,
+                vae=vae,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer,
+                buffer=buffer,
+                target_view=target_view,
+                rollout_steps=args.rollout_steps,
+                n_rollouts=args.n_rollouts,
+                eval_steps=args.eval_steps,
+                env_name=env_name,
             )
+
+            print("\nComputing FVD scores for video rollouts...")
+            fvd_mv = compute_fvd(gt_clips.float(), mv_clips.float())
+            fvd_sv = compute_fvd(gt_clips.float(), sv_clips.float())
+
+            mv_p = results["Multi-View (OWM)"]["target_psnr"]
+            sv_p = results["Single-View Baseline"]["target_psnr"]
+            auc_m = float(np.mean(mv_p))
+            auc_s = float(np.mean(sv_p))
+            dm = next((s + 1 for s, v in enumerate(mv_p) if v < 20.0), f">{args.rollout_steps}")
+            ds = next((s + 1 for s, v in enumerate(sv_p) if v < 20.0), f">{args.rollout_steps}")
+
+            print("\n" + "=" * 80)
+            print("  COMPARISON SUMMARY: MULTI-VIEW vs SINGLE-VIEW")
+            print("=" * 80)
+            print(f"  {'Metric':<30} | {'Multi-View (OWM)':<18} | {'Single-View':<18} | {'Advantage':<14}")
+            print("  " + "-" * 76)
+            print(f"  {'AUC-PSNR ↑':<30} | {auc_m:<15.2f} dB | {auc_s:<15.2f} dB | {auc_m - auc_s:+11.2f} dB")
+            print(f"  {'Drift Onset (PSNR < 20dB)':<30} | {str(dm):<18} | {str(ds):<18} | {'-'}")
+            print(f"  {'Final Step PSNR ↑':<30} | {mv_p[-1]:<15.2f} dB | {sv_p[-1]:<15.2f} dB | {mv_p[-1] - sv_p[-1]:+11.2f} dB")
+            print(f"  {'FVD (lower is better) ↓':<30} | {fvd_mv:<18.2f} | {fvd_sv:<18.2f} | {fvd_sv - fvd_mv:+11.2f}")
+            mean_cpce = float(np.mean(results["Multi-View (OWM)"]["cpce"]))
+            print(f"  {'Cross-Proj. Consistency (CPCE)':<30} | {mean_cpce:<18.6f} | {'N/A':<18} | {'-'}")
+            auc_occ_m = float(np.mean(results["Multi-View (OWM)"]["occlusion_err"]))
+            auc_occ_s = float(np.mean(results["Single-View Baseline"]["occlusion_err"]))
+            print(f"  {'Occlusion Error ↓':<30} | {auc_occ_m:<18.6f} | {auc_occ_s:<18.6f} | {auc_occ_m - auc_occ_s:+11.6f}")
+            print("=" * 80 + "\n")
+
+            plot_degradation_curves(results, f"results/exp3_1/{target_view}_degradation.png", args.rollout_steps, target_view=target_view)
+            save_csv(results, f"results/exp3_1/{target_view}_metrics.csv", args.rollout_steps, fvd_multi=fvd_mv, fvd_single=fvd_sv)
+
+            if best_vis is not None and args.save_video:
+                create_comparison_visualizations(
+                    gt_frames=best_vis[0],
+                    multi_frames=best_vis[1],
+                    single_frames=best_vis[2],
+                    out_dir="results/exp3_1",
+                    target_view=target_view,
+                    fps=15,
+                )
 
     else:
         # ── SINGLE MODEL EVALUATION (FALLBACK) ──
@@ -772,14 +777,14 @@ def main(args):
         print(f"  FVD:             {fvd_val:.2f}")
 
         results = {label: {"psnr": psnr_vals}}
-        plot_degradation_curves(results, "results/exp3_1/degradation.png", args.rollout_steps)
+        plot_degradation_curves(results, f"results/exp3_1/degradation.png", args.rollout_steps)
         save_csv(results, "results/exp3_1/metrics.csv", args.rollout_steps)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Exp 3.1: Long-Horizon Rollout Degradation & Multi-View vs Single-View Comparison")
     parser.add_argument("--ckpt_dir",        type=str, default="./checkpoints/wan_ortho_lora_final", help="Path to Multi-View LoRA checkpoint")
-    parser.add_argument("--single_ckpt_dir", type=str, default="./checkpoints/wan_single_lora_epoch_8", help="Path to Single-View LoRA checkpoint")
+    parser.add_argument("--single_ckpt_dir", type=str, default="./checkpoints/wan_single_lora_final", help="Path to Single-View LoRA checkpoint")
     parser.add_argument("--target_view",     type=str, default="3D_FPV", help="Target camera view to compare (3D_FPV, Top, Side, Rear)")
     parser.add_argument("--model_id",        type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
     parser.add_argument("--env_name",        type=str, default=None)
