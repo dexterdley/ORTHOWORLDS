@@ -3,6 +3,7 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
+from .camera_utils import apply_camera_pose
 
 class LunarOrthographicWrapper(gym.Wrapper):
     """
@@ -20,7 +21,7 @@ class LunarOrthographicWrapper(gym.Wrapper):
         self.camera_z_offset = 12.0 
         self.camera_y_offset = 3.0
         
-    def render(self):
+    def render(self, camera_pose="Center"):
         base_env = self.env.unwrapped
         
         # 1. Setup Surfaces
@@ -173,14 +174,16 @@ class LunarOrthographicWrapper(gym.Wrapper):
                 dx = vx - cam_x
                 dy = vy - cam_y
                 depth_cam = cam_z - vz # Camera sits at +Z looking forward
+
+                d_c, dx_c, dy_c = apply_camera_pose(depth_cam, dx, dy, camera_pose=camera_pose)
                 
-                if depth_cam < 1.0:
+                if d_c < 1.0:
                     valid_fpv = False
                 else:
-                    px = (dx / depth_cam) * self.fov + cx
-                    py = self.VIEWPORT_H - ((dy / depth_cam) * self.fov + cy)
+                    px = (dx_c / d_c) * self.fov + cx
+                    py = self.VIEWPORT_H - ((dy_c / d_c) * self.fov + cy)
                     pts_f.append((px, py))
-                    depths_f.append(depth_cam)
+                    depths_f.append(d_c)
                     
             if len(pts_t) >= 3: proj_top.append((sum(depths_t)/len(depths_t), pts_t, color))
             if len(pts_r) >= 3: proj_rear.append((sum(depths_r)/len(depths_r), pts_r, color))
@@ -197,9 +200,15 @@ class LunarOrthographicWrapper(gym.Wrapper):
         for surf, p_list in [(top_surf, proj_top), (rear_surf, proj_rear), 
                              (side_surf, proj_side), (fpv_surf, proj_fpv)]:
             for _, pts, color in p_list:
+                if len(pts) < 3:
+                    continue
                 safe_color = (int(color[0]), int(color[1]), int(color[2]))
-                gfxdraw.aapolygon(surf, pts, safe_color)
-                gfxdraw.filled_polygon(surf, pts, safe_color)
+                ipts = [(int(round(p[0])), int(round(p[1]))) for p in pts]
+                try:
+                    gfxdraw.aapolygon(surf, ipts, safe_color)
+                    gfxdraw.filled_polygon(surf, ipts, safe_color)
+                except Exception:
+                    pass
                 
         # 6. Convert to Numpy Arrays
         out_imgs = []

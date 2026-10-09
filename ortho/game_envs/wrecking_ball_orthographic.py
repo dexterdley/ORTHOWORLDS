@@ -7,6 +7,7 @@ import pygame
 from pygame import gfxdraw
 import math 
 import cv2
+from .camera_utils import apply_camera_pose
 try:
     from gymnasium import spaces
 except ImportError:
@@ -257,7 +258,7 @@ class WreckingBallOrthographicWrapper(gym.Wrapper):
         self.VIEWPORT_W, self.VIEWPORT_H = 800, 600
         self.fov = 400.0
         
-    def render(self):
+    def render(self, camera_pose="Center"):
         base_env = self.env.unwrapped
         
         top_surf = pygame.Surface((self.VIEWPORT_W, self.VIEWPORT_H))
@@ -349,8 +350,11 @@ class WreckingBallOrthographicWrapper(gym.Wrapper):
 
             pts_fpv, depths_fpv = [], []
             for dx, dy, dz in clipped_pts:
-                pts_fpv.append((-(dz / dx) * self.fov + cx, self.VIEWPORT_H - ((dy / dx) * self.fov + cy)))
-                depths_fpv.append(dx)
+                d_c, lat_c, dy_c = apply_camera_pose(dx, -dz, dy, camera_pose=camera_pose)
+                dz_c = -lat_c
+                if d_c > 0.1:
+                    pts_fpv.append((-(dz_c / d_c) * self.fov + cx, self.VIEWPORT_H - ((dy_c / d_c) * self.fov + cy)))
+                    depths_fpv.append(d_c)
                 
             if len(pts_t) >= 3: proj_top.append((sum(depths_t)/len(depths_t), pts_t, color, layer))
             if len(pts_r) >= 3: proj_rear.append((sum(depths_r)/len(depths_r), pts_r, color, layer))
@@ -361,8 +365,14 @@ class WreckingBallOrthographicWrapper(gym.Wrapper):
         for proj_list, surf in [(proj_top, top_surf), (proj_rear, rear_surf), (proj_side, side_surf), (proj_fpv, fpv_surf)]:
             proj_list.sort(key=lambda x: (x[3], -x[0]))
             for _, pts, color, _ in proj_list:
+                if len(pts) < 3:
+                    continue
                 safe_color = (int(color[0]), int(color[1]), int(color[2]))
-                gfxdraw.aapolygon(surf, pts, safe_color)
-                gfxdraw.filled_polygon(surf, pts, safe_color)
+                ipts = [(int(round(p[0])), int(round(p[1]))) for p in pts]
+                try:
+                    gfxdraw.aapolygon(surf, ipts, safe_color)
+                    gfxdraw.filled_polygon(surf, ipts, safe_color)
+                except Exception:
+                    pass
 
         return [np.transpose(pygame.surfarray.array3d(s), (1, 0, 2)) for s in [top_surf, rear_surf, side_surf, fpv_surf]]

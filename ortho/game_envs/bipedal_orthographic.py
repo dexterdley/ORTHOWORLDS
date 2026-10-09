@@ -2,6 +2,7 @@ import gym
 import numpy as np
 import pygame
 from pygame import gfxdraw
+from .camera_utils import apply_camera_pose
 
 class BipedalOrthographicWrapper(gym.Wrapper):
     """
@@ -15,7 +16,7 @@ class BipedalOrthographicWrapper(gym.Wrapper):
         self.VIEWPORT_H = 400
         self.fov = 400.0
         
-    def render(self):
+    def render(self, camera_pose="Center"):
         base_env = self.env.unwrapped
         
         if base_env.screen is None and base_env.render_mode == "human":
@@ -143,14 +144,16 @@ class BipedalOrthographicWrapper(gym.Wrapper):
                 dx = vx - cam_x
                 dy = vy - cam_y
                 dz = vz - cam_z
+
+                dx_c, dz_c, dy_c = apply_camera_pose(dx, dz, dy, camera_pose=camera_pose)
                 
-                if dx < 10.0:  # Camera clipping plane
+                if dx_c < 10.0:  # Camera clipping plane
                     valid_fpv = False
                 else:
-                    px = (dz / dx) * self.fov + cx
-                    py = self.VIEWPORT_H - ((dy / dx) * self.fov + cy)
+                    px = (dz_c / dx_c) * self.fov + cx
+                    py = self.VIEWPORT_H - ((dy_c / dx_c) * self.fov + cy)
                     pts_fpv.append((px, py))
-                    depths_fpv.append(dx)
+                    depths_fpv.append(dx_c)
                 
             if len(pts_t) >= 3: proj_top.append((sum(depths_t)/len(depths_t), pts_t, color, layer))
             if len(pts_f) >= 3: proj_front.append((sum(depths_f)/len(depths_f), pts_f, color, layer))
@@ -162,9 +165,15 @@ class BipedalOrthographicWrapper(gym.Wrapper):
                                 (proj_side, side_surf), (proj_fpv, fpv_surf)]:
             proj_list.sort(key=lambda x: (x[3], -x[0]))
             for _, pts, color, _ in proj_list:
+                if len(pts) < 3:
+                    continue
                 safe_color = (int(color[0]), int(color[1]), int(color[2]))
-                gfxdraw.aapolygon(surf, pts, safe_color)
-                gfxdraw.filled_polygon(surf, pts, safe_color)
+                ipts = [(int(round(p[0])), int(round(p[1]))) for p in pts]
+                try:
+                    gfxdraw.aapolygon(surf, ipts, safe_color)
+                    gfxdraw.filled_polygon(surf, ipts, safe_color)
+                except Exception:
+                    pass
 
         out_imgs = []
         for surf in [top_surf, front_surf, side_surf, fpv_surf]:

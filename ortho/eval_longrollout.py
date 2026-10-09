@@ -783,8 +783,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Exp 3.1: Long-Horizon Rollout Degradation & Multi-View vs Single-View Comparison")
-    parser.add_argument("--ckpt_dir",        type=str, default="./checkpoints/wan_ortho_lora_final", help="Path to Multi-View LoRA checkpoint")
-    parser.add_argument("--single_ckpt_dir", type=str, default="./checkpoints/wan_single_lora_final", help="Path to Single-View LoRA checkpoint")
+    parser.add_argument("--ckpt_dir",        type=str, default="./checkpoints/wan_ortho_12_lora_final", help="Path to Multi-View LoRA checkpoint")
+    parser.add_argument("--single_ckpt_dir", type=str, default="./checkpoints/wan_single_12_lora_final", help="Path to Single-View LoRA checkpoint")
     parser.add_argument("--target_view",     type=str, default="3D_FPV", help="Target camera view to compare (3D_FPV, Top, Side, Rear)")
     parser.add_argument("--model_id",        type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
     parser.add_argument("--env_name",        type=str, default=None)

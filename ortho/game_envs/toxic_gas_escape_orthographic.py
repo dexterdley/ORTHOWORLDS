@@ -6,6 +6,7 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
+from .camera_utils import apply_camera_pose
 try:
     from gymnasium import spaces
 except ImportError:
@@ -273,7 +274,7 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
                     pass
 
     # ------------------------------------------------------------------
-    def render(self):
+    def render(self, camera_pose="Center"):
         base = self.env.unwrapped
 
         VW, VH = self.VIEWPORT_W, self.VIEWPORT_H
@@ -507,10 +508,14 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
 
             pts_fpv, df = [], []
             for rfwd, rright, rup in clipped:
-                px_f = -(rright / rfwd) * self.fov + cx
-                py_f =  (rup    / rfwd) * self.fov + cy
-                pts_fpv.append((px_f, py_f))
-                df.append(rfwd)
+                d_c, lat_c, vert_c = apply_camera_pose(rfwd, -rright, -rup, camera_pose=camera_pose)
+                rright_c = -lat_c
+                rup_c = -vert_c
+                if d_c > 0.1:
+                    px_f = -(rright_c / d_c) * self.fov + cx
+                    py_f =  (rup_c    / d_c) * self.fov + cy
+                    pts_fpv.append((px_f, py_f))
+                    df.append(d_c)
 
             if len(pts_fpv) >= 3:
                 proj_fpv.append((sum(df)/len(df), pts_fpv, color, layer))

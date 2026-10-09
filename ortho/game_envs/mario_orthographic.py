@@ -6,6 +6,7 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
+from .camera_utils import apply_camera_pose
 try:
     from gymnasium import spaces
 except ImportError:
@@ -423,7 +424,7 @@ class MarioOrthographicWrapper(gym.Wrapper):
         ], c_side, layer, no_fpv))
 
     # ------------------------------------------------------------------
-    def render(self):
+    def render(self, camera_pose="Center"):
         base = self.env.unwrapped
 
         VW, VH = self.VIEWPORT_W, self.VIEWPORT_H
@@ -661,10 +662,13 @@ class MarioOrthographicWrapper(gym.Wrapper):
 
             pts_fpv, df = [], []
             for dx, dy, dz in clipped:
-                px_f = -(dz / dx) * self.fov + cx
-                py_f = -(dy / dx) * self.fov + cy
-                pts_fpv.append((px_f, py_f))
-                df.append(dx)
+                d_c, lat_c, dy_c = apply_camera_pose(dx, -dz, dy, camera_pose=camera_pose)
+                dz_c = -lat_c
+                if d_c > 0.1:
+                    px_f = -(dz_c / d_c) * self.fov + cx
+                    py_f = -(dy_c / d_c) * self.fov + cy
+                    pts_fpv.append((px_f, py_f))
+                    df.append(d_c)
 
             if len(pts_fpv) >= 3:
                 proj_fpv.append((sum(df)/len(df), pts_fpv, color, layer))

@@ -197,7 +197,7 @@ def train_ablation(cfg: AblationConfig, buffer, model_id, ckpt_out_dir):
         pbar = tqdm(range(cfg.steps_per_epoch), desc=f"  Epoch {epoch+1}/{cfg.epochs}")
 
         for _ in pbar:
-            views_t, views_next_seq, actions_seq, env_names_seq = buffer.sample_trajectory_batch(
+            views_t, views_next_seq, actions_seq, env_names_seq, _ = buffer.sample_trajectory_batch(
                 batch_size=4, seq_len=cfg.train_seq_len  # small batch for ablation speed
             )
 

@@ -5,6 +5,7 @@ Two robots compete to push each other out of a circular ring.
 
 import math
 import numpy as np
+from .camera_utils import apply_camera_pose
 
 try:
     import gymnasium as gym
@@ -895,7 +896,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 clipped.append((ix, iy, iz))
         return clipped
 
-    def _render_fpv(self, objects):
+    def _render_fpv(self, objects, camera_pose="Center"):
         """Render first-person view."""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
@@ -932,10 +933,13 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 for v in clipped_verts:
                     depth = v[1] + 0.5
                     scale = 200.0
-                    sx = self.view_width / 2 + (v[0] / depth) * scale
-                    sy = self.view_height / 2 - ((v[2] - 0.7) / depth) * scale
+                    d_c, lat_c, vert_c = apply_camera_pose(depth, v[0], v[2] - 0.7, camera_pose=camera_pose)
+                    if d_c < 0.1:
+                        d_c = 0.1
+                    sx = self.view_width / 2 + (lat_c / d_c) * scale
+                    sy = self.view_height / 2 - (vert_c / d_c) * scale
                     points.append((sx, sy))
-                    total_depth += depth
+                    total_depth += d_c
                 
                 avg_depth = total_depth / len(clipped_verts)
                 render_items.append((avg_depth, points, obj['color']))
@@ -947,13 +951,14 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 rx = dx * math.cos(-player_angle) - dy * math.sin(-player_angle)
                 ry = dx * math.sin(-player_angle) + dy * math.cos(-player_angle)
                 depth = ry + 0.5
-                if depth < 0.1:
+                d_c, lat_c, vert_c = apply_camera_pose(depth, rx, obj['z_top'] - 0.7, camera_pose=camera_pose)
+                if d_c < 0.1:
                     continue
                 scale = 200.0
-                sx = self.view_width / 2 + (rx / depth) * scale
-                sy = self.view_height / 2 - ((obj['z_top'] - 0.7) / depth) * scale
-                radius_px = int(obj['radius'] * 200.0 / depth)
-                render_items.append((depth, ('circle', sx, sy, radius_px), obj['color']))
+                sx = self.view_width / 2 + (lat_c / d_c) * scale
+                sy = self.view_height / 2 - (vert_c / d_c) * scale
+                radius_px = int(obj['radius'] * 200.0 / d_c)
+                render_items.append((d_c, ('circle', sx, sy, radius_px), obj['color']))
 
         render_items.sort(key=lambda x: -x[0])
 
@@ -982,7 +987,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
         ).copy()
 
-    def render(self):
+    def render(self, camera_pose="Center"):
         """Return tuple of 4 orthographic views."""
         if not pygame.get_init():
             pygame.init()
@@ -995,7 +1000,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         im_top_down = self._render_top_down(objects)
         im_rear = self._render_rear(objects)
         im_side = self._render_side(objects)
-        im_fpv = self._render_fpv(objects)
+        im_fpv = self._render_fpv(objects, camera_pose=camera_pose)
 
         return (im_top_down, im_rear, im_side, im_fpv)
 

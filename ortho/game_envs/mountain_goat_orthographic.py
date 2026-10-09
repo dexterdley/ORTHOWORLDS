@@ -18,6 +18,7 @@ Fully compatible with Gym/Gymnasium and Box2D SWIG bindings.
 
 import math
 import numpy as np
+from .camera_utils import apply_camera_pose
 import pygame
 from pygame import gfxdraw
 
@@ -438,7 +439,7 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
         self.VH = 600
         self.fov = 320.0
 
-    def render(self):
+    def render(self, camera_pose="Center"):
         base = self.env.unwrapped
 
         top_surf  = pygame.Surface((self.VW, self.VH))
@@ -661,11 +662,14 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
             if len(clipped_fpv) >= 3:
                 pts_fpv = []
                 for dx_c, dy_c, dz_c in clipped_fpv:
-                    px = (dz_c / dx_c) * self.fov + cx
-                    py = self.VH - ((dy_c / dx_c) * self.fov + cy)
-                    pts_fpv.append((px, py))
+                    d_c, dz_rot, dy_rot = apply_camera_pose(dx_c, dz_c, dy_c, camera_pose=camera_pose)
+                    if d_c > 0.1:
+                        px = (dz_rot / d_c) * self.fov + cx
+                        py = self.VH - ((dy_rot / d_c) * self.fov + cy)
+                        pts_fpv.append((px, py))
                 depth_c = sum(c[0] for c in clipped_fpv) / len(clipped_fpv)
-                proj_fpv.append((depth_c, pts_fpv, color, layer))
+                if len(pts_fpv) >= 3:
+                    proj_fpv.append((depth_c, pts_fpv, color, layer))
 
         # ----------------------------------------------------------------------
         # D. Z-Index Sorting & Rendering to Surfaces

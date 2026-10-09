@@ -6,6 +6,7 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
+from .camera_utils import apply_camera_pose
 try:
     from gymnasium import spaces
 except ImportError:
@@ -443,7 +444,7 @@ class DroneDogfightOrthographicWrapper(gym.Wrapper):
         return np.transpose(pygame.surfarray.array3d(surf), (1, 0, 2))
 
     # ------------------------------------------------------------------
-    def render(self):
+    def render(self, camera_pose="Center"):
         base = self.env.unwrapped
 
         # Initialise surfaces
@@ -685,11 +686,13 @@ class DroneDogfightOrthographicWrapper(gym.Wrapper):
 
             pts_fpv, df = [], []
             for rx, ry, rz in clipped:
-                # Project: horizontal = -ry/rx*fov, vertical = -rz/rx*fov (Z is up)
-                px_f = -(ry / rx) * self.fov + cx
-                py_f = -(rz / rx) * self.fov + cy
-                pts_fpv.append((px_f, py_f))
-                df.append(rx)
+                d_c, lat_c, rz_c = apply_camera_pose(rx, -ry, rz, camera_pose=camera_pose)
+                ry_c = -lat_c
+                if d_c > 0.1:
+                    px_f = -(ry_c / d_c) * self.fov + cx
+                    py_f = -(rz_c / d_c) * self.fov + cy
+                    pts_fpv.append((px_f, py_f))
+                    df.append(d_c)
 
             if len(pts_fpv) >= 3:
                 proj_fpv.append((sum(df)/len(df), pts_fpv, color, layer))

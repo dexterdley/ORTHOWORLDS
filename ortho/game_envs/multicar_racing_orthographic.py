@@ -4,6 +4,7 @@ import pygame
 from pygame import gfxdraw
 import math 
 import cv2
+from .camera_utils import apply_camera_pose
 
 class MultiCarOrthographicWrapper(gym.Wrapper):
     """
@@ -24,7 +25,7 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
         self.camera_h = 10.0      
         self.camera_z = 8.0       
         
-    def render(self):
+    def render(self, camera_pose="Center"):
         top_down_img = self.env.render()
         if top_down_img is None:
             return None, None, None, None
@@ -180,8 +181,9 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
         
         for p_vertices, color, layer in polys:
             pts_r, pts_s, pts_f = [], [], []
-            depths_cam, depths_side = [], []
+            depths_rear, depths_side, depths_fpv = [], [], []
             valid_cam = True
+            valid_fpv = True
             
             for v in p_vertices:
                 if len(v) == 3: vx, vy, vh = v
@@ -201,6 +203,7 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                 px_r = (rx * self.scale_factor) + self.WINDOW_W / 2
                 py_r = (zh * self.scale_factor) + self.WINDOW_H / 2
                 pts_r.append((px_r, py_r))
+                depths_rear.append(depth_cam)
                 
                 # B. Orthographic Side
                 px_s = (ry * self.scale_factor) + self.WINDOW_W / 2
@@ -209,17 +212,23 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                 depths_side.append(-rx) # Lateral axis becomes side view depth
                 
                 # C. True Perspective 3D (FPV)
-                if depth_cam > 0:
-                    px_f = (rx / depth_cam) * self.fov + self.WINDOW_W / 2
-                    py_f = (zh / depth_cam) * self.fov + self.WINDOW_H / 2
+                d_c, rx_c, vert_c = apply_camera_pose(depth_cam, rx, -zh, camera_pose=camera_pose)
+                zh_c = -vert_c
+                if d_c < 2.0:
+                    valid_fpv = False
+                else:
+                    px_f = (rx_c / d_c) * self.fov + self.WINDOW_W / 2
+                    py_f = (zh_c / d_c) * self.fov + self.WINDOW_H / 2
                     pts_f.append((px_f, py_f))
-                
-                depths_cam.append(depth_cam)
+                    depths_fpv.append(d_c)
                 
             if valid_cam and len(pts_r) >= 3: 
-                avg_d = sum(depths_cam) / len(depths_cam)
+                avg_d = sum(depths_rear) / len(depths_rear)
                 proj_polys_rear.append((avg_d, pts_r, color, layer))
-                proj_polys_fpv.append((avg_d, pts_f, color, layer))
+
+            if valid_fpv and len(pts_f) >= 3:
+                avg_df = sum(depths_fpv) / len(depths_fpv)
+                proj_polys_fpv.append((avg_df, pts_f, color, layer))
                 
             if len(pts_s) >= 3:
                 avg_ds = sum(depths_side) / len(depths_side)
@@ -237,9 +246,15 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                       
         for surf, p_list in draw_lists:
             for _, pts, color, _ in p_list:
+                if len(pts) < 3:
+                    continue
                 safe_color = (int(color[0]), int(color[1]), int(color[2]))
-                gfxdraw.aapolygon(surf, pts, safe_color)
-                gfxdraw.filled_polygon(surf, pts, safe_color)
+                ipts = [(int(round(p[0])), int(round(p[1]))) for p in pts]
+                try:
+                    gfxdraw.aapolygon(surf, ipts, safe_color)
+                    gfxdraw.filled_polygon(surf, ipts, safe_color)
+                except Exception:
+                    pass
             
         # 5. Convert and resize to match Gym's standard output
         target_shape = (top_down_img.shape[1], top_down_img.shape[0])

@@ -1,5 +1,6 @@
 import math
 import numpy as np
+from .camera_utils import apply_camera_pose
 
 try:
     import gymnasium as gym
@@ -418,7 +419,7 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
         self.view_width = SCREEN_WIDTH
         self.view_height = SCREEN_HEIGHT
 
-    def render(self):
+    def render(self, camera_pose="Center"):
         """Returns tuple of 4 orthographic views: (top_down, rear, side, fpv)"""
         # Ensure pygame is initialized for fonts and surfaces
         if not pygame.get_init():
@@ -441,7 +442,7 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
         im_top_down = self._render_top_down(objects_3d, player_x, player_y)
         im_rear = self._render_rear(objects_3d, player_x, player_y)
         im_side = self._render_side(objects_3d, player_x, player_y)
-        im_fpv = self._render_fpv(objects_3d, player_x, player_y)
+        im_fpv = self._render_fpv(objects_3d, player_x, player_y, camera_pose=camera_pose)
 
         return (im_top_down, im_rear, im_side, im_fpv)
 
@@ -663,7 +664,7 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
         ).copy()
 
-    def _render_fpv(self, objects, player_x, player_y):
+    def _render_fpv(self, objects, player_x, player_y, camera_pose="Center"):
         """First-person view: looking from catapult toward enemy"""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
@@ -703,11 +704,13 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                     dy = v[1] - eye_y
                     if dx <= 0.5:
                         continue
-                    # Perspective: z_screen maps to horizontal, y maps to vertical
-                    proj_scale = 200.0 / dx
-                    sz = obj.get('z_min', 0) * proj_scale
-                    sx = int(self.view_width / 2 + sz)
-                    sy = int(self.view_height / 2 - dy * proj_scale)
+                    z_val = obj.get('z_min', 0)
+                    d_c, z_c, dy_c = apply_camera_pose(dx, z_val, dy, camera_pose=camera_pose)
+                    if d_c <= 0.1:
+                        continue
+                    proj_scale = 200.0 / d_c
+                    sx = int(self.view_width / 2 + z_c * proj_scale)
+                    sy = int(self.view_height / 2 - dy_c * proj_scale)
                     screen_verts.append((sx, sy))
 
                 if len(screen_verts) >= 3:

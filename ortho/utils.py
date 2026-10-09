@@ -334,12 +334,13 @@ ENV_PROMPT_TEMPLATES = {
 }
 
 
-def compose_player_prompts(action_batch, env_name=None):
+def compose_player_prompts(action_batch, env_name=None, camera_pose=None):
     """
     Composes text prompts for Wan2.1 text encoder tailored to each environment.
     Supports either a single env_name string or a list/tuple of env_names for mixed batches.
+    Optionally accepts camera_pose (e.g. 'Up', 'Down', 'Left', 'Right', 'Center') for 3D FPV camera conditioning.
     Example for Bipedal Walker:
-      'Bipedal Walker 2D robot locomotion: leg torques [hip1: +0.20, knee1: -0.45, hip2: +0.10, knee2: +0.80], balancing across terrain.'
+      'Bipedal Walker 2D robot locomotion: leg torques [hip1: +0.20, knee1: -0.45, hip2: +0.10, knee2: +0.80], balancing across terrain, camera look Up.'
     """
     # Normalize action_batch to iterable of 1D action vectors
     if isinstance(action_batch, torch.Tensor):
@@ -357,8 +358,15 @@ def compose_player_prompts(action_batch, env_name=None):
     else:
         env_list = [env_name] * num_samples
 
+    if isinstance(camera_pose, (list, tuple)):
+        cam_list = list(camera_pose)
+    elif camera_pose is not None:
+        cam_list = [camera_pose] * num_samples
+    else:
+        cam_list = [None] * num_samples
+
     prompts = []
-    for a, sample_env in zip(action_batch, env_list):
+    for a, sample_env, sample_cam in zip(action_batch, env_list, cam_list):
         if sample_env is None:
             sample_env = _ACTIVE_ENV_NAME or "Generic"
 
@@ -391,8 +399,13 @@ def compose_player_prompts(action_batch, env_name=None):
         except Exception:
             action_str = f"action [{', '.join(f'{x.item():+.2f}' for x in a)}]"
 
+        cam_str = ""
+        if sample_cam and str(sample_cam).strip().lower() not in ("none", ""):
+            clean_cam = str(sample_cam).strip().title()
+            cam_str = f", camera look {clean_cam}"
+
         full_prompt = (
-            f"{matched_template['title']}: {action_str}, {matched_template['suffix']}."
+            f"{matched_template['title']}: {action_str}, {matched_template['suffix']}{cam_str}."
         )
         prompts.append(full_prompt)
 

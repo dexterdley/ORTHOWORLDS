@@ -265,6 +265,74 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
     return x_tau.to(dtype=transformer.dtype)
 
 
+def _annotate_frame_pose(frame_tensor, pose_str):
+    """Overlays keyboard arrow key icons with the active direction highlighted yellow on a (3, H, W) frame tensor in [0, 1]."""
+    np_img = (frame_tensor.float().permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8).copy()
+    h, w, _ = np_img.shape
+
+    # Proportional sizing based on frame dimensions
+    key_size = max(10, int(min(h, w) * 0.10))
+    gap = max(1, int(key_size * 0.15))
+    margin = max(4, int(min(h, w) * 0.04))
+
+    # Inverted-T layout: Up on top row; Left, Down, Right on bottom row
+    keys = {
+        'Up':    (margin + key_size + gap, margin, key_size, key_size),
+        'Left':  (margin, margin + key_size + gap, key_size, key_size),
+        'Down':  (margin + key_size + gap, margin + key_size + gap, key_size, key_size),
+        'Right': (margin + 2 * (key_size + gap), margin + key_size + gap, key_size, key_size),
+    }
+
+    # Semi-transparent dark background backing
+    pad_w = 3 * key_size + 2 * gap + 2 * gap
+    pad_h = 2 * key_size + gap + 2 * gap
+    overlay = np_img.copy()
+    cv2.rectangle(
+        overlay,
+        (margin - gap, margin - gap),
+        (margin - gap + pad_w, margin - gap + pad_h),
+        (0, 0, 0),
+        -1
+    )
+    np_img = cv2.addWeighted(overlay, 0.5, np_img, 0.5, 0)
+
+    active_name = str(pose_str or '').strip().title()
+
+    for name, (kx, ky, kw, kh) in keys.items():
+        is_active = (name == active_name)
+        cx, cy = kx + kw // 2, ky + kh // 2
+        d = max(2, kw // 3)
+
+        if is_active:
+            # Highlighted yellow: RGB (255, 230, 0)
+            key_bg = (255, 230, 0)
+            arrow_color = (20, 20, 20)
+            border_color = (255, 255, 120)
+        else:
+            # Inactive / unpressed: dark key with grey arrow
+            key_bg = (40, 42, 48)
+            arrow_color = (180, 180, 185)
+            border_color = (75, 78, 85)
+
+        cv2.rectangle(np_img, (kx, ky), (kx + kw, ky + kh), key_bg, -1)
+        cv2.rectangle(np_img, (kx, ky), (kx + kw, ky + kh), border_color, 1)
+
+        # Draw directional arrow triangle
+        if name == 'Up':
+            pts = np.array([[cx, cy - d], [cx - d, cy + d - 1], [cx + d, cy + d - 1]], np.int32)
+        elif name == 'Down':
+            pts = np.array([[cx, cy + d], [cx - d, cy - d + 1], [cx + d, cy - d + 1]], np.int32)
+        elif name == 'Left':
+            pts = np.array([[cx - d, cy], [cx + d - 1, cy - d], [cx + d - 1, cy + d]], np.int32)
+        elif name == 'Right':
+            pts = np.array([[cx + d, cy], [cx - d + 1, cy - d], [cx - d + 1, cy + d]], np.int32)
+
+        cv2.fillPoly(np_img, [pts], arrow_color)
+
+    out = torch.from_numpy(np_img).float().permute(2, 0, 1) / 255.0
+    return out
+
+
 @torch.no_grad()
 def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, env_name=None, rollout_steps=16, steps=20):
     """
@@ -289,11 +357,23 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
 
     print(f"Starting {actual_steps}-step Autoregressive Rollout for [{env_name or 'Default'}]...")
 
+    curr_pose = random.choice(["Up", "Down", "Left", "Right"])
+    pose_hold = 10
+
     for step_i in range(actual_steps):
         act = act_seq[step_i]
         sample_env = env_seq[step_i] or env_name
+        
+        if pose_hold <= 0:
+            # Switch to a new distinct direction so the camera sweeps to a new angle
+            choices = [p for p in ["Up", "Down", "Left", "Right"] if p != curr_pose]
+            curr_pose = random.choice(choices)
+            pose_hold = random.randint(3, 5)
+        sample_cam = curr_pose
+        pose_hold -= 1
 
-        prompt = compose_player_prompts([act], env_name=sample_env)
+        # Condition Wan prompt: Only the 3D FPV uses the camera pose
+        prompt = compose_player_prompts([act], env_name=sample_env, camera_pose=sample_cam)
         text_inputs = tokenizer(
             prompt, padding="max_length", max_length=64, truncation=True, return_tensors="pt"
         ).to(device)
@@ -312,14 +392,23 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
         gen_top.append(decoded_views[0, 0].cpu())
         gen_side.append(decoded_views[0, 1].cpu())
         gen_rear.append(decoded_views[0, 2].cpu())
-        gen_fpv.append(decoded_views[0, 3].cpu())
 
         # Ground truth next views
         gt_vn_01 = torch.from_numpy(vn_seq[step_i]).float() / 255.0  # (4, 3, H, W)
         gt_top.append(gt_vn_01[0])
         gt_side.append(gt_vn_01[1])
         gt_rear.append(gt_vn_01[2])
-        gt_fpv.append(gt_vn_01[3])
+
+        # Add the input pose overlay to the generated and ground truth FPV frames
+        curr_gen_fpv = decoded_views[0, 3].cpu()
+        curr_gt_fpv = gt_vn_01[3]
+
+        if sample_cam and str(sample_cam).strip().lower() not in ("none", ""):
+            curr_gen_fpv = _annotate_frame_pose(curr_gen_fpv, sample_cam)
+            curr_gt_fpv = _annotate_frame_pose(curr_gt_fpv, sample_cam)
+
+        gen_fpv.append(curr_gen_fpv)
+        gt_fpv.append(curr_gt_fpv)
 
         # Re-encode decoded RGB frame back through VAE to stay on the clean VAE manifold
         next_views_norm = decoded_views * 2.0 - 1.0
@@ -398,10 +487,23 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
     obs, _ = env.reset(seed=seed)
     state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
 
+    # 5 discrete camera pose states: Center, Up, Down, Left, Right
+    current_pose = "Center"
+    pose_hold = 0
+
     collected = 0
     for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
-        img_top_down, im_rear, im_side, im_fpv = env.render()
-        
+        if pose_hold <= 0:
+            if random.random() < 0.40:
+                current_pose = "Center"
+            else:
+                current_pose = random.choice(["Up", "Down", "Left", "Right"])
+            pose_hold = random.randint(3, 8)
+        else:
+            pose_hold -= 1
+
+        img_top_down, im_rear, im_side, im_fpv = env.render(camera_pose=current_pose)
+
         with torch.inference_mode():
             if hasattr(agent, "predict"):
                 action, _ = agent.predict(obs, deterministic=True)
@@ -419,17 +521,19 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
 
-        next_img_top_down, next_im_rear, next_im_side, next_im_fpv = env.render()
+        next_img_top_down, next_im_rear, next_im_side, next_im_fpv = env.render(camera_pose=current_pose)
 
         # Ordering convention: 0:Top, 1:Side, 2:Rear, 3:3D/FPV
         buffer.push(
             top_t=img_top_down, side_t=im_side, rear_t=im_rear, fpv_t=im_fpv,
             top_next=next_img_top_down, side_next=next_im_side, rear_next=next_im_rear, fpv_next=next_im_fpv,
-            action=action, done=done, env_name=env_name,
+            action=action, done=done, env_name=env_name, camera_pose=current_pose,
         )
         collected += 1
         if done:
             obs, _ = env.reset()
+            current_pose = "Center"
+            pose_hold = 0
         else:
             obs = next_obs
         state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
@@ -539,7 +643,7 @@ def main(args):
             # Sample batch of contiguous trajectories of length `args.train_seq_len`
             # views_t:       (B, 4, 3, H, W) — anchor frame at t=0
             # views_next_seq: list[T] of (B, 4, 3, H, W) — target frames t=1..T
-            views_t, views_next_seq, actions_seq, env_names_seq = buffer.sample_trajectory_batch(
+            views_t, views_next_seq, actions_seq, env_names_seq, camera_poses_seq = buffer.sample_trajectory_batch(
                 batch_size=args.batch_size,
                 seq_len=args.train_seq_len,
             )

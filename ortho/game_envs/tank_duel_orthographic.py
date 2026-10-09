@@ -1,5 +1,6 @@
 import math
 import numpy as np
+from .camera_utils import apply_camera_pose
 
 try:
     import gymnasium as gym
@@ -784,7 +785,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
         )
 
-    def _project_fpv(self, shapes, player_pos, player_angle):
+    def _project_fpv(self, shapes, player_pos, player_angle, camera_pose="Center"):
         """First Person View: perspective projection from player's viewpoint."""
         surface = pygame.Surface((self.view_w, self.view_h))
         surface.fill(COLOR_SKY)
@@ -827,7 +828,8 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
                 y_cam = dx * sin_a + dy * cos_a
                 z_cam = dz
 
-                cam_verts.append((x_cam, y_cam, z_cam))
+                d_c, x_c, z_c = apply_camera_pose(y_cam, x_cam, z_cam, camera_pose=camera_pose)
+                cam_verts.append((x_c, d_c, z_c))
 
             # Clip against near plane (y_cam > Z_NEAR)
             clipped_verts = self._clip_near_plane(cam_verts, Z_NEAR)
@@ -954,7 +956,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
 
         return poly
 
-    def render(self):
+    def render(self, camera_pose="Center"):
         """Returns tuple of 4 views: (top_down, rear, side, fpv)"""
         if not pygame.get_init():
             pygame.init()
@@ -968,7 +970,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
         im_top_down = self._project_top_down(shapes, player_pos)
         im_rear = self._project_rear(shapes, player_pos, env.player_body.angle)
         im_side = self._project_side(shapes, player_pos, env.player_body.angle)
-        im_fpv = self._project_fpv(shapes, player_pos, env.player_body.angle)
+        im_fpv = self._project_fpv(shapes, player_pos, env.player_body.angle, camera_pose=camera_pose)
 
         return (im_top_down, im_rear, im_side, im_fpv)
 
