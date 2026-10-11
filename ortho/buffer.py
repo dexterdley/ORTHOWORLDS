@@ -36,8 +36,8 @@ class OrthoTransitionBuffer:
         self.dones = np.zeros(capacity, dtype=bool)
         # Environment name per transition
         self.env_names = [None] * capacity
-        # Camera pose per transition (e.g. 'Center', 'Up', 'Down', 'Left', 'Right')
-        self.camera_poses = ["Center"] * capacity
+        # Camera state per transition (e.g. 'Center', 'Up', 'Down', 'Left', 'Right')
+        self.camera_states = [None] * capacity
 
     def _resize(self, img):
         if img.shape[0] != self.img_h or img.shape[1] != self.img_w:
@@ -46,7 +46,7 @@ class OrthoTransitionBuffer:
 
     def push(self, top_t, side_t, rear_t, fpv_t,
              top_next, side_next, rear_next, fpv_next,
-             action, done, env_name=None, camera_pose="Center"):
+             action, done, camera_state, env_name=None):
 
         vt = [self._resize(x) for x in [top_t, side_t, rear_t, fpv_t]]
         vn = [self._resize(x) for x in [top_next, side_next, rear_next, fpv_next]]
@@ -69,7 +69,7 @@ class OrthoTransitionBuffer:
 
         self.dones[self.ptr] = done
         self.env_names[self.ptr] = env_name or self.default_env_name
-        self.camera_poses[self.ptr] = camera_pose or "Center"
+        self.camera_states[self.ptr] = camera_state
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -95,7 +95,7 @@ class OrthoTransitionBuffer:
                 valid_starts.append(i)
         return valid_starts
 
-    def sample_trajectory_batch(self, batch_size, seq_len=4, target_device=device, env_filter=None, return_camera_poses=True):
+    def sample_trajectory_batch(self, batch_size, seq_len=4, target_device=device, env_filter=None, return_camera_states=True):
         """
         Samples a batch of contiguous multi-step trajectories of length `seq_len`.
         Returns:
@@ -103,7 +103,7 @@ class OrthoTransitionBuffer:
           views_next_seq:   list of `seq_len` tensors, each (B, 4, 3, H, W) in [-1, 1]
           actions_seq:      list of `seq_len` action lists (each of length B)
           env_names_seq:    list of `seq_len` env_name lists (each of length B)
-          camera_poses_seq: list of `seq_len` camera pose lists (each of length B) [if return_camera_poses=True]
+          camera_states_seq: list of `seq_len` camera pose lists (each of length B) [if return_camera_state=True]
         """
         valid_starts = self._get_valid_trajectory_starts(seq_len, env_filter=env_filter)
         if not valid_starts:
@@ -117,7 +117,7 @@ class OrthoTransitionBuffer:
         views_next_seq = []
         actions_seq = []
         env_names_seq = []
-        camera_poses_seq = []
+        camera_states_seq = []
 
         for s in range(seq_len):
             step_idxs = np.minimum(start_idxs + s, self.size - 1)
@@ -127,18 +127,18 @@ class OrthoTransitionBuffer:
                 for idx in step_idxs
             ]
             env_names_s = [self.env_names[idx] for idx in step_idxs]
-            camera_poses_s = [self.camera_poses[idx] for idx in step_idxs]
+            camera_states_s = [self.camera_states[idx] for idx in step_idxs]
 
             views_next_seq.append(views_next_s)
             actions_seq.append(actions_s)
             env_names_seq.append(env_names_s)
-            camera_poses_seq.append(camera_poses_s)
+            camera_states_seq.append(camera_states_s)
 
-        if return_camera_poses:
-            return views_t, views_next_seq, actions_seq, env_names_seq, camera_poses_seq
+        if return_camera_states:
+            return views_t, views_next_seq, actions_seq, env_names_seq, camera_states_seq
         return views_t, views_next_seq, actions_seq, env_names_seq
 
-    def sample_sequence(self, seq_len=16, env_filter=None, return_camera_poses=False):
+    def sample_sequence(self, seq_len=16, env_filter=None, return_camera_states=False):
         """Samples a contiguous sequence of transitions without crossing episode resets."""
         candidates = self._get_valid_trajectory_starts(seq_len, env_filter=env_filter)
 
@@ -158,8 +158,8 @@ class OrthoTransitionBuffer:
         vn_seq = self.views_next[idxs]
         act_seq = [self.actions[i, :self.action_lens[i]] for i in idxs]
         env_seq = [self.env_names[i] for i in idxs]
-        cam_seq = [self.camera_poses[i] for i in idxs]
+        cam_seq = [self.camera_states[i] for i in idxs]
 
-        if return_camera_poses:
+        if return_camera_states:
             return vt_seq, vn_seq, act_seq, env_seq, cam_seq
         return vt_seq, vn_seq, act_seq, env_seq

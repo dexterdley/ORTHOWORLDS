@@ -1,4 +1,5 @@
 import os
+import cv2
 import random
 import numpy as np
 import torch
@@ -411,7 +412,77 @@ def compose_player_prompts(action_batch, env_name=None, camera_pose=None):
 
     return prompts
 
+def _annotate_frame_pose(frame_tensor, pose_str):
+    """Overlays keyboard arrow key icons with the active direction highlighted yellow on a (3, H, W) frame tensor in [0, 1]."""
+    np_img = (frame_tensor.float().permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8).copy()
+    h, w, _ = np_img.shape
 
+    # Proportional sizing based on frame dimensions
+    key_size = max(10, int(min(h, w) * 0.10))
+    gap = max(1, int(key_size * 0.15))
+    margin = max(4, int(min(h, w) * 0.04))
+
+    # Inverted-T layout: Up on top row; Left, Down, Right on bottom row
+    keys = {
+        'Up':    (margin + key_size + gap, margin, key_size, key_size),
+        'Left':  (margin, margin + key_size + gap, key_size, key_size),
+        'Down':  (margin + key_size + gap, margin + key_size + gap, key_size, key_size),
+        'Right': (margin + 2 * (key_size + gap), margin + key_size + gap, key_size, key_size),
+    }
+
+    # Semi-transparent dark background backing
+    pad_w = 3 * key_size + 2 * gap + 2 * gap
+    pad_h = 2 * key_size + gap + 2 * gap
+    overlay = np_img.copy()
+    cv2.rectangle(
+        overlay,
+        (margin - gap, margin - gap),
+        (margin - gap + pad_w, margin - gap + pad_h),
+        (0, 0, 0),
+        -1
+    )
+    np_img = cv2.addWeighted(overlay, 0.5, np_img, 0.5, 0)
+
+    if isinstance(pose_str, (list, tuple)):
+        raw_val = pose_str[0] if len(pose_str) > 0 else ''
+    else:
+        raw_val = pose_str or ''
+
+    active_name = str(raw_val).strip().title()
+
+    for name, (kx, ky, kw, kh) in keys.items():
+        is_active = (name == active_name)
+        cx, cy = kx + kw // 2, ky + kh // 2
+        d = max(2, kw // 3)
+
+        if is_active:
+            # Highlighted yellow: RGB (255, 230, 0)
+            key_bg = (255, 230, 0)
+            arrow_color = (20, 20, 20)
+            border_color = (255, 255, 120)
+        else:
+            # Inactive / unpressed: dark key with grey arrow
+            key_bg = (40, 42, 48)
+            arrow_color = (180, 180, 185)
+            border_color = (75, 78, 85)
+
+        cv2.rectangle(np_img, (kx, ky), (kx + kw, ky + kh), key_bg, -1)
+        cv2.rectangle(np_img, (kx, ky), (kx + kw, ky + kh), border_color, 1)
+
+        # Draw directional arrow triangle
+        if name == 'Up':
+            pts = np.array([[cx, cy - d], [cx - d, cy + d - 1], [cx + d, cy + d - 1]], np.int32)
+        elif name == 'Down':
+            pts = np.array([[cx, cy + d], [cx - d, cy - d + 1], [cx + d, cy - d + 1]], np.int32)
+        elif name == 'Left':
+            pts = np.array([[cx - d, cy], [cx + d - 1, cy - d], [cx + d - 1, cy + d]], np.int32)
+        elif name == 'Right':
+            pts = np.array([[cx + d, cy], [cx - d + 1, cy - d], [cx - d + 1, cy + d]], np.int32)
+
+        cv2.fillPoly(np_img, [pts], arrow_color)
+
+    out = torch.from_numpy(np_img).float().permute(2, 0, 1) / 255.0
+    return out
 
 # ==========================================
 # MODEL SETUP WITH LORA

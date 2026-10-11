@@ -2,24 +2,89 @@ import gym
 import numpy as np
 import pygame
 from pygame import gfxdraw
-from .camera_utils import apply_camera_pose
+import math
 
 class BipedalOrthographicWrapper(gym.Wrapper):
     """
     Wraps BipedalWalker to extrude 2D Box2D shapes into 3D volumes,
-    rendering Top-Down, Orthographic Rear, Orthographic Side, and True 3D FPV.
+    rendering Top-Down, Orthographic Front, Orthographic Side, and True 3D FPV.
+    Maintains persistent camera xyz position, roll, yaw, and pitch state.
     """
-    def __init__(self, env):
+    def __init__(self, env, step_yaw_deg=8.0, step_pitch_deg=5.0):
         super().__init__(env)
         self.SCALE = 30.0
         self.VIEWPORT_W = 600
         self.VIEWPORT_H = 400
         self.fov = 400.0
         
+        # Follow/Orbit camera baseline offsets (relative to hull)
+        self.camera_dist = 250.0   # Distance behind the walker along X-axis
+        self.camera_height = 50.0  # Vertical offset above the walker
+        
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+        
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the camera in world space."""
+        base_env = self.env.unwrapped
+        if not hasattr(base_env, 'hull') or base_env.hull is None:
+            return (0.0, 0.0, 0.0)
+
+        target_x = base_env.hull.position.x * self.SCALE
+        target_y = base_env.hull.position.y * self.SCALE
+        target_z = 0.0
+
+        cos_p = math.cos(self.cam_pitch)
+        sin_p = math.sin(self.cam_pitch)
+        cos_y = math.cos(self.cam_yaw)
+        sin_y = math.sin(self.cam_yaw)
+
+        # Baseline trailing vector: [-camera_dist, 0, 0] rotated by yaw around Y, pitch around horizontal
+        cam_x = target_x - self.camera_dist * cos_y * cos_p
+        cam_y = target_y + self.camera_height + self.camera_dist * sin_p
+        cam_z = target_z + self.camera_dist * sin_y * cos_p
+
+        return (cam_x, cam_y, cam_z)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
+
     def render(self, camera_pose="Center"):
+        # 0. Accumulate camera orientation delta for 3D FPV
+        self.update_camera_pose(camera_pose)
+
         base_env = self.env.unwrapped
         
-        if base_env.screen is None and base_env.render_mode == "human":
+        if base_env.screen is None and getattr(base_env, "render_mode", None) == "human":
             return base_env.render()
             
         top_surf = pygame.Surface((self.VIEWPORT_W, self.VIEWPORT_H))
@@ -53,7 +118,7 @@ class BipedalOrthographicWrapper(gym.Wrapper):
                 connect_poly = [V_back[idx_curr], V_back[idx_next], V_front[idx_next], V_front[idx_curr]]
                 polys_3d.append((connect_poly, color, 0))
 
-        # --- 2. Extrude Missing Start Flag ---
+        # --- 2. Extrude Start Flag ---
         TERRAIN_STEP = 14.0 / self.SCALE
         flag_x = 3 * TERRAIN_STEP
         flag_y1 = (self.VIEWPORT_H / self.SCALE) / 4 
@@ -69,7 +134,7 @@ class BipedalOrthographicWrapper(gym.Wrapper):
         pole_w = 1.0 / self.SCALE
         pole_verts = [(flag_x, flag_y1), (flag_x + pole_w, flag_y1), (flag_x + pole_w, flag_y2), (flag_x, flag_y2)]
         cloth_verts = [(flag_x, flag_y2), (flag_x, flag_y2 - 10 / self.SCALE), (flag_x + 25 / self.SCALE, flag_y2 - 5 / self.SCALE)]
-                       
+                        
         for verts, is_cloth in [(pole_verts, False), (cloth_verts, True)]:
             c1, c2 = (cloth_c1, cloth_c2) if is_cloth else ((40, 40, 40), (20, 20, 20))
             V_back = [(vx * self.SCALE, vy * self.SCALE, -0.5 * self.SCALE) for vx, vy in verts]
@@ -114,11 +179,26 @@ class BipedalOrthographicWrapper(gym.Wrapper):
         proj_top, proj_front, proj_side, proj_fpv = [], [], [], []
         cy, cx = self.VIEWPORT_H / 2, self.VIEWPORT_W / 2
         
-        # FPV Camera setup (Behind the walker, looking forward down the X-axis)
-        hull_pos = base_env.hull.position
-        cam_x = hull_pos.x * self.SCALE - 250.0  
-        cam_y = hull_pos.y * self.SCALE + 50.0
-        cam_z = 0.0
+        # Get dynamically calculated position from our property
+        cam_fpv_x, cam_fpv_y, cam_fpv_z = self.cam_pos
+
+        cos_p = math.cos(self.cam_pitch)
+        sin_p = math.sin(self.cam_pitch)
+        cos_y = math.cos(self.cam_yaw)
+        sin_y = math.sin(self.cam_yaw)
+
+        # Camera coordinate frame basis vectors (looking toward target)
+        fwd_x = cos_y * cos_p
+        fwd_z = -sin_y * cos_p
+        fwd_y = -sin_p
+
+        right_x = sin_y
+        right_z = cos_y
+        right_y = 0.0
+
+        up_x = -cos_y * sin_p
+        up_z = sin_y * sin_p
+        up_y = cos_p
         
         for p_vertices, color, layer in polys_3d:
             pts_t, pts_f, pts_s, pts_fpv = [], [], [], []
@@ -128,32 +208,34 @@ class BipedalOrthographicWrapper(gym.Wrapper):
             for vx, vy, vz in p_vertices:
                 vx_scrolled = vx - scroll_x
                 
-                # A. Top-Down
+                # A. Top-Down (Orthographic invariant)
                 pts_t.append((vx_scrolled, vz + cy))
                 depths_t.append(-vy) 
                 
-                # B. Front Elevation
+                # B. Front Elevation (Orthographic invariant)
                 pts_f.append((vz + cx, self.VIEWPORT_H - vy))
                 depths_f.append(vx_scrolled) 
                 
-                # C. Side Elevation (Native)
+                # C. Side Elevation (Orthographic invariant)
                 pts_s.append((vx_scrolled, self.VIEWPORT_H - vy))
                 depths_s.append(vz) 
                 
                 # D. True 3D Perspective (FPV)
-                dx = vx - cam_x
-                dy = vy - cam_y
-                dz = vz - cam_z
+                rx = vx - cam_fpv_x
+                ry = vy - cam_fpv_y
+                rz = vz - cam_fpv_z
 
-                dx_c, dz_c, dy_c = apply_camera_pose(dx, dz, dy, camera_pose=camera_pose)
+                dx_c = rx * right_x + ry * right_y + rz * right_z  # Camera lateral axis
+                dy_c = rx * up_x    + ry * up_y    + rz * up_z     # Camera vertical axis
+                d_c  = rx * fwd_x   + ry * fwd_y   + rz * fwd_z    # Camera optical depth axis
                 
-                if dx_c < 10.0:  # Camera clipping plane
+                if d_c < 10.0:  # Near clipping plane
                     valid_fpv = False
                 else:
-                    px = (dz_c / dx_c) * self.fov + cx
-                    py = self.VIEWPORT_H - ((dy_c / dx_c) * self.fov + cy)
+                    px = (dx_c / d_c) * self.fov + cx
+                    py = self.VIEWPORT_H - ((dy_c / d_c) * self.fov + cy)
                     pts_fpv.append((px, py))
-                    depths_fpv.append(dx_c)
+                    depths_fpv.append(d_c)
                 
             if len(pts_t) >= 3: proj_top.append((sum(depths_t)/len(depths_t), pts_t, color, layer))
             if len(pts_f) >= 3: proj_front.append((sum(depths_f)/len(depths_f), pts_f, color, layer))

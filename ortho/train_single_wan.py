@@ -28,7 +28,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 # HuggingFace & Diffusers imports
-from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent
+from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose
 from buffer import OrthoTransitionBuffer
 
 from stable_baselines3 import PPO
@@ -262,75 +262,6 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
 
     return x_tau.to(dtype=transformer.dtype)
 
-
-def _annotate_frame_pose(frame_tensor, pose_str):
-    """Overlays keyboard arrow key icons with the active direction highlighted yellow on a (3, H, W) frame tensor in [0, 1]."""
-    np_img = (frame_tensor.float().permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8).copy()
-    h, w, _ = np_img.shape
-
-    # Proportional sizing based on frame dimensions
-    key_size = max(10, int(min(h, w) * 0.10))
-    gap = max(1, int(key_size * 0.15))
-    margin = max(4, int(min(h, w) * 0.04))
-
-    # Inverted-T layout: Up on top row; Left, Down, Right on bottom row
-    keys = {
-        'Up':    (margin + key_size + gap, margin, key_size, key_size),
-        'Left':  (margin, margin + key_size + gap, key_size, key_size),
-        'Down':  (margin + key_size + gap, margin + key_size + gap, key_size, key_size),
-        'Right': (margin + 2 * (key_size + gap), margin + key_size + gap, key_size, key_size),
-    }
-
-    # Semi-transparent dark background backing
-    pad_w = 3 * key_size + 2 * gap + 2 * gap
-    pad_h = 2 * key_size + gap + 2 * gap
-    overlay = np_img.copy()
-    cv2.rectangle(
-        overlay,
-        (margin - gap, margin - gap),
-        (margin - gap + pad_w, margin - gap + pad_h),
-        (0, 0, 0),
-        -1
-    )
-    np_img = cv2.addWeighted(overlay, 0.5, np_img, 0.5, 0)
-
-    active_name = str(pose_str or '').strip().title()
-
-    for name, (kx, ky, kw, kh) in keys.items():
-        is_active = (name == active_name)
-        cx, cy = kx + kw // 2, ky + kh // 2
-        d = max(2, kw // 3)
-
-        if is_active:
-            # Highlighted yellow: RGB (255, 230, 0)
-            key_bg = (255, 230, 0)
-            arrow_color = (20, 20, 20)
-            border_color = (255, 255, 120)
-        else:
-            # Inactive / unpressed: dark key with grey arrow
-            key_bg = (40, 42, 48)
-            arrow_color = (180, 180, 185)
-            border_color = (75, 78, 85)
-
-        cv2.rectangle(np_img, (kx, ky), (kx + kw, ky + kh), key_bg, -1)
-        cv2.rectangle(np_img, (kx, ky), (kx + kw, ky + kh), border_color, 1)
-
-        # Draw directional arrow triangle
-        if name == 'Up':
-            pts = np.array([[cx, cy - d], [cx - d, cy + d - 1], [cx + d, cy + d - 1]], np.int32)
-        elif name == 'Down':
-            pts = np.array([[cx, cy + d], [cx - d, cy - d + 1], [cx + d, cy - d + 1]], np.int32)
-        elif name == 'Left':
-            pts = np.array([[cx - d, cy], [cx + d - 1, cy - d], [cx + d - 1, cy + d]], np.int32)
-        elif name == 'Right':
-            pts = np.array([[cx + d, cy], [cx - d + 1, cy - d], [cx - d + 1, cy + d]], np.int32)
-
-        cv2.fillPoly(np_img, [pts], arrow_color)
-
-    out = torch.from_numpy(np_img).float().permute(2, 0, 1) / 255.0
-    return out
-
-
 @torch.no_grad()
 def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, env_name=None, rollout_steps=16, steps=20):
     """
@@ -342,7 +273,7 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
     transformer.eval()
 
     # 1. Grab continuous sequence from buffer (without episode boundaries)
-    vt_seq, vn_seq, act_seq, env_seq = buffer.sample_sequence(seq_len=rollout_steps, env_filter=env_name)
+    vt_seq, vn_seq, act_seq, env_seq, cam_seq = buffer.sample_sequence(seq_len=rollout_steps, env_filter=env_name, return_camera_states=True)
     actual_steps = len(act_seq)
 
     # Initial frame at t=0
@@ -355,25 +286,22 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
 
     print(f"Starting {actual_steps}-step Autoregressive Rollout for [{env_name or 'Default'}]...")
 
-    curr_pose = random.choice(["Up", "Down", "Left", "Right"])
-    pose_hold = 10
-
     for step_i in range(actual_steps):
         act = act_seq[step_i]
         sample_env = env_seq[step_i] or env_name
+        sample_cam = cam_seq[step_i]
+        
+        # Compose prompt with stateful context
+        prompt = compose_player_prompts(
+            [act],
+            env_name=sample_env,
+            camera_pose=sample_cam,
+        )
 
-        if pose_hold <= 0:
-            # Switch to a new distinct direction so the camera sweeps to a new angle
-            choices = [p for p in ["Up", "Down", "Left", "Right"] if p != curr_pose]
-            curr_pose = random.choice(choices)
-            pose_hold = random.randint(3, 5)
-        sample_cam = curr_pose
-        pose_hold -= 1
-
-        prompt = compose_player_prompts([act], env_name=sample_env, camera_pose=sample_cam)
         text_inputs = tokenizer(
             prompt, padding="max_length", max_length=64, truncation=True, return_tensors="pt"
         ).to(device)
+        
         prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
 
         next_latents = predict_next_view_latents(
@@ -400,9 +328,8 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
         curr_gen_fpv = decoded_views[0, 3].cpu()
         curr_gt_fpv = gt_vn_01[3]
 
-        if sample_cam and str(sample_cam).strip().lower() not in ("none", ""):
-            curr_gen_fpv = _annotate_frame_pose(curr_gen_fpv, sample_cam)
-            curr_gt_fpv = _annotate_frame_pose(curr_gt_fpv, sample_cam)
+        curr_gen_fpv = _annotate_frame_pose(curr_gen_fpv, sample_cam["command"])
+        curr_gt_fpv = _annotate_frame_pose(curr_gt_fpv, sample_cam["command"])
 
         gen_fpv.append(curr_gen_fpv)
         gt_fpv.append(curr_gt_fpv)
@@ -479,69 +406,71 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
     transformer.train()
 
 def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker"):
-    """Collects multi-camera rollouts from a gym environment into buffer."""
-    print(f"Collecting {n_steps} rollout steps from '{env_name}'...")
-    obs, _ = env.reset(seed=seed)
+  """Collects camera rollouts storing stateful camera poses."""
+  obs, _ = env.reset(seed=seed)
+  state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
+
+  current_pose = "Center"
+  pose_hold = 0
+
+  for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
+    if pose_hold <= 0:
+      if random.random() < 0.35:
+        current_pose = "Center"
+      else:
+        current_pose = random.choice(["Up", "Down", "Left", "Right"])
+      pose_hold = random.randint(3, 8)
+    else:
+      pose_hold -= 1
+
+    # Render pass returns orthographic views + FPV
+    img_top, im_rear, im_side, im_fpv = env.render(camera_pose=current_pose)
+
+    with torch.inference_mode():
+      if hasattr(agent, "predict"):
+        action, _ = agent.predict(obs, deterministic=True)
+      else:
+        action = env.action_space.sample()
+
+    next_obs, reward, terminated, truncated, _ = env.step(action)
+    done = terminated or truncated
+
+    next_top, next_rear, next_side, next_fpv = env.render(
+        camera_pose=current_pose
+    )
+
+    # Extract wrapper's stateful angles if available
+    cam_state = {
+        "command": current_pose,
+        "position": getattr(env, "cam_pos", [0.0, 0.0, 0.0]),
+        "roll": getattr(env, "cam_roll", 0.0),
+        "yaw": getattr(env, "cam_yaw", 0.0),
+        "pitch": getattr(env, "cam_pitch", 0.0),
+    }
+
+    buffer.push(
+        top_t=img_top,
+        side_t=im_side,
+        rear_t=im_rear,
+        fpv_t=im_fpv,
+        top_next=next_top,
+        side_next=next_side,
+        rear_next=next_rear,
+        fpv_next=next_fpv,
+        action=action,
+        done=done,
+        env_name=env_name,
+        camera_state=cam_state,
+    )
+
+    if done:
+      obs, _ = env.reset()
+      current_pose = "Center"
+      pose_hold = 0
+    else:
+      obs = next_obs
     state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
-
-    # 5 discrete camera pose states: Center, Up, Down, Left, Right
-    current_pose = "Center"
-    pose_hold = 0
-
-    collected = 0
-    for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
-        # Smooth burst sampling of camera poses (40% Center, 60% directional arrow keys)
-        if pose_hold <= 0:
-            if random.random() < 0.40:
-                current_pose = "Center"
-            else:
-                current_pose = random.choice(["Up", "Down", "Left", "Right"])
-            pose_hold = random.randint(3, 8)
-        else:
-            pose_hold -= 1
-
-        try:
-            img_top_down, im_rear, im_side, im_fpv = env.render(camera_pose=current_pose)
-        except TypeError:
-            img_top_down, im_rear, im_side, im_fpv = env.render()
-        
-        with torch.inference_mode():
-            if hasattr(agent, "predict"):
-                action, _ = agent.predict(obs, deterministic=True)
-            elif hasattr(agent, "feature_net"):
-                features = agent.feature_net(state)
-                if agent.is_discrete:
-                    logits = agent.actor_head(features)
-                    action = torch.argmax(logits, dim=-1).item()
-                else:
-                    mean = torch.tanh(agent.actor_mean(features))
-                    action = mean.squeeze(0).cpu().numpy()
-            else:
-                action = env.action_space.sample()
-        
-        next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-
-        try:
-            next_img_top_down, next_im_rear, next_im_side, next_im_fpv = env.render(camera_pose=current_pose)
-        except TypeError:
-            next_img_top_down, next_im_rear, next_im_side, next_im_fpv = env.render()
-
-        # Ordering convention: 0:Top, 1:Side, 2:Rear, 3:3D/FPV
-        buffer.push(
-            top_t=img_top_down, side_t=im_side, rear_t=im_rear, fpv_t=im_fpv,
-            top_next=next_img_top_down, side_next=next_im_side, rear_next=next_im_rear, fpv_next=next_im_fpv,
-            action=action, done=done, env_name=env_name, camera_pose=current_pose,
-        )
-        collected += 1
-        if done:
-            obs, _ = env.reset()
-            current_pose = "Center"
-            pose_hold = 0
-        else:
-            obs = next_obs
-        state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
-    env.close()
+  env.close()
 
 def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
     """Loops through all registered environments and populates the multi-env buffer."""
@@ -672,7 +601,6 @@ def main(args):
             views_next_seq = [v[:,-1 : :] for v in views_next_seq]
 
             with torch.no_grad():
-                # Encode views at t=0
                 latents_t = encode_views_to_latents(vae, views_t, out_dtype=model.dtype)
 
                 # Encode target views and text prompts for each step along the trajectory
@@ -688,6 +616,7 @@ def main(args):
                         env_name=env_names_seq[s],
                         camera_pose=camera_poses_seq[s],
                     )
+
                     text_inputs = tokenizer(
                         prompts_s, padding="max_length", max_length=64, truncation=True, return_tensors="pt"
                     ).to(device)

@@ -652,28 +652,15 @@ def main(args):
         print(f"Loading Multi-View LoRA from: {args.ckpt_dir}")
         multi_transformer = PeftModel.from_pretrained(base_transformer, args.ckpt_dir)
         multi_transformer.eval()
-    else:
-        print(f"[WARN] Multi-View checkpoint not found at: {args.ckpt_dir}")
 
     # 2. Load Single-View Model (supports PEFT adapter sharing or separate model)
     single_view_transformer = None
-    if args.single_ckpt_dir and os.path.exists(args.single_ckpt_dir):
-        print(f"Loading Single-View LoRA from: {args.single_ckpt_dir}")
-        if multi_transformer is not None:
-            try:
-                multi_transformer.load_adapter(args.single_ckpt_dir, adapter_name="single_view")
-                single_view_transformer = "adapter:single_view"
-                print("  [INFO] Loaded Single-View adapter onto shared base DiT (memory-efficient).")
-            except Exception as e:
-                print(f"  [INFO] Loading separate PeftModel instance for single-view ({e})")
-                base_single, _, _, _ = load_base_model(model_id=args.model_id)
-                single_view_transformer = PeftModel.from_pretrained(base_single, args.single_ckpt_dir)
-                single_view_transformer.eval()
-        else:
-            single_view_transformer = PeftModel.from_pretrained(base_transformer, args.single_ckpt_dir)
-            single_view_transformer.eval()
-    else:
-        print(f"[WARN] Single-View checkpoint not found at: {args.single_ckpt_dir}")
+    print(f"Loading Single-View LoRA from: {args.single_ckpt_dir}")
+    if multi_transformer is not None:
+        multi_transformer.load_adapter(args.single_ckpt_dir, adapter_name="single_view")
+        single_view_transformer = "adapter:single_view"
+        print("  [INFO] Loaded Single-View adapter onto shared base DiT (memory-efficient).")
+
 
     # 3. Populate buffer with gym environment rollouts
     registry = _build_registry()
@@ -793,6 +780,6 @@ if __name__ == "__main__":
     parser.add_argument("--eval_steps",      type=int, default=20)
     parser.add_argument("--buffer_steps",    type=int, default=2000)
     parser.add_argument("--save_video",      action="store_true", default=True, help="Save comparison video, gif, and strip")
-    parser.add_argument("--seed",            type=int, default=42)
+    parser.add_argument("--seed",            type=int, default=69)
     args = parser.parse_args()
     main(args)

@@ -264,75 +264,6 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
 
     return x_tau.to(dtype=transformer.dtype)
 
-
-def _annotate_frame_pose(frame_tensor, pose_str):
-    """Overlays keyboard arrow key icons with the active direction highlighted yellow on a (3, H, W) frame tensor in [0, 1]."""
-    np_img = (frame_tensor.float().permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8).copy()
-    h, w, _ = np_img.shape
-
-    # Proportional sizing based on frame dimensions
-    key_size = max(10, int(min(h, w) * 0.10))
-    gap = max(1, int(key_size * 0.15))
-    margin = max(4, int(min(h, w) * 0.04))
-
-    # Inverted-T layout: Up on top row; Left, Down, Right on bottom row
-    keys = {
-        'Up':    (margin + key_size + gap, margin, key_size, key_size),
-        'Left':  (margin, margin + key_size + gap, key_size, key_size),
-        'Down':  (margin + key_size + gap, margin + key_size + gap, key_size, key_size),
-        'Right': (margin + 2 * (key_size + gap), margin + key_size + gap, key_size, key_size),
-    }
-
-    # Semi-transparent dark background backing
-    pad_w = 3 * key_size + 2 * gap + 2 * gap
-    pad_h = 2 * key_size + gap + 2 * gap
-    overlay = np_img.copy()
-    cv2.rectangle(
-        overlay,
-        (margin - gap, margin - gap),
-        (margin - gap + pad_w, margin - gap + pad_h),
-        (0, 0, 0),
-        -1
-    )
-    np_img = cv2.addWeighted(overlay, 0.5, np_img, 0.5, 0)
-
-    active_name = str(pose_str or '').strip().title()
-
-    for name, (kx, ky, kw, kh) in keys.items():
-        is_active = (name == active_name)
-        cx, cy = kx + kw // 2, ky + kh // 2
-        d = max(2, kw // 3)
-
-        if is_active:
-            # Highlighted yellow: RGB (255, 230, 0)
-            key_bg = (255, 230, 0)
-            arrow_color = (20, 20, 20)
-            border_color = (255, 255, 120)
-        else:
-            # Inactive / unpressed: dark key with grey arrow
-            key_bg = (40, 42, 48)
-            arrow_color = (180, 180, 185)
-            border_color = (75, 78, 85)
-
-        cv2.rectangle(np_img, (kx, ky), (kx + kw, ky + kh), key_bg, -1)
-        cv2.rectangle(np_img, (kx, ky), (kx + kw, ky + kh), border_color, 1)
-
-        # Draw directional arrow triangle
-        if name == 'Up':
-            pts = np.array([[cx, cy - d], [cx - d, cy + d - 1], [cx + d, cy + d - 1]], np.int32)
-        elif name == 'Down':
-            pts = np.array([[cx, cy + d], [cx - d, cy - d + 1], [cx + d, cy - d + 1]], np.int32)
-        elif name == 'Left':
-            pts = np.array([[cx - d, cy], [cx + d - 1, cy - d], [cx + d - 1, cy + d]], np.int32)
-        elif name == 'Right':
-            pts = np.array([[cx + d, cy], [cx - d + 1, cy - d], [cx - d + 1, cy + d]], np.int32)
-
-        cv2.fillPoly(np_img, [pts], arrow_color)
-
-    out = torch.from_numpy(np_img).float().permute(2, 0, 1) / 255.0
-    return out
-
-
 @torch.no_grad()
 def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, env_name=None, rollout_steps=16, steps=20):
     """
@@ -357,25 +288,16 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
 
     print(f"Starting {actual_steps}-step Autoregressive Rollout for [{env_name or 'Default'}]...")
 
-    curr_pose = random.choice(["Up", "Down", "Left", "Right"])
-    pose_hold = 10
+    curr_pose = ["Center"]
 
     for step_i in range(actual_steps):
         act = act_seq[step_i]
         sample_env = env_seq[step_i] or env_name
         
-        if pose_hold <= 0:
-            # Switch to a new distinct direction so the camera sweeps to a new angle
-            choices = [p for p in ["Up", "Down", "Left", "Right"] if p != curr_pose]
-            curr_pose = random.choice(choices)
-            pose_hold = random.randint(3, 5)
-        sample_cam = curr_pose
-        pose_hold -= 1
-
         # Condition Wan prompt: Only the 3D FPV uses the camera pose
-        prompt = compose_player_prompts([act], env_name=sample_env, camera_pose=sample_cam)
+        prompt = compose_player_prompts([act], env_name=sample_env, camera_pose=curr_pose)
         text_inputs = tokenizer(
-            prompt, padding="max_length", max_length=64, truncation=True, return_tensors="pt"
+            prompt, padding="max_length", max_length=128, truncation=True, return_tensors="pt"
         ).to(device)
         prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
 
@@ -403,9 +325,8 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
         curr_gen_fpv = decoded_views[0, 3].cpu()
         curr_gt_fpv = gt_vn_01[3]
 
-        if sample_cam and str(sample_cam).strip().lower() not in ("none", ""):
-            curr_gen_fpv = _annotate_frame_pose(curr_gen_fpv, sample_cam)
-            curr_gt_fpv = _annotate_frame_pose(curr_gt_fpv, sample_cam)
+        # curr_gen_fpv = _annotate_frame_pose(curr_gen_fpv, curr_pose)
+        # curr_gt_fpv = _annotate_frame_pose(curr_gt_fpv, curr_pose)
 
         gen_fpv.append(curr_gen_fpv)
         gt_fpv.append(curr_gt_fpv)
@@ -489,18 +410,9 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
 
     # 5 discrete camera pose states: Center, Up, Down, Left, Right
     current_pose = "Center"
-    pose_hold = 0
-
     collected = 0
+
     for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
-        if pose_hold <= 0:
-            if random.random() < 0.40:
-                current_pose = "Center"
-            else:
-                current_pose = random.choice(["Up", "Down", "Left", "Right"])
-            pose_hold = random.randint(3, 8)
-        else:
-            pose_hold -= 1
 
         img_top_down, im_rear, im_side, im_fpv = env.render(camera_pose=current_pose)
 
@@ -568,6 +480,8 @@ def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
                 filename="ppo-CarRacing-v2.zip"
             )
             agent = PPO.load(checkpoint)
+            for _ in tqdm(range(50)): # skip first 50 frames
+                obs, reward, terminated, truncated, info = env.step(np.zeros(3))
 
         else:
             print(f"Loading PPO agent from: {ckpt_path}")
