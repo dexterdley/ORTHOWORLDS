@@ -14,7 +14,7 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
     3. Orthographic Side
     4. True 3D Perspective (First-Person)
     """
-    def __init__(self, env):
+    def __init__(self, env, step_yaw_deg=8.0, step_pitch_deg=5.0):
         super().__init__(env)
         self.WINDOW_W = 1000
         self.WINDOW_H = 800
@@ -22,14 +22,70 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
         # Camera Parameters
         self.fov = 500.0          # Used for 3D Perspective
         self.scale_factor = 25.0  # Used for Orthographic
-        self.camera_h = 10.0      
-        self.camera_z = 8.0       
-        
-    def render(self, camera_pose="Center"):
-        top_down_img = self.env.render()
-        if top_down_img is None:
-            return None, None, None, None
+        self.camera_height = 8.0
+        self.camera_dist = 12.0
 
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+        
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+    
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the camera in world space."""
+        base_env = self.env.unwrapped
+        if not hasattr(base_env, 'car') or base_env.car is None:
+            return (0.0, 0.0, 0.0)
+
+        car_x, car_y = base_env.car.hull.position
+        car_angle = base_env.car.hull.angle
+        total_yaw = car_angle + self.cam_yaw
+
+        cos_p = math.cos(self.cam_pitch)
+        sin_p = math.sin(self.cam_pitch)
+        cos_y = math.cos(total_yaw)
+        sin_y = math.sin(total_yaw)
+
+        cam_x = car_x - self.camera_dist * sin_y * cos_p
+        cam_y = car_y - self.camera_dist * cos_y * cos_p
+        cam_z = self.camera_height + self.camera_dist * sin_p
+
+        return (cam_x, cam_y, cam_z)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
+
+
+    def render(self, camera_pose="Center"):
+        self.update_camera_pose(camera_pose)
+
+        top_down_img = self.env.render()
         base_env = self.env.unwrapped
         
         # 1. Setup surfaces for the three custom views
@@ -176,9 +232,30 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                         ]
                         polys.append((side_poly, tire_side_c, 2))
 
-        # 2. Apply Projections (Orthographic & Perspective)
+        # 2. Camera Coordinates and Frame Vectors
         proj_polys_rear, proj_polys_side, proj_polys_fpv = [], [], []
         
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
+
+        total_yaw = car_angle + self.cam_yaw
+        cos_p = math.cos(self.cam_pitch)
+        sin_p = math.sin(self.cam_pitch)
+        cos_y = math.cos(total_yaw)
+        sin_y = math.sin(total_yaw)
+
+        # FPV Basis vectors
+        fwd_x = sin_y * cos_p
+        fwd_y = cos_y * cos_p
+        fwd_z = -sin_p
+
+        right_x = cos_y
+        right_y = -sin_y
+        right_z = 0.0
+
+        up_x = sin_y * sin_p
+        up_y = cos_y * sin_p
+        up_z = cos_p
+
         for p_vertices, color, layer in polys:
             pts_r, pts_s, pts_f = [], [], []
             depths_rear, depths_side, depths_fpv = [], [], []
@@ -193,9 +270,9 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                 dy = vy - car_y
                 rx = dx * cos_a - dy * sin_a
                 ry = dx * sin_a + dy * cos_a
-                zh = self.camera_h - vh
+                zh = self.camera_height - vh
                 
-                depth_cam = ry + self.camera_z
+                depth_cam = ry + self.camera_dist
                 if depth_cam < 2.5: 
                     valid_cam = False
                 
@@ -211,18 +288,24 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                 pts_s.append((px_s, py_s))
                 depths_side.append(-rx) # Lateral axis becomes side view depth
                 
-                # C. True Perspective 3D (FPV)
-                d_c, rx_c, vert_c = apply_camera_pose(depth_cam, rx, -zh, camera_pose=camera_pose)
-                zh_c = -vert_c
-                if d_c < 2.0:
+                # C. True 3D Perspective (FPV)
+                dx_w = vx - self.cam_x
+                dy_w = vy - self.cam_y
+                dz_w = vh - self.cam_z
+
+                dx_c = dx_w * right_x + dy_w * right_y + dz_w * right_z
+                dy_c = dx_w * up_x    + dy_w * up_y    + dz_w * up_z
+                d_c  = dx_w * fwd_x   + dy_w * fwd_y   + dz_w * fwd_z
+
+                if d_c < 1.0:
                     valid_fpv = False
                 else:
-                    px_f = (rx_c / d_c) * self.fov + self.WINDOW_W / 2
-                    py_f = (zh_c / d_c) * self.fov + self.WINDOW_H / 2
+                    px_f = (dx_c / d_c) * self.fov + self.WINDOW_W / 2
+                    py_f = self.WINDOW_H - ((dy_c / d_c) * self.fov + self.WINDOW_H / 2)
                     pts_f.append((px_f, py_f))
                     depths_fpv.append(d_c)
-                
-            if valid_cam and len(pts_r) >= 3: 
+
+            if valid_cam and len(pts_r) >= 3:
                 avg_d = sum(depths_rear) / len(depths_rear)
                 proj_polys_rear.append((avg_d, pts_r, color, layer))
 

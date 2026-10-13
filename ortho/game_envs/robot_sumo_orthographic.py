@@ -5,7 +5,7 @@ Two robots compete to push each other out of a circular ring.
 
 import math
 import numpy as np
-from .camera_utils import apply_camera_pose
+from .camera_utils import orbit_camera_frame, orbit_camera_offset
 
 try:
     import gymnasium as gym
@@ -491,13 +491,95 @@ class RobotSumoEnv(gym.Env):
 
 
 class RobotSumoOrthographicWrapper(gym.Wrapper):
-    """Wrapper that provides orthographic multi-view 3D rendering."""
+    """
+    Wrapper that provides orthographic multi-view 3D rendering.
+    The 3D FPV view is a third-person orbit camera trailing the player robot (robot visible).
+    Maintains persistent camera xyz position, roll, yaw, and pitch state.
+    """
 
-    def __init__(self, env):
+    def __init__(self, env, step_yaw_deg=8.0, step_pitch_deg=5.0):
         super().__init__(env)
         self.view_width = 800
         self.view_height = 600
         self.surfaces = {}
+
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+
+        # Follow/Orbit camera baseline offsets (relative to the player robot)
+        self.camera_dist = 2.0     # Distance behind the robot along its heading (plow side = forward)
+        self.camera_height = 2.0   # Height of the camera above the ground (robot top is 1.5)
+
+        # Orbit focus distance along the FPV depth axis (the player robot, camera_dist ahead)
+        self.pivot_depth = self.camera_dist
+
+        # Last computed FPV camera position (world space)
+        self.cam_x, self.cam_y, self.cam_z = 0.0, 0.0, 0.0
+
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def _cam_anchor(self):
+        """Un-orbited third-person camera anchor (camera_dist behind the player robot along its heading,
+        camera_height above the ground) used for camera-relative coordinates."""
+        base_env = self.env.unwrapped
+        if getattr(base_env, 'player_body', None) is None:
+            return (0.0, 0.0, 0.0)
+        body = base_env.player_body
+        angle = body.angle
+        # FPV depth (forward) axis in world space: (-sin a, cos a)
+        return (body.position.x + self.camera_dist * math.sin(angle),
+                body.position.y - self.camera_dist * math.cos(angle),
+                self.camera_height)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the camera in world space."""
+        base_env = self.env.unwrapped
+        if getattr(base_env, 'player_body', None) is None:
+            return (0.0, 0.0, 0.0)
+
+        anchor_x, anchor_y, anchor_z = self._cam_anchor
+        angle = base_env.player_body.angle
+
+        # Orbit displacement in the un-orbited camera frame (depth, lateral, vertical)
+        d_dep, d_lat, d_vert = orbit_camera_offset(self.cam_yaw, self.cam_pitch, self.pivot_depth)
+
+        # Map back to world axes (inverse of the FPV mapping: lateral = (cos a, sin a), depth = (-sin a, cos a))
+        cam_x = anchor_x + d_lat * math.cos(angle) - d_dep * math.sin(angle)
+        cam_y = anchor_y + d_lat * math.sin(angle) + d_dep * math.cos(angle)
+        cam_z = anchor_z + d_vert
+
+        return (cam_x, cam_y, cam_z)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
 
     def _get_3d_objects(self):
         """Extract 3D objects from the 2D environment by extruding shapes."""
@@ -572,7 +654,6 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
             'vertices_3d': top_face,
             'color': color,
             'z_center': z_top,
-            'no_fpv': is_player,
         })
 
         # Side faces
@@ -591,7 +672,6 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 'vertices_3d': side,
                 'color': side_color,
                 'z_center': (z_base + z_top) / 2,
-                'no_fpv': is_player,
             })
 
         # Plow
@@ -613,7 +693,6 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 'vertices_3d': plow_top,
                 'color': plow_color,
                 'z_center': PLOW_Z_TOP,
-                'no_fpv': is_player,
             })
 
             for i in range(4):
@@ -630,7 +709,6 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                     'vertices_3d': side,
                     'color': side_color,
                     'z_center': (PLOW_Z_BASE + PLOW_Z_TOP) / 2,
-                    'no_fpv': is_player,
                 })
 
         # Wheels
@@ -644,7 +722,6 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 'z_top': WHEEL_Z_TOP,
                 'color': COLOR_WHEEL,
                 'z_center': (WHEEL_Z_BASE + WHEEL_Z_TOP) / 2,
-                'no_fpv': is_player,
             })
 
         return objects
@@ -877,9 +954,9 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
             p2 = poly_3d[(i + 1) % len(poly_3d)]
 
             # Check if points are inside (depth >= near_z)
-            # p = (rx, ry, z). depth is ry + 0.5
-            d1 = p1[1] + 0.5
-            d2 = p2[1] + 0.5
+            # p = (d_c, lat_c, vert_c) in the orbited camera frame; depth is d_c
+            d1 = p1[0]
+            d2 = p2[0]
 
             inside1 = d1 >= near_z
             inside2 = d2 >= near_z
@@ -896,8 +973,8 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 clipped.append((ix, iy, iz))
         return clipped
 
-    def _render_fpv(self, objects, camera_pose="Center"):
-        """Render first-person view."""
+    def _render_fpv(self, objects):
+        """Render third-person 3D view (orbit camera trailing the player robot)."""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
 
@@ -905,8 +982,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         pygame.draw.rect(surface, COLOR_RING,
                          (0, self.view_height // 2, self.view_width, self.view_height // 2))
 
-        player_x = self.env.player_body.position.x
-        player_y = self.env.player_body.position.y
+        player_x, player_y, anchor_z = self._cam_anchor
         player_angle = self.env.player_body.angle
 
         render_items = []
@@ -915,25 +991,24 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 continue
 
             if obj['type'] == 'polygon' or obj['type'] == 'edge':
-                # Transform vertices to player space
-                player_space_verts = []
+                # Transform vertices to the (orbited) camera frame, then clip on orbited depth
+                cam_space_verts = []
                 for v in obj['vertices_3d']:
                     dx = v[0] - player_x
                     dy = v[1] - player_y
                     rx = dx * math.cos(-player_angle) - dy * math.sin(-player_angle)
                     ry = dx * math.sin(-player_angle) + dy * math.cos(-player_angle)
-                    player_space_verts.append((rx, ry, v[2]))
-                
-                clipped_verts = self._clip_polygon_near(player_space_verts)
+                    cam_space_verts.append(orbit_camera_frame(ry, rx, v[2] - anchor_z, self.cam_yaw, self.cam_pitch, self.pivot_depth))
+
+                clipped_verts = self._clip_polygon_near(cam_space_verts)
                 if len(clipped_verts) < 3:
                     continue
 
                 points = []
                 total_depth = 0
                 for v in clipped_verts:
-                    depth = v[1] + 0.5
                     scale = 200.0
-                    d_c, lat_c, vert_c = apply_camera_pose(depth, v[0], v[2] - 0.7, camera_pose=camera_pose)
+                    d_c, lat_c, vert_c = v
                     if d_c < 0.1:
                         d_c = 0.1
                     sx = self.view_width / 2 + (lat_c / d_c) * scale
@@ -950,8 +1025,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 dy = cy - player_y
                 rx = dx * math.cos(-player_angle) - dy * math.sin(-player_angle)
                 ry = dx * math.sin(-player_angle) + dy * math.cos(-player_angle)
-                depth = ry + 0.5
-                d_c, lat_c, vert_c = apply_camera_pose(depth, rx, obj['z_top'] - 0.7, camera_pose=camera_pose)
+                d_c, lat_c, vert_c = orbit_camera_frame(ry, rx, obj['z_top'] - anchor_z, self.cam_yaw, self.cam_pitch, self.pivot_depth)
                 if d_c < 0.1:
                     continue
                 scale = 200.0
@@ -989,6 +1063,9 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
 
     def render(self, camera_pose="Center"):
         """Return tuple of 4 orthographic views."""
+        # 0. Accumulate camera orientation delta for 3D FPV
+        self.update_camera_pose(camera_pose)
+
         if not pygame.get_init():
             pygame.init()
             pygame.font.init()
@@ -1000,7 +1077,8 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         im_top_down = self._render_top_down(objects)
         im_rear = self._render_rear(objects)
         im_side = self._render_side(objects)
-        im_fpv = self._render_fpv(objects, camera_pose=camera_pose)
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
+        im_fpv = self._render_fpv(objects)
 
         return (im_top_down, im_rear, im_side, im_fpv)
 

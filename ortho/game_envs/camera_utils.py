@@ -72,6 +72,33 @@ def apply_camera_pose(depth, lateral, vertical, camera_pose="Center", yaw_deg=20
     elif pose == "down":
         pitch = -math.radians(pitch_deg)
 
+    return rotate_camera_frame(depth, lateral, vertical, yaw, pitch)
+
+def orbit_camera_frame(depth, lateral, vertical, yaw, pitch, pivot_depth):
+    """
+    Orbits the camera around a pivot `pivot_depth` ahead on the optical axis, keeping the pivot
+    centred (camera pans around the target while still facing it), like the orbit cameras in
+    bipedal/lunar/multicar wrappers. Inputs are camera-relative points before orbiting.
+    yaw < 0 ('Left') moves the camera to the left of the target; pitch > 0 ('Up') raises it.
+    """
+    d, lat, vert = rotate_camera_frame(depth - pivot_depth, lateral, vertical, -yaw, -pitch)
+    return d + pivot_depth, lat, vert
+
+def orbit_camera_offset(yaw, pitch, pivot_depth):
+    """
+    Camera displacement (d_depth, d_lateral, d_vertical) from its un-orbited anchor, expressed in
+    the un-orbited camera frame. Add it to the anchor (mapped to world axes) to get `cam_pos`.
+    """
+    return (pivot_depth * (1.0 - math.cos(yaw) * math.cos(pitch)),
+            pivot_depth * math.sin(yaw) * math.cos(pitch),
+            pivot_depth * math.sin(pitch))
+
+def rotate_camera_frame(depth, lateral, vertical, yaw, pitch):
+    """
+    Applies an accumulated yaw/pitch (radians) to a camera-relative point.
+    Same conventions as `apply_camera_pose`: yaw > 0 turns right, pitch > 0 tilts up.
+    Used by wrappers that keep persistent `cam_yaw` / `cam_pitch` state.
+    """
     if yaw == 0.0 and pitch == 0.0:
         return depth, lateral, vertical
 

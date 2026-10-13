@@ -6,7 +6,7 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
-from .camera_utils import apply_camera_pose
+from .camera_utils import orbit_camera_frame, orbit_camera_offset
 try:
     from gymnasium import spaces
 except ImportError:
@@ -353,15 +353,91 @@ class MarioOrthographicWrapper(gym.Wrapper):
       Top-Down  : X-Z plan view  (looking down from above along -Y)
       Rear      : Z-Y elevation  (looking along +X from behind)
       Side      : X-Y elevation  → the natural 2D game view
-      FPV       : perspective from slightly behind Mario looking right
+      FPV       : true 3D third-person perspective, orbit camera trailing Mario
+                  (behind along -X, above) looking right (+X, level progression)
+
+    Maintains persistent camera xyz position, roll, yaw, and pitch state.
     """
 
-    def __init__(self, env):
+    def __init__(self, env, step_yaw_deg=8.0, step_pitch_deg=5.0):
         super().__init__(env)
         self.SCALE      = SCALE
         self.VIEWPORT_W = 800
         self.VIEWPORT_H = 600
         self.fov        = 280.0
+
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+
+        # Follow/Orbit camera baseline offsets (relative to Mario), in scaled px
+        self.camera_dist = 2.5 * SCALE     # Distance behind Mario along -X (level progression axis)
+        self.camera_height = 0.8 * SCALE   # Vertical offset above Mario's body centre
+
+        # Orbit pivot: Mario himself (camera_dist ahead of the camera along +X)
+        self.pivot_depth = self.camera_dist
+
+        # Last computed camera world position (valid before first render)
+        self.cam_x, self.cam_y, self.cam_z = 0.0, 0.0, 0.0
+
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def _cam_anchor(self):
+        """Un-orbited FPV anchor: camera_dist behind (-X) and camera_height above Mario, looking +X.
+        Trails along the level progression axis (does not flip with Mario's facing)."""
+        base = self.env.unwrapped
+        if not hasattr(base, 'player') or base.player is None:
+            return None
+        S = self.SCALE
+        cam_x = float(base.player.position.x) * S - self.camera_dist   # trailing behind
+        cam_y = float(base.player.position.y) * S + self.camera_height # above body centre
+        cam_z = 0.0                                                    # center depth
+        return (cam_x, cam_y, cam_z)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the camera in world space."""
+        anchor = self._cam_anchor
+        if anchor is None:
+            return (0.0, 0.0, 0.0)
+
+        # Orbit offset in the un-orbited camera frame (depth, lateral, vertical)
+        d_off, lat_off, v_off = orbit_camera_offset(self.cam_yaw, self.cam_pitch, self.pivot_depth)
+        # Camera frame → world: depth = +X, lateral = -Z, vertical = Y (camera always looks +X)
+        cam_x = anchor[0] + d_off
+        cam_y = anchor[1] + v_off
+        cam_z = anchor[2] - lat_off
+
+        return (cam_x, cam_y, cam_z)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
 
     # ------------------------------------------------------------------
     def _surf_to_img(self, surf):
@@ -425,6 +501,9 @@ class MarioOrthographicWrapper(gym.Wrapper):
 
     # ------------------------------------------------------------------
     def render(self, camera_pose="Center"):
+        # 0. Accumulate camera orientation delta for 3D FPV
+        self.update_camera_pose(camera_pose)
+
         base = self.env.unwrapped
 
         VW, VH = self.VIEWPORT_W, self.VIEWPORT_H
@@ -534,7 +613,7 @@ class MarioOrthographicWrapper(gym.Wrapper):
         polys_3d.append((fq, GOAL_C, 3, False))
 
         # ----------------------------------------------------------------
-        # E. Mario character — stacked coloured boxes
+        # E. Mario character — stacked coloured boxes (visible in the third-person FPV)
         # ----------------------------------------------------------------
         foot_y = p_y - P_HH    # Y at bottom of character
         mx     = p_x
@@ -550,7 +629,7 @@ class MarioOrthographicWrapper(gym.Wrapper):
                           foot_y + y_lo,
                           foot_y + y_hi,
                           Z_CHAR_LO, Z_CHAR_HI,
-                          color_f, color_t, color_f, layer, no_fpv=True)
+                          color_f, color_t, color_f, layer)
 
         mario_box(0.00, 0.22, 0.00, 0.00, MARIO_SHOE,  (120, 75, 40),  2)   # Shoes
         mario_box(0.22, 0.72, 0.00, 0.00, MARIO_OVR,   (20,  100, 230), 2)  # Overalls/legs
@@ -559,11 +638,11 @@ class MarioOrthographicWrapper(gym.Wrapper):
 
         # Arms (left & right sleeves + white gloves with animated swing)
         # Left arm & glove
-        self._add_box(polys_3d, mx - P_HW - 0.14 - swing_off, mx - P_HW + 0.02 - swing_off, foot_y + 0.74, foot_y + 1.04, Z_CHAR_LO - 0.04, Z_CHAR_HI + 0.04, MARIO_SHIRT, (230, 20, 20), MARIO_SHIRT, 3, no_fpv=True)
-        self._add_box(polys_3d, mx - P_HW - 0.14 - swing_off, mx - P_HW + 0.02 - swing_off, foot_y + 0.60, foot_y + 0.74, Z_CHAR_LO - 0.04, Z_CHAR_HI + 0.04, (250, 250, 250), (250, 250, 250), (220, 220, 220), 3, no_fpv=True)
+        self._add_box(polys_3d, mx - P_HW - 0.14 - swing_off, mx - P_HW + 0.02 - swing_off, foot_y + 0.74, foot_y + 1.04, Z_CHAR_LO - 0.04, Z_CHAR_HI + 0.04, MARIO_SHIRT, (230, 20, 20), MARIO_SHIRT, 3)
+        self._add_box(polys_3d, mx - P_HW - 0.14 - swing_off, mx - P_HW + 0.02 - swing_off, foot_y + 0.60, foot_y + 0.74, Z_CHAR_LO - 0.04, Z_CHAR_HI + 0.04, (250, 250, 250), (250, 250, 250), (220, 220, 220), 3)
         # Right arm & glove
-        self._add_box(polys_3d, mx + P_HW - 0.02 + swing_off, mx + P_HW + 0.14 + swing_off, foot_y + 0.74, foot_y + 1.04, Z_CHAR_LO - 0.04, Z_CHAR_HI + 0.04, MARIO_SHIRT, (230, 20, 20), MARIO_SHIRT, 3, no_fpv=True)
-        self._add_box(polys_3d, mx + P_HW - 0.02 + swing_off, mx + P_HW + 0.14 + swing_off, foot_y + 0.60, foot_y + 0.74, Z_CHAR_LO - 0.04, Z_CHAR_HI + 0.04, (250, 250, 250), (250, 250, 250), (220, 220, 220), 3, no_fpv=True)
+        self._add_box(polys_3d, mx + P_HW - 0.02 + swing_off, mx + P_HW + 0.14 + swing_off, foot_y + 0.74, foot_y + 1.04, Z_CHAR_LO - 0.04, Z_CHAR_HI + 0.04, MARIO_SHIRT, (230, 20, 20), MARIO_SHIRT, 3)
+        self._add_box(polys_3d, mx + P_HW - 0.02 + swing_off, mx + P_HW + 0.14 + swing_off, foot_y + 0.60, foot_y + 0.74, Z_CHAR_LO - 0.04, Z_CHAR_HI + 0.04, (250, 250, 250), (250, 250, 250), (220, 220, 220), 3)
 
         # Cap — wider than head and slightly overhanging
         self._add_box(polys_3d,
@@ -572,7 +651,7 @@ class MarioOrthographicWrapper(gym.Wrapper):
                       foot_y + 1.30,
                       foot_y + 1.55,
                       Z_CHAR_LO - 0.05, Z_CHAR_HI + 0.05,
-                      MARIO_HAT, (230, 10, 10), MARIO_HAT, 3, no_fpv=True)
+                      MARIO_HAT, (230, 10, 10), MARIO_HAT, 3)
         # Cap brim (front overhang depending on facing direction)
         if facing_right:
             self._add_box(polys_3d,
@@ -581,7 +660,7 @@ class MarioOrthographicWrapper(gym.Wrapper):
                           foot_y + 1.28,
                           foot_y + 1.38,
                           Z_CHAR_LO - 0.05, Z_CHAR_HI + 0.05,
-                          MARIO_HAT, (230, 10, 10), MARIO_HAT, 3, no_fpv=True)
+                          MARIO_HAT, (230, 10, 10), MARIO_HAT, 3)
         else:
             self._add_box(polys_3d,
                           mx - P_HW - 0.18,
@@ -589,15 +668,15 @@ class MarioOrthographicWrapper(gym.Wrapper):
                           foot_y + 1.28,
                           foot_y + 1.38,
                           Z_CHAR_LO - 0.05, Z_CHAR_HI + 0.05,
-                          MARIO_HAT, (230, 10, 10), MARIO_HAT, 3, no_fpv=True)
+                          MARIO_HAT, (230, 10, 10), MARIO_HAT, 3)
 
         # ----------------------------------------------------------------
         # F. Multi-View Projections
         # ----------------------------------------------------------------
-        # FPV camera: placed at Mario's head/eyes, looking along facing direction
-        cam_x = p_x_s
-        cam_y = (p_y + P_HH - 0.15) * S   # eye height
-        cam_z = 0.0                        # center depth
+        # Get dynamically calculated position from our property (orbited, for logging)
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
+        # Un-orbited anchor for camera-relative vectors (orbit_camera_frame applies the orbit)
+        anc_x, anc_y, anc_z = self._cam_anchor
 
         proj_top, proj_rear, proj_side, proj_fpv = [], [], [], []
 
@@ -633,21 +712,18 @@ class MarioOrthographicWrapper(gym.Wrapper):
             if no_fpv:
                 continue
 
-            # FPV: first person perspective looking along facing direction
+            # FPV: third-person orbit camera trailing Mario, looking along +X
             rel_verts = []
             for vx, vy, vz in p_verts:
-                if facing_right:
-                    dx = vx - cam_x    # forward (+X)
-                    dy = vy - cam_y    # up/down relative to eye
-                    dz = vz - cam_z    # left/right relative to eye
-                else:
-                    dx = cam_x - vx    # forward (-X when facing West)
-                    dy = vy - cam_y    # up/down relative to eye
-                    dz = cam_z - vz    # left/right relative to eye
-                rel_verts.append((dx, dy, dz))
+                dx = vx - anc_x    # forward (+X)
+                dy = vy - anc_y    # up/down relative to camera
+                dz = vz - anc_z    # left/right relative to camera
+                # Orbit first so near-plane clipping runs on the orbited depth
+                d_c, lat_c, dy_c = orbit_camera_frame(dx, -dz, dy, self.cam_yaw, self.cam_pitch, self.pivot_depth)
+                rel_verts.append((d_c, dy_c, -lat_c))
 
             clipped = []
-            near = 0.5
+            near = 0.5 * S   # 0.5 m (scaled px): keeps projected coords within gfxdraw's 16-bit range
             for i in range(len(rel_verts)):
                 pc, pp = rel_verts[i], rel_verts[i - 1]
                 if pc[0] >= near and pp[0] >= near:
@@ -661,14 +737,11 @@ class MarioOrthographicWrapper(gym.Wrapper):
                         clipped.append(pc)
 
             pts_fpv, df = [], []
-            for dx, dy, dz in clipped:
-                d_c, lat_c, dy_c = apply_camera_pose(dx, -dz, dy, camera_pose=camera_pose)
-                dz_c = -lat_c
-                if d_c > 0.1:
-                    px_f = -(dz_c / d_c) * self.fov + cx
-                    py_f = -(dy_c / d_c) * self.fov + cy
-                    pts_fpv.append((px_f, py_f))
-                    df.append(d_c)
+            for d_c, dy_c, dz_c in clipped:
+                px_f = -(dz_c / d_c) * self.fov + cx
+                py_f = -(dy_c / d_c) * self.fov + cy
+                pts_fpv.append((px_f, py_f))
+                df.append(d_c)
 
             if len(pts_fpv) >= 3:
                 proj_fpv.append((sum(df)/len(df), pts_fpv, color, layer))

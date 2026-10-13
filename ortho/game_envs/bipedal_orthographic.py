@@ -180,7 +180,7 @@ class BipedalOrthographicWrapper(gym.Wrapper):
         cy, cx = self.VIEWPORT_H / 2, self.VIEWPORT_W / 2
         
         # Get dynamically calculated position from our property
-        cam_fpv_x, cam_fpv_y, cam_fpv_z = self.cam_pos
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
 
         cos_p = math.cos(self.cam_pitch)
         sin_p = math.sin(self.cam_pitch)
@@ -221,9 +221,9 @@ class BipedalOrthographicWrapper(gym.Wrapper):
                 depths_s.append(vz) 
                 
                 # D. True 3D Perspective (FPV)
-                rx = vx - cam_fpv_x
-                ry = vy - cam_fpv_y
-                rz = vz - cam_fpv_z
+                rx = vx - self.cam_x
+                ry = vy - self.cam_y
+                rz = vz - self.cam_z
 
                 dx_c = rx * right_x + ry * right_y + rz * right_z  # Camera lateral axis
                 dy_c = rx * up_x    + ry * up_y    + rz * up_z     # Camera vertical axis
@@ -261,5 +261,4 @@ class BipedalOrthographicWrapper(gym.Wrapper):
         for surf in [top_surf, front_surf, side_surf, fpv_surf]:
             img = pygame.surfarray.array3d(surf)
             out_imgs.append(np.transpose(img, (1, 0, 2)))
-            
         return out_imgs[0], out_imgs[1], out_imgs[2], out_imgs[3]

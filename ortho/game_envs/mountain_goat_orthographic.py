@@ -11,14 +11,14 @@ Views returned by MountainGoatOrthographicWrapper.render():
   1. Top-Down  : X-Z plan view (looking down from above, centered on goat)
   2. Rear      : Z-Y elevation (looking from behind the goat along +X)
   3. Side      : X-Y elevation (native 2D side-view of the mountain climb)
-  4. 3DV / FPV : True 3D perspective from the goat's head looking West (-X) up the mountain slope
+  4. 3DV / FPV : True 3D third-person perspective from behind/above the goat looking West (-X) up the slope
 
 Fully compatible with Gym/Gymnasium and Box2D SWIG bindings.
 """
 
 import math
 import numpy as np
-from .camera_utils import apply_camera_pose
+from .camera_utils import orbit_camera_frame, orbit_camera_offset
 import pygame
 from pygame import gfxdraw
 
@@ -430,16 +430,95 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
       - Top-Down  : X-Z plan view looking down
       - Rear      : Z-Y elevation looking along +X from behind
       - Side      : X-Y elevation (the 2D mountain side view)
-      - 3DV / FPV : 3D Perspective looking West (-X) up the mountain slope from the goat's head!
+      - 3DV / FPV : 3D third-person orbit camera trailing the goat, looking West (-X) up the mountain slope
+    Maintains persistent camera xyz position, roll, yaw, and pitch state.
     """
-    def __init__(self, env):
+    def __init__(self, env, step_yaw_deg=8.0, step_pitch_deg=5.0):
         super().__init__(env)
         self.SCALE = SCALE
         self.VW = 800
         self.VH = 600
         self.fov = 320.0
 
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+
+        # Follow/Orbit camera baseline offsets (relative to torso)
+        self.camera_dist = 3.0 * SCALE    # Distance behind the goat along +X (it climbs toward -X)
+        self.camera_height = 1.0 * SCALE  # Vertical offset above the goat
+
+        # Orbit pivot: the goat itself (camera circles the goat while still facing it)
+        self.pivot_depth = self.camera_dist
+
+        # Persistent camera world position (updated each render)
+        self.cam_x, self.cam_y, self.cam_z = 0.0, 0.0, 0.0
+
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def _cam_anchor(self):
+        """Un-orbited follow-camera anchor (behind and above the goat, looking West, -X) used for projection."""
+        base = self.env.unwrapped
+        if not hasattr(base, 'torso') or base.torso is None:
+            return (0.0, 0.0, 0.0)
+
+        # 3DV / FPV Camera: trails camera_dist behind the goat (East, +X) and camera_height above it,
+        # looking West (-X direction) up the slope so the goat is fully visible
+        cam_x = base.torso.position.x * SCALE + self.camera_dist
+        cam_y = base.torso.position.y * SCALE + self.camera_height
+        cam_z = 0.0
+
+        return (cam_x, cam_y, cam_z)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the camera in world space."""
+        base = self.env.unwrapped
+        if not hasattr(base, 'torso') or base.torso is None:
+            return (0.0, 0.0, 0.0)
+
+        anchor_x, anchor_y, anchor_z = self._cam_anchor
+        # Orbit displacement in camera frame: depth = -X, lateral = -Z, vertical = +Y
+        off_d, off_lat, off_vert = orbit_camera_offset(self.cam_yaw, self.cam_pitch, self.pivot_depth)
+        cam_x = anchor_x - off_d
+        cam_y = anchor_y + off_vert
+        cam_z = anchor_z - off_lat
+
+        return (cam_x, cam_y, cam_z)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
+
     def render(self, camera_pose="Center"):
+        # 0. Accumulate camera orientation delta for 3D FPV
+        self.update_camera_pose(camera_pose)
+
         base = self.env.unwrapped
 
         top_surf  = pygame.Surface((self.VW, self.VH))
@@ -542,10 +621,10 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
         # ----------------------------------------------------------------------
         # C. Extrude Goat Body Parts (Torso, Head, Left/Right Horns, Legs)
         # ----------------------------------------------------------------------
-        # (body_obj, z0, z1, color1, color2, no_fpv)
+        # (body_obj, z0, z1, color1, color2, no_fpv) -- goat is fully visible in the third-person FPV
         body_depths = [
-            (base.torso, Z_TORSO_LO, Z_TORSO_HI, GOAT_FUR, GOAT_FUR, True),   # no_fpv = True
-            (base.head,  Z_TORSO_LO, Z_TORSO_HI, GOAT_FUR, GOAT_FUR, True),   # no_fpv = True
+            (base.torso, Z_TORSO_LO, Z_TORSO_HI, GOAT_FUR, GOAT_FUR, False),
+            (base.head,  Z_TORSO_LO, Z_TORSO_HI, GOAT_FUR, GOAT_FUR, False),
         ]
 
         if hasattr(base, 'horn_left'):
@@ -553,12 +632,12 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
         if hasattr(base, 'horn_right'):
             body_depths.append((base.horn_right, Z_HORN_RIGHT_LO, Z_HORN_RIGHT_HI, GOAT_HORN, GOAT_HORN, False))
 
-        # Add legs (no_fpv = True)
+        # Add legs
         for idx, leg_body in enumerate(base.legs):
             if idx < 4:  # Near legs
-                body_depths.append((leg_body, Z_LEG_NEAR_LO, Z_LEG_NEAR_HI, GOAT_FUR, GOAT_HOOF, True))
+                body_depths.append((leg_body, Z_LEG_NEAR_LO, Z_LEG_NEAR_HI, GOAT_FUR, GOAT_HOOF, False))
             else:        # Far legs
-                body_depths.append((leg_body, Z_LEG_FAR_LO,  Z_LEG_FAR_HI,  GOAT_FAR_FUR, GOAT_HOOF, True))
+                body_depths.append((leg_body, Z_LEG_FAR_LO,  Z_LEG_FAR_HI,  GOAT_FAR_FUR, GOAT_HOOF, False))
 
         for body_obj, z0, z1, c1, c2, no_fpv in body_depths:
             for f in body_obj.fixtures:
@@ -593,10 +672,9 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
         goat_x = base.torso.position.x * SCALE
         goat_y = base.torso.position.y * SCALE
 
-        # 3DV / FPV Camera: Located at front of goat's head looking West (-X direction)
-        cam_x = (base.head.position.x - 0.2 if hasattr(base, 'head') else base.torso.position.x) * SCALE
-        cam_y = (base.head.position.y + 0.1 if hasattr(base, 'head') else base.torso.position.y) * SCALE
-        cam_z = 0.0
+        # Get dynamically calculated (orbited) position from our property; project from the anchor
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
+        anchor_x, anchor_y, anchor_z = self._cam_anchor
 
         for poly_item in polys_3d:
             if len(poly_item) == 4:
@@ -632,12 +710,14 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
                 continue
 
             # D. 3DV / FPV: Perspective looking WEST (-X direction) up mountain with Sutherland-Hodgman near plane clipping
+            # Camera-relative points are orbited first so the near plane clips on the true (orbited) depth
             rel_verts_fpv = []
             for vx, vy, vz in p_verts:
-                dx = cam_x - vx          # Positive when objects are West of the camera (in front)
-                dy = vy - cam_y          # Vertical relative to head
-                dz = cam_z - vz          # Lateral relative to head
-                rel_verts_fpv.append((dx, dy, dz))
+                dx = anchor_x - vx     # Positive when objects are West of the camera (in front)
+                dy = vy - anchor_y     # Vertical relative to camera
+                dz = anchor_z - vz     # Lateral relative to camera
+                d_o, dz_o, dy_o = orbit_camera_frame(dx, dz, dy, self.cam_yaw, self.cam_pitch, self.pivot_depth)
+                rel_verts_fpv.append((d_o, dy_o, dz_o))
 
             clipped_fpv = []
             near = 0.5 * SCALE  # 0.5 metres in front of camera
@@ -661,8 +741,7 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
 
             if len(clipped_fpv) >= 3:
                 pts_fpv = []
-                for dx_c, dy_c, dz_c in clipped_fpv:
-                    d_c, dz_rot, dy_rot = apply_camera_pose(dx_c, dz_c, dy_c, camera_pose=camera_pose)
+                for d_c, dy_rot, dz_rot in clipped_fpv:
                     if d_c > 0.1:
                         px = (dz_rot / d_c) * self.fov + cx
                         py = self.VH - ((dy_rot / d_c) * self.fov + cy)

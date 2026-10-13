@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from .camera_utils import apply_camera_pose
+from .camera_utils import orbit_camera_frame, orbit_camera_offset
 
 try:
     import gymnasium as gym
@@ -178,7 +178,6 @@ class TankDuelEnv(gym.Env):
             "type": "player_body",
             "color": COLOR_PLAYER_BODY,
             "z": Z_TANK_BODY,
-            "no_fpv": True,
         }
 
         # Player turret (visual only, tracked by angle)
@@ -195,7 +194,6 @@ class TankDuelEnv(gym.Env):
             "type": "player_turret",
             "color": COLOR_PLAYER_TURRET,
             "z": Z_TANK_TURRET,
-            "no_fpv": True,
         }
 
         # Joint connecting turret to body
@@ -560,12 +558,95 @@ class TankDuelEnv(gym.Env):
 
 
 class TankDuelOrthographicWrapper(gym.Wrapper):
-    """Wraps TankDuelEnv to provide orthographic multi-view 3D rendering."""
+    """
+    Wraps TankDuelEnv to provide orthographic multi-view 3D rendering.
+    Maintains persistent camera xyz position, roll, yaw, and pitch state.
+    The 3D FPV view is a third-person orbit camera trailing the player tank body (tank fully visible).
+    """
 
-    def __init__(self, env):
+    def __init__(self, env, step_yaw_deg=8.0, step_pitch_deg=5.0):
         super().__init__(env)
         self.view_w = SCREEN_W
         self.view_h = SCREEN_H
+
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+
+        # Follow/Orbit camera baseline offsets (relative to player tank body, 3 m x 2 m hull, ~1.5 m tall with turret)
+        self.camera_dist = 4.5     # Distance behind the tank centre along its forward heading (stays inside the 5 m spawn-to-wall gap)
+        self.camera_height = 2.0   # Vertical offset above the tank base (camera at world z = 2.5, level with the wall tops)
+
+        # Orbit pivot distance (m) along the FPV optical axis: the tank itself, so the camera circles the player
+        self.pivot_depth = self.camera_dist
+
+        # Last computed camera world position
+        self.cam_x, self.cam_y, self.cam_z = 0.0, 0.0, 0.0
+
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def _cam_anchor(self):
+        """Un-orbited FPV camera anchor (world X, Y, Z) used for camera-relative projection."""
+        base_env = self.env.unwrapped
+        if getattr(base_env, 'player_body', None) is None:
+            return (0.0, 0.0, 0.0)
+
+        px, py = base_env.player_body.position[0], base_env.player_body.position[1]
+        player_angle = base_env.player_body.angle
+        # Third-person: camera trails camera_dist behind the tank body along its heading, camera_height above it
+        cam_x = px - math.cos(player_angle) * self.camera_dist
+        cam_y = py - math.sin(player_angle) * self.camera_dist
+        cam_z = Z_TANK_BODY + self.camera_height
+
+        return (cam_x, cam_y, cam_z)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the orbited camera in world space."""
+        base_env = self.env.unwrapped
+        if getattr(base_env, 'player_body', None) is None:
+            return (0.0, 0.0, 0.0)
+
+        ax, ay, az = self._cam_anchor
+        player_angle = base_env.player_body.angle
+        d_depth, d_lat, d_vert = orbit_camera_offset(self.cam_yaw, self.cam_pitch, self.pivot_depth)
+        # Inverse of _project_fpv's mapping: depth axis = (cos a, sin a), lateral (right) axis = (sin a, -cos a)
+        cos_a = math.cos(player_angle)
+        sin_a = math.sin(player_angle)
+        cam_x = ax + d_depth * cos_a + d_lat * sin_a
+        cam_y = ay + d_depth * sin_a - d_lat * cos_a
+        cam_z = az + d_vert
+
+        return (cam_x, cam_y, cam_z)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
 
     def _get_3d_shapes(self):
         """Extract all bodies and extrude them into 3D shapes."""
@@ -785,8 +866,8 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
         )
 
-    def _project_fpv(self, shapes, player_pos, player_angle, camera_pose="Center"):
-        """First Person View: perspective projection from player's viewpoint."""
+    def _project_fpv(self, shapes, player_pos, player_angle):
+        """3D FPV: third-person perspective projection from the orbit camera trailing the player tank."""
         surface = pygame.Surface((self.view_w, self.view_h))
         surface.fill(COLOR_SKY)
 
@@ -795,12 +876,8 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
             surface, COLOR_GROUND, (0, self.view_h // 2, self.view_w, self.view_h // 2)
         )
 
-        px, py = player_pos
-        # Camera slightly forward and up from player
-        cam_forward = 2.0
-        cam_x = px + math.cos(player_angle) * cam_forward
-        cam_y = py + math.sin(player_angle) * cam_forward
-        cam_z = 1.5  # camera height
+        # Un-orbited camera anchor; orbit_camera_frame applies the orbit (cam_pos is the orbited position)
+        cam_x, cam_y, cam_z = self._cam_anchor
 
         fov_scale = 400.0  # focal length in pixels
 
@@ -821,14 +898,14 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
 
                 # Rotate to camera frame (forward is player_angle)
                 # Camera looks along player_angle direction
-                cos_a = math.cos(-player_angle)
-                sin_a = math.sin(-player_angle)
-                # After rotation: x_cam = right, y_cam = forward (depth), z_cam = up
-                x_cam = dx * cos_a - dy * sin_a
-                y_cam = dx * sin_a + dy * cos_a
+                cos_a = math.cos(player_angle)
+                sin_a = math.sin(player_angle)
+                # x_cam = right (sin a, -cos a), y_cam = forward/depth (cos a, sin a), z_cam = up
+                x_cam = dx * sin_a - dy * cos_a
+                y_cam = dx * cos_a + dy * sin_a
                 z_cam = dz
 
-                d_c, x_c, z_c = apply_camera_pose(y_cam, x_cam, z_cam, camera_pose=camera_pose)
+                d_c, x_c, z_c = orbit_camera_frame(y_cam, x_cam, z_cam, self.cam_yaw, self.cam_pitch, self.pivot_depth)
                 cam_verts.append((x_c, d_c, z_c))
 
             # Clip against near plane (y_cam > Z_NEAR)
@@ -844,7 +921,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
                 if cv[1] <= 0:
                     valid = False
                     break
-                sx = int(-cv[0] / cv[1] * fov_scale + self.view_w / 2)
+                sx = int(cv[0] / cv[1] * fov_scale + self.view_w / 2)
                 sy = int(-cv[2] / cv[1] * fov_scale + self.view_h / 2)
                 points.append((sx, sy))
                 avg_depth += cv[1]
@@ -927,15 +1004,17 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
                         output.append(intersect(prev, current, edge_func))
                     output.append(current)
                 elif prev_inside:
-                    output.append(intersect(prev, current, edge_func))
+                    # intersect() expects (outside, inside); passing (inside, outside) converged to the far
+                    # off-screen point, which overflowed gfxdraw's int16 coords as stray lines
+                    output.append(intersect(current, prev, edge_func))
             return output
 
         def intersect(p1, p2, edge_func):
-            # Binary search for intersection (simple approach)
+            # Binary search for intersection (simple approach); p1 outside, p2 inside
             # For axis-aligned edges this is straightforward
             x1, y1 = p1
             x2, y2 = p2
-            for _ in range(10):
+            for _ in range(24):
                 mx = (x1 + x2) / 2
                 my = (y1 + y2) / 2
                 if edge_func((mx, my)):
@@ -958,6 +1037,9 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
 
     def render(self, camera_pose="Center"):
         """Returns tuple of 4 views: (top_down, rear, side, fpv)"""
+        # 0. Accumulate camera orientation delta for 3D FPV
+        self.update_camera_pose(camera_pose)
+
         if not pygame.get_init():
             pygame.init()
 
@@ -970,7 +1052,9 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
         im_top_down = self._project_top_down(shapes, player_pos)
         im_rear = self._project_rear(shapes, player_pos, env.player_body.angle)
         im_side = self._project_side(shapes, player_pos, env.player_body.angle)
-        im_fpv = self._project_fpv(shapes, player_pos, env.player_body.angle, camera_pose=camera_pose)
+        # Get dynamically calculated position from our property
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
+        im_fpv = self._project_fpv(shapes, player_pos, env.player_body.angle)
 
         return (im_top_down, im_rear, im_side, im_fpv)
 

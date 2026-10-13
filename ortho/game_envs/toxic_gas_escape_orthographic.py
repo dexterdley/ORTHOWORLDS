@@ -6,7 +6,7 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
-from .camera_utils import apply_camera_pose
+from .camera_utils import orbit_camera_frame, orbit_camera_offset
 try:
     from gymnasium import spaces
 except ImportError:
@@ -247,14 +247,94 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
       Rear     : X-Z elevation  (looking from South wall toward North)
       Side     : Y-Z elevation  (looking from West wall toward East)
       FPV      : perspective from car roof looking forward along heading
+
+    Maintains persistent camera xyz position, roll, yaw, and pitch state.
     """
 
-    def __init__(self, env):
+    def __init__(self, env, step_yaw_deg=8.0, step_pitch_deg=5.0):
         super().__init__(env)
         self.SCALE      = SCALE
         self.VIEWPORT_W = 800
         self.VIEWPORT_H = 600
         self.fov        = 300.0
+
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+
+        # Orbit pivot: player car, 1.5 m ahead of the trailing camera anchor (scaled pixels)
+        self.pivot_depth = 1.5 * SCALE
+
+        # Camera world position (refreshed each render from cam_pos)
+        self.cam_x, self.cam_y, self.cam_z = 0.0, 0.0, 0.0
+
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the orbited camera in world space."""
+        base = self.env.unwrapped
+        if not hasattr(base, 'player') or base.player is None:
+            return (0.0, 0.0, 0.0)
+
+        ax, ay, az = self._cam_anchor
+        p_angle = float(base.player.angle)
+        # Orbit offset in the un-orbited camera frame (depth along heading, lateral to the right, vertical up)
+        od, ol, ov = orbit_camera_offset(self.cam_yaw, self.cam_pitch, self.pivot_depth)
+        cam_x = ax + od * math.cos(p_angle) + ol * math.sin(p_angle)
+        cam_y = ay + od * math.sin(p_angle) - ol * math.cos(p_angle)
+        cam_z = az + ov
+
+        return (cam_x, cam_y, cam_z)
+
+    @property
+    def _cam_anchor(self):
+        """Un-orbited FPV camera anchor (trailing the car) used for camera-relative projection."""
+        base = self.env.unwrapped
+        if not hasattr(base, 'player') or base.player is None:
+            return (0.0, 0.0, 0.0)
+
+        S = self.SCALE
+        p_angle = float(base.player.angle)
+        p_x = base.player.position.x * S
+        p_y = base.player.position.y * S
+
+        # FPV camera: slightly behind car at roof height, looking along heading
+        cam_offset = -1.5 * S
+        cam_h      = CAR_Z_HI * S * 1.2
+        cam_x  = p_x + cam_offset * math.cos(p_angle)
+        cam_y  = p_y + cam_offset * math.sin(p_angle)
+        cam_z  = cam_h
+
+        return (cam_x, cam_y, cam_z)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
 
     # ------------------------------------------------------------------
     def _surf_to_img(self, surf):
@@ -275,6 +355,9 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
 
     # ------------------------------------------------------------------
     def render(self, camera_pose="Center"):
+        # 0. Accumulate camera orientation delta for 3D FPV
+        self.update_camera_pose(camera_pose)
+
         base = self.env.unwrapped
 
         VW, VH = self.VIEWPORT_W, self.VIEWPORT_H
@@ -436,12 +519,10 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
         p_x = base.player.position.x * S
         p_y = base.player.position.y * S
 
-        # FPV camera: slightly behind car at roof height, looking along heading
-        cam_offset = -1.5 * S
-        cam_h      = CAR_Z_HI * S * 1.2
-        cam_x  = p_x + cam_offset * math.cos(p_angle)
-        cam_y  = p_y + cam_offset * math.sin(p_angle)
-        cam_z  = cam_h
+        # Get dynamically calculated position from our property
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
+        # Projection uses the un-orbited anchor; orbit_camera_frame applies the orbit
+        anc_x, anc_y, anc_z = self._cam_anchor
 
         cos_a = math.cos(-p_angle)
         sin_a = math.sin(-p_angle)
@@ -484,8 +565,8 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
             # FPV — perspective projection
             rel_verts = []
             for vx, vy, vz in p_verts:
-                dx, dy = vx - cam_x, vy - cam_y
-                dz = vz - cam_z
+                dx, dy = vx - anc_x, vy - anc_y
+                dz = vz - anc_z
                 # Rotate into camera-forward space
                 rfwd  =  dx * cos_a - dy * sin_a   # depth (forward)
                 rright = dx * sin_a + dy * cos_a   # lateral
@@ -508,7 +589,7 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
 
             pts_fpv, df = [], []
             for rfwd, rright, rup in clipped:
-                d_c, lat_c, vert_c = apply_camera_pose(rfwd, -rright, -rup, camera_pose=camera_pose)
+                d_c, lat_c, vert_c = orbit_camera_frame(rfwd, -rright, -rup, self.cam_yaw, self.cam_pitch, self.pivot_depth)
                 rright_c = -lat_c
                 rup_c = -vert_c
                 if d_c > 0.1:

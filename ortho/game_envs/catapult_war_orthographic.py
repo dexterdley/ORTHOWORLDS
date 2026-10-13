@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from .camera_utils import apply_camera_pose
+from .camera_utils import orbit_camera_frame, orbit_camera_offset
 
 try:
     import gymnasium as gym
@@ -410,17 +410,99 @@ class CatapultWarEnv(gym.Env):
 
 
 class CatapultWarOrthographicWrapper(gym.Wrapper):
-    """Wraps CatapultWarEnv to produce orthographic multi-view 3D renders."""
+    """
+    Wraps CatapultWarEnv to produce orthographic multi-view 3D renders plus a
+    third-person true-3D view (orbit camera trailing the catapult).
+    Maintains persistent camera xyz position, roll, yaw, and pitch state.
+    """
 
-    def __init__(self, env=None, render_mode='rgb_array'):
+    def __init__(self, env=None, render_mode='rgb_array', step_yaw_deg=8.0, step_pitch_deg=5.0):
         if env is None:
             env = CatapultWarEnv(render_mode=render_mode)
         super().__init__(env)
         self.view_width = SCREEN_WIDTH
         self.view_height = SCREEN_HEIGHT
 
+        # Follow/Orbit camera baseline offsets (relative to catapult base)
+        self.camera_dist = 4.5    # Distance behind the catapult along -X (catapult is ~5 m long; FPV FOV is wide)
+        self.camera_height = 2.0   # Vertical offset above the catapult base
+
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+        self.pivot_depth = self.camera_dist  # Orbit focus on the catapult (camera circles the player)
+
+        # Last computed camera position (updated in render)
+        self.cam_x, self.cam_y, self.cam_z = 0.0, 0.0, 0.0
+
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def _cam_anchor(self):
+        """Un-orbited trailing camera (behind/above the catapult, looking +X) used as origin for camera-relative vectors."""
+        base_env = self.env.unwrapped
+        if not hasattr(base_env, 'catapult_base'):
+            return (0.0, 0.0, 0.0)
+
+        # Player reference position (catapult)
+        if base_env.catapult_base:
+            player_x = base_env.catapult_base.position[0]
+            player_y = base_env.catapult_base.position[1]
+        else:
+            player_x, player_y = 10.0, 2.0
+
+        # Third-person trailing camera: camera_dist behind (-X) and camera_height above the catapult
+        return (player_x - self.camera_dist, player_y + self.camera_height, 0.0)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the camera in world space."""
+        base_env = self.env.unwrapped
+        if not hasattr(base_env, 'catapult_base'):
+            return (0.0, 0.0, 0.0)
+
+        anchor_x, anchor_y, anchor_z = self._cam_anchor
+        # Orbit displacement in camera frame; FPV maps depth->+X, lateral->+Z, vertical->+Y
+        d_depth, d_lat, d_vert = orbit_camera_offset(self.cam_yaw, self.cam_pitch, self.pivot_depth)
+        cam_x = anchor_x + d_depth
+        cam_y = anchor_y + d_vert
+        cam_z = anchor_z + d_lat
+
+        return (cam_x, cam_y, cam_z)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
+
     def render(self, camera_pose="Center"):
         """Returns tuple of 4 orthographic views: (top_down, rear, side, fpv)"""
+        # 0. Accumulate camera orientation delta for 3D FPV
+        self.update_camera_pose(camera_pose)
+
         # Ensure pygame is initialized for fonts and surfaces
         if not pygame.get_init():
             pygame.init()
@@ -442,7 +524,9 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
         im_top_down = self._render_top_down(objects_3d, player_x, player_y)
         im_rear = self._render_rear(objects_3d, player_x, player_y)
         im_side = self._render_side(objects_3d, player_x, player_y)
-        im_fpv = self._render_fpv(objects_3d, player_x, player_y, camera_pose=camera_pose)
+        # Get dynamically calculated position from our property
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
+        im_fpv = self._render_fpv(objects_3d, player_x, player_y)
 
         return (im_top_down, im_rear, im_side, im_fpv)
 
@@ -457,7 +541,8 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
             'z_min': -5.0,
             'z_max': 5.0,
             'color': COLOR_TERRAIN,
-            'depth': 0.0
+            'depth': 0.0,
+            'no_fpv': True  # 3D view draws the ground as its backdrop plane
         })
 
         # Catapult base
@@ -470,7 +555,8 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                     'z_min': -1.0,
                     'z_max': 1.0,
                     'color': COLOR_CATAPULT_BASE,
-                    'depth': Z_CATAPULT
+                    'depth': Z_CATAPULT,
+                    'player': True  # drawn as a solid extruded volume in the 3D view
                 })
 
         # Catapult arm
@@ -483,7 +569,8 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                     'z_min': -0.3,
                     'z_max': 0.3,
                     'color': COLOR_CATAPULT_ARM,
-                    'depth': Z_CATAPULT + 0.5
+                    'depth': Z_CATAPULT + 0.5,
+                    'player': True  # drawn as a solid extruded volume in the 3D view
                 })
 
         # Boulder
@@ -664,8 +751,8 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
         ).copy()
 
-    def _render_fpv(self, objects, player_x, player_y, camera_pose="Center"):
-        """First-person view: looking from catapult toward enemy"""
+    def _render_fpv(self, objects, player_x, player_y):
+        """Third-person 3D view: trailing camera behind the catapult looking toward the enemy"""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
 
@@ -673,41 +760,63 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
         pygame.draw.rect(surface, COLOR_TERRAIN,
                          (0, self.view_height // 2, self.view_width, self.view_height // 2))
 
-        # Simple perspective projection from catapult position
-        eye_x = player_x
-        eye_y = player_y + 3.0
-        eye_z = 0.0
+        # Simple perspective projection from un-orbited trailing camera; orbit_camera_frame applies the orbit
+        eye_x, eye_y, eye_z = self._cam_anchor
+        near = 0.1
 
-        # Sort by distance (far first)
-        def get_dist(obj):
-            if obj['type'] == 'box':
-                avg_x = sum(v[0] for v in obj['vertices_2d']) / len(obj['vertices_2d'])
-            else:
-                avg_x = obj['center'][0]
-            return -(avg_x - eye_x)
+        def to_cam(x, y, z):
+            # Camera-relative (depth=+X, lateral=+Z, vertical=+Y), then orbited around the catapult
+            return orbit_camera_frame(x - eye_x, z - eye_z, y - eye_y,
+                                      self.cam_yaw, self.cam_pitch, self.pivot_depth)
 
-        sorted_objs = sorted(objects, key=get_dist)
-
-        for obj in sorted_objs:
+        # Build drawable items (orbited depth, kind, color, data). Scene boxes are drawn as their
+        # z_min face; the player's (catapult) boxes are drawn as solid extruded volumes.
+        items = []
+        for obj in objects:
+            if obj.get('no_fpv'):
+                continue
             if obj['type'] == 'box':
                 verts = obj['vertices_2d']
-                avg_x = sum(v[0] for v in verts) / len(verts)
-                depth = avg_x - eye_x
+                z0 = obj.get('z_min', 0)
+                faces = [(obj['color'], [(v[0], v[1], z0) for v in verts])]
+                if obj.get('player'):
+                    z1 = obj.get('z_max', 0)
+                    side = tuple(int(c * 0.75) for c in obj['color'])
+                    faces.append((obj['color'], [(v[0], v[1], z1) for v in verts]))
+                    for i in range(len(verts)):
+                        a, b = verts[i], verts[(i + 1) % len(verts)]
+                        faces.append((side, [(a[0], a[1], z0), (b[0], b[1], z0),
+                                             (b[0], b[1], z1), (a[0], a[1], z1)]))
+                for color, face in faces:
+                    cam_verts = [to_cam(*p) for p in face]
+                    depth = sum(c[0] for c in cam_verts) / len(cam_verts)
+                    items.append((depth, 'poly', color, cam_verts))
+            elif obj['type'] == 'circle':
+                cam_c = to_cam(obj['center'][0], obj['center'][1], 0.0)
+                items.append((cam_c[0], 'circle', obj['color'], (cam_c, obj['radius'])))
 
-                if depth <= 0.5:
-                    continue
+        # Sort by orbited depth (far first)
+        items.sort(key=lambda it: -it[0])
+
+        for _, kind, color, data in items:
+            if kind == 'poly':
+                cam_verts = data
+
+                # Clip polygon against the near plane on the orbited depth
+                clipped = []
+                n = len(cam_verts)
+                for i in range(n):
+                    a, b = cam_verts[i], cam_verts[(i + 1) % n]
+                    a_in, b_in = a[0] >= near, b[0] >= near
+                    if a_in:
+                        clipped.append(a)
+                    if a_in != b_in:
+                        t = (near - a[0]) / (b[0] - a[0])
+                        clipped.append(tuple(a[k] + t * (b[k] - a[k]) for k in range(3)))
 
                 # Project vertices
                 screen_verts = []
-                for v in verts:
-                    dx = v[0] - eye_x
-                    dy = v[1] - eye_y
-                    if dx <= 0.5:
-                        continue
-                    z_val = obj.get('z_min', 0)
-                    d_c, z_c, dy_c = apply_camera_pose(dx, z_val, dy, camera_pose=camera_pose)
-                    if d_c <= 0.1:
-                        continue
+                for d_c, z_c, dy_c in clipped:
                     proj_scale = 200.0 / d_c
                     sx = int(self.view_width / 2 + z_c * proj_scale)
                     sy = int(self.view_height / 2 - dy_c * proj_scale)
@@ -716,27 +825,24 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                 if len(screen_verts) >= 3:
                     if any(0 <= v[0] < self.view_width and 0 <= v[1] < self.view_height for v in screen_verts):
                         try:
-                            pygame.draw.polygon(surface, obj['color'], screen_verts)
+                            pygame.draw.polygon(surface, color, screen_verts)
                             pygame.gfxdraw.aapolygon(surface, screen_verts, (0, 0, 0))
                         except (ValueError, TypeError):
                             pass
 
-            elif obj['type'] == 'circle':
-                cx, cy = obj['center']
-                r = obj['radius']
-                dx = cx - eye_x
-                dy = cy - eye_y
+            elif kind == 'circle':
+                (d_c, z_c, dy_c), r = data
 
-                if dx <= 0.5:
+                if d_c <= 0.5:
                     continue
 
-                proj_scale = 200.0 / dx
-                sx = int(self.view_width / 2)
-                sy = int(self.view_height / 2 - dy * proj_scale)
+                proj_scale = 200.0 / d_c
+                sx = int(self.view_width / 2 + z_c * proj_scale)
+                sy = int(self.view_height / 2 - dy_c * proj_scale)
                 sr = max(1, int(r * proj_scale))
 
                 if 0 <= sx < self.view_width and 0 <= sy < self.view_height:
-                    pygame.draw.circle(surface, obj['color'], (sx, sy), sr)
+                    pygame.draw.circle(surface, color, (sx, sy), sr)
 
         # Crosshair
         cx, cy = self.view_width // 2, self.view_height // 2

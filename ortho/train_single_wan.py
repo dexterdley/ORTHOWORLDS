@@ -263,9 +263,12 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
     return x_tau.to(dtype=transformer.dtype)
 
 @torch.no_grad()
-def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, env_name=None, rollout_steps=16, steps=20):
+def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, env_name=None, env=None, rollout_steps=16, steps=20):
     """
     Autoregressive video rollout for all 4 orthographic views.
+    The model is trained on FPV only (1 context frame -> 1 target frame), so each view is
+    rolled out independently as its own batch item with the same 2-frame layout. Top/Side/Rear
+    rollouts therefore test how an FPV-only model generalizes to unseen views.
     Returns:
       gen_views: (vid_top, vid_rear, vid_side, vid_fpv) each (1, T, 3, H, W) in [0, 1]
       gt_views:  (gt_top,  gt_rear,  gt_side,  gt_fpv)  each (1, T, 3, H, W) in [0, 1]
@@ -274,23 +277,56 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
 
     # 1. Grab continuous sequence from buffer (without episode boundaries)
     vt_seq, vn_seq, act_seq, env_seq, cam_seq = buffer.sample_sequence(seq_len=rollout_steps, env_filter=env_name, return_camera_states=True)
-    actual_steps = len(act_seq)
 
-    # Initial frame at t=0
-    curr_views = torch.from_numpy(vt_seq[0:1]).float().to(device) / 127.5 - 1.0
+    obs, _ = env.reset()
+    if env_name == "MultiCar Racing":
+        for _ in tqdm(range(50)): # skip first 50 frames
+            obs, reward, terminated, truncated, info = env.step(np.zeros(3))
+
+    img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Right")
+
+    # Each view becomes its own batch item: (4, 1, 3, H, W) -> latents (4, C, 1, h, w)
+    vt = [cv2.resize(x, (96, 96), interpolation=cv2.INTER_AREA) for x in [img_top, im_side, im_rear, im_fpv]]
+    vt = np.stack([np.transpose(v, (2, 0, 1)) for v in vt])
+    vt = np.expand_dims(vt, axis=1)
+
+    curr_views = torch.from_numpy(vt).float().to(device) / 127.5 - 1.0
     curr_latents = encode_views_to_latents(vae, curr_views, out_dtype=transformer.dtype)
+    num_views = curr_latents.shape[0]
 
     # Frame storage (0: Top, 1: Side, 2: Rear, 3: FPV)
     gen_top, gen_side, gen_rear, gen_fpv = [], [], [], []
     gt_top,  gt_side,  gt_rear,  gt_fpv  = [], [], [], []
 
-    print(f"Starting {actual_steps}-step Autoregressive Rollout for [{env_name or 'Default'}]...")
+    print(f"Starting {rollout_steps}-step Autoregressive Rollout for [{env_name or 'Default'}]...")
 
-    for step_i in range(actual_steps):
+    for step_i in range(rollout_steps):
         act = act_seq[step_i]
-        sample_env = env_seq[step_i] or env_name
-        sample_cam = cam_seq[step_i]
         
+        # Adapt action for env.step (Discrete vs Box)
+        step_act = act
+        if hasattr(env, "action_space"):
+            if hasattr(env.action_space, "n"):  # Discrete (e.g. Lunar Lander)
+                if isinstance(step_act, (np.ndarray, list)):
+                    step_act = int(round(float(step_act[0])))
+                else:
+                    step_act = int(round(float(step_act)))
+                step_act = max(0, min(step_act, env.action_space.n - 1))
+            elif hasattr(env.action_space, "shape"):  # Box (e.g. Bipedal Walker, Car Racing)
+                step_act = np.array(step_act, dtype=np.float32).flatten()
+                target_dim = env.action_space.shape[0]
+                if step_act.size >= target_dim:
+                    step_act = step_act[:target_dim]
+                else:
+                    step_act = env.action_space.sample()
+                step_act = np.clip(step_act, env.action_space.low, env.action_space.high)
+
+        sample_env = env_seq[step_i] or env_name
+        sample_cam = dict(cam_seq[step_i])  # copy so the buffer's stored dict isn't mutated
+
+        sample_cam["command"] = "Right"
+        sample_cam["x"] += 1.0
+
         # Compose prompt with stateful context
         prompt = compose_player_prompts(
             [act],
@@ -299,10 +335,11 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
         )
 
         text_inputs = tokenizer(
-            prompt, padding="max_length", max_length=64, truncation=True, return_tensors="pt"
+            prompt, padding="max_length", max_length=128, truncation=True, return_tensors="pt"
         ).to(device)
         
         prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
+        prompt_embeds = prompt_embeds.expand(num_views, -1, -1)
 
         next_latents = predict_next_view_latents(
             transformer=transformer,
@@ -311,22 +348,30 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
             steps=steps,
         )
 
-        decoded_views = decode_latents_to_views(vae, next_latents)  # (1, 4, 3, H, W) in [0, 1]
+        decoded_views = decode_latents_to_views(vae, next_latents)  # (4, 1, 3, H, W) in [0, 1]
 
         # Store generated frames (0: Top, 1: Side, 2: Rear, 3: FPV)
         gen_top.append(decoded_views[0, 0].cpu())
-        gen_side.append(decoded_views[0, 1].cpu())
-        gen_rear.append(decoded_views[0, 2].cpu())
+        gen_side.append(decoded_views[1, 0].cpu())
+        gen_rear.append(decoded_views[2, 0].cpu())
+        
+        next_obs, reward, terminated, truncated, _ = env.step(step_act)
+        next_top, next_rear, next_side, next_fpv = env.render(
+            camera_pose=sample_cam["command"]
+        )
+        if terminated or truncated:
+            env.reset()
+        vn = [cv2.resize(x, (96, 96), interpolation=cv2.INTER_AREA) for x in [next_top, next_side, next_rear, next_fpv]]
+        vn = np.stack([np.transpose(v, (2, 0, 1)) for v in vn])
 
-        # Ground truth next views
-        gt_vn_01 = torch.from_numpy(vn_seq[step_i]).float() / 255.0  # (4, 3, H, W)
-        gt_top.append(gt_vn_01[0])
-        gt_side.append(gt_vn_01[1])
-        gt_rear.append(gt_vn_01[2])
+        gt_vn = torch.from_numpy(vn).float() / 255.0  # (4, 3, H, W)
+        gt_top.append(gt_vn[0])
+        gt_side.append(gt_vn[1])
+        gt_rear.append(gt_vn[2])
 
         # Add the input pose overlay to the generated and ground truth FPV frames
-        curr_gen_fpv = decoded_views[0, 3].cpu()
-        curr_gt_fpv = gt_vn_01[3]
+        curr_gen_fpv = decoded_views[3, 0].cpu()
+        curr_gt_fpv = gt_vn[3]
 
         curr_gen_fpv = _annotate_frame_pose(curr_gen_fpv, sample_cam["command"])
         curr_gt_fpv = _annotate_frame_pose(curr_gt_fpv, sample_cam["command"])
@@ -349,29 +394,35 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, en
     vid_gt_fpv   = torch.stack(gt_fpv,   dim=0).unsqueeze(0)
 
     transformer.train()
+    env.close()
     return (vid_gen_top, vid_gen_rear, vid_gen_side, vid_gen_fpv,
             vid_gt_top,  vid_gt_rear,  vid_gt_side,  vid_gt_fpv)
 
 
 @torch.no_grad()
-def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, writer, epoch, rollout_steps=16, steps=20, fps=15, env_names=None):
+def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, writer, epoch, rollout_steps=16, steps=20, fps=15):
     """
     Performs autoregressive video rollouts for each view and writes the videos to TensorBoard.
     """
     transformer.eval()
     unique_envs = ['Bipedal Walker', 'Lunar Lander', 'MultiCar Racing']
+    reg_dict = dict(_build_registry())
     
     print(f"\n[VALIDATION] Running autoregressive video rollouts for epoch {epoch} across envs: {', '.join(unique_envs)}...")
 
     for env_idx, env_name in enumerate(unique_envs):
-        (vid_top_down_01, vid_rear_01, vid_side_01, vid_fpv_01,
-         vid_gt_top_down_01, vid_gt_rear_01, vid_gt_side_01, vid_gt_fpv_01) = autoregressive_rollout(
+        env = reg_dict[env_name]()
+        env.reset()
+
+        (vid_top_down, vid_rear, vid_side, vid_fpv,
+         vid_gt_top_down, vid_gt_rear, vid_gt_side, vid_gt_fpv) = autoregressive_rollout(
             transformer=transformer,
             vae=vae,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             buffer=buffer,
             env_name=env_name,
+            env=env,
             rollout_steps=rollout_steps,
             steps=steps,
         )
@@ -382,10 +433,10 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
             mse = F.mse_loss(pred, gt).item()
             return 20.0 * math.log10(1.0) - 10.0 * math.log10(max(mse, 1e-8))
 
-        psnr_top_down = _psnr(vid_top_down_01, vid_gt_top_down_01)
-        psnr_rear     = _psnr(vid_rear_01, vid_gt_rear_01)
-        psnr_side     = _psnr(vid_side_01, vid_gt_side_01)
-        psnr_fpv      = _psnr(vid_fpv_01, vid_gt_fpv_01)
+        psnr_top_down = _psnr(vid_top_down, vid_gt_top_down)
+        psnr_rear     = _psnr(vid_rear, vid_gt_rear)
+        psnr_side     = _psnr(vid_side, vid_gt_side)
+        psnr_fpv      = _psnr(vid_fpv, vid_gt_fpv)
         psnr_mean     = (psnr_top_down + psnr_rear + psnr_side + psnr_fpv) / 4.0
 
         writer.add_scalar(f"Validation/{clean_tag}/PSNR/Top Down", psnr_top_down, epoch)
@@ -398,79 +449,82 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
               f"(Top-Down: {psnr_top_down:.2f}dB, Rear: {psnr_rear:.2f}dB, Side: {psnr_side:.2f}dB, FPV: {psnr_fpv:.2f}dB)")
 
         # Always write per-env tagged videos; also alias as generic Test/ for the first env
-        writer.add_video(f"Test/{clean_tag}/Top-Down", vid_top_down_01, epoch, fps=fps)
-        writer.add_video(f"Test/{clean_tag}/Rear",     vid_rear_01,     epoch, fps=fps)
-        writer.add_video(f"Test/{clean_tag}/Side",     vid_side_01,     epoch, fps=fps)
-        writer.add_video(f"Test/{clean_tag}/FPV",      vid_fpv_01,      epoch, fps=fps)
+        writer.add_video(f"Test/{clean_tag}/Top-Down", vid_top_down, epoch, fps=fps)
+        writer.add_video(f"Test/{clean_tag}/Rear",     vid_rear,     epoch, fps=fps)
+        writer.add_video(f"Test/{clean_tag}/Side",     vid_side,     epoch, fps=fps)
+        writer.add_video(f"Test/{clean_tag}/FPV",      vid_fpv,      epoch, fps=fps)
+
+        writer.add_video(f"GT/{clean_tag}/Top-Down", vid_gt_top_down, epoch, fps=fps)
+        writer.add_video(f"GT/{clean_tag}/Rear",     vid_gt_rear,     epoch, fps=fps)
+        writer.add_video(f"GT/{clean_tag}/Side",     vid_gt_side,     epoch, fps=fps)
+        writer.add_video(f"GT/{clean_tag}/FPV",      vid_gt_fpv,      epoch, fps=fps)
 
     transformer.train()
 
 def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker"):
-  """Collects camera rollouts storing stateful camera poses."""
-  obs, _ = env.reset(seed=seed)
-  state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
-
-  current_pose = "Center"
-  pose_hold = 0
-
-  for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
-    if pose_hold <= 0:
-      if random.random() < 0.35:
-        current_pose = "Center"
-      else:
-        current_pose = random.choice(["Up", "Down", "Left", "Right"])
-      pose_hold = random.randint(3, 8)
-    else:
-      pose_hold -= 1
-
-    # Render pass returns orthographic views + FPV
-    img_top, im_rear, im_side, im_fpv = env.render(camera_pose=current_pose)
-
-    with torch.inference_mode():
-      if hasattr(agent, "predict"):
-        action, _ = agent.predict(obs, deterministic=True)
-      else:
-        action = env.action_space.sample()
-
-    next_obs, reward, terminated, truncated, _ = env.step(action)
-    done = terminated or truncated
-
-    next_top, next_rear, next_side, next_fpv = env.render(
-        camera_pose=current_pose
-    )
-
-    # Extract wrapper's stateful angles if available
-    cam_state = {
-        "command": current_pose,
-        "position": getattr(env, "cam_pos", [0.0, 0.0, 0.0]),
-        "roll": getattr(env, "cam_roll", 0.0),
-        "yaw": getattr(env, "cam_yaw", 0.0),
-        "pitch": getattr(env, "cam_pitch", 0.0),
-    }
-
-    buffer.push(
-        top_t=img_top,
-        side_t=im_side,
-        rear_t=im_rear,
-        fpv_t=im_fpv,
-        top_next=next_top,
-        side_next=next_side,
-        rear_next=next_rear,
-        fpv_next=next_fpv,
-        action=action,
-        done=done,
-        env_name=env_name,
-        camera_state=cam_state,
-    )
-
-    if done:
-      obs, _ = env.reset()
-      current_pose = "Center"
-      pose_hold = 0
-    else:
-      obs = next_obs
+    """Collects camera rollouts storing stateful camera poses."""
+    obs, _ = env.reset(seed=seed)
     state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
-  env.close()
+
+    pose_hold = 0
+
+    for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
+        if pose_hold <= 0:
+          current_pose = random.choice(["Center", "Up", "Down", "Left", "Right"])
+          pose_hold = random.randint(8, 16)
+        else:
+          pose_hold -= 1
+
+        # Render pass returns orthographic views + FPV
+        img_top, im_rear, im_side, im_fpv = env.render(camera_pose=current_pose)
+
+        with torch.inference_mode():
+          if hasattr(agent, "predict"):
+            action, _ = agent.predict(obs, deterministic=True)
+          else:
+            action = env.action_space.sample()
+
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+
+        next_top, next_rear, next_side, next_fpv = env.render(
+            camera_pose=current_pose
+        )
+
+        # Extract wrapper's stateful angles if available
+        cam_state = {
+            "command": current_pose,
+            "x": getattr(env, "cam_x", 0.0),
+            "y": getattr(env, "cam_y", 0.0),
+            "z": getattr(env, "cam_z", 0.0),
+            "roll": getattr(env, "cam_roll", 0.0),
+            "yaw": getattr(env, "cam_yaw", 0.0),
+            "pitch": getattr(env, "cam_pitch", 0.0),
+        }
+
+        buffer.push(
+            top_t=img_top,
+            side_t=im_side,
+            rear_t=im_rear,
+            fpv_t=im_fpv,
+            top_next=next_top,
+            side_next=next_side,
+            rear_next=next_rear,
+            fpv_next=next_fpv,
+            action=action,
+            done=done,
+            env_name=env_name,
+            camera_state=cam_state,
+        )
+
+        if done:
+          obs, _ = env.reset()
+          current_pose = "Center"
+          pose_hold = 0
+        else:
+          obs = next_obs
+        state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
+    env.close()
 
 def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
     """Loops through all registered environments and populates the multi-env buffer."""
@@ -501,6 +555,8 @@ def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
                 filename="ppo-CarRacing-v2.zip"
             )
             agent = PPO.load(checkpoint)
+            for _ in tqdm(range(50)): # skip first 50 frames
+                obs, reward, terminated, truncated, info = env.step(np.zeros(3))
 
         else:
             print(f"Loading PPO agent from: {ckpt_path}")
@@ -532,26 +588,9 @@ def main(args):
     )
 
     active_envs = []
-    if args.env.lower() == "all":
-        active_envs = collect_all_envs_rollouts(
-            registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs
-        )
-    else:
-        matched_name = next((k for k in reg_dict if k.lower() == args.env.lower()), None)
-        if matched_name is None:
-            matched_name = registry[0][0]
-        print(f"Loading single environment: {matched_name}")
-        env = reg_dict[matched_name]()
-
-        obs, info = env.reset()
-
-        state_dim = int(np.prod(obs.shape if hasattr(obs, 'shape') else env.observation_space.shape))
-        clean_name = "".join(c for c in matched_name if c.isalnum() or c in ('_', '-')).lower()
-        ckpt_path = os.path.join("checkpoints", f"ppo_{clean_name}.pt")
-        agent = load_agent(ckpt_path, state_dim, env.action_space, device)
-
-        collect_rollouts(env, agent, buffer, n_steps=args.rollout_steps, seed=args.seed, env_name=matched_name)
-        active_envs.append((matched_name, env))
+    active_envs = collect_all_envs_rollouts(
+        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs
+    )
 
     # 2. Model & LoRA Setup
     model, vae, text_encoder, tokenizer = load_model(
@@ -569,7 +608,7 @@ def main(args):
     total_steps = args.epochs * args.steps_per_epoch
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
 
-    log_dir = f"./runs/wan_single_multienv_{args.num_envs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir = f"./runs/wan_single_multienv_cam_{args.num_envs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging to: {log_dir}")
 
@@ -618,7 +657,7 @@ def main(args):
                     )
 
                     text_inputs = tokenizer(
-                        prompts_s, padding="max_length", max_length=64, truncation=True, return_tensors="pt"
+                        prompts_s, padding="max_length", max_length=128, truncation=True, return_tensors="pt"
                     ).to(device)
                     embeds_s = text_encoder(**text_inputs).last_hidden_state.to(dtype=model.dtype)
                     prompt_embeds_seq.append(embeds_s)
@@ -681,9 +720,10 @@ def main(args):
             print(f"  [SAVED] LoRA checkpoint to {ckpt_dir}")
 
     print("\nTraining Complete! Saving final LoRA weights...")
-    os.makedirs(f"./checkpoints/wan_single_{args.num_envs}_lora_final", exist_ok=True)
-    model.save_pretrained(f"./checkpoints/wan_single_{args.num_envs}_lora_final")
+    os.makedirs(f"./checkpoints/wan_single_cam_{args.num_envs}_lora_final", exist_ok=True)
+    model.save_pretrained(f"./checkpoints/wan_single_cam_{args.num_envs}_lora_final")
     writer.close()
+    
     for _, env in active_envs:
         try:
             env.close()

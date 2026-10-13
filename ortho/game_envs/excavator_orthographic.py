@@ -4,7 +4,7 @@ import pygame
 from pygame import gfxdraw
 import math 
 import cv2
-from .camera_utils import apply_camera_pose
+from .camera_utils import orbit_camera_frame, orbit_camera_offset
 from gymnasium import spaces
 from Box2D.b2 import (world, polygonShape, circleShape, revoluteJointDef)
 
@@ -173,14 +173,90 @@ class ExcavatorEnv(gym.Env):
 # 2. THE ORTHOGRAPHIC MULTI-VIEW WRAPPER (UPDATED)
 # ==========================================
 class ExcavatorOrthographicWrapper(gym.Wrapper):
-    """Extrudes 2D Box2D Excavator into 3D, now supporting Circles & Multi-Fixtures."""
-    def __init__(self, env):
+    """
+    Extrudes 2D Box2D Excavator into 3D, now supporting Circles & Multi-Fixtures.
+    Maintains persistent camera xyz position, roll, yaw, and pitch state.
+    The 3D FPV view is a third-person orbit camera trailing behind the excavator (whole machine visible).
+    """
+    def __init__(self, env, step_yaw_deg=8.0, step_pitch_deg=5.0):
         super().__init__(env)
         self.SCALE = SCALE
         self.VIEWPORT_W, self.VIEWPORT_H = 800, 600
         self.fov = 400.0
-        
+
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+
+        # Follow/Orbit camera baseline offsets (relative to chassis)
+        self.camera_dist = 10.0 * self.SCALE   # Distance behind the excavator along X-axis
+        self.camera_height = 4.0 * self.SCALE  # Vertical offset above the chassis centre (sees over the bin and chassis)
+
+        # Orbit pivot = the chassis, so the camera circles the excavator while facing it
+        self.pivot_depth = self.camera_dist
+
+        # Last computed camera position (valid even before the first full render)
+        self.cam_x, self.cam_y, self.cam_z = 0.0, 0.0, 0.0
+
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def _cam_anchor(self):
+        """Un-orbited 3D camera anchor (camera_dist behind, camera_height above the chassis) in world space; the projection is relative to this."""
+        base_env = self.env.unwrapped
+        if not hasattr(base_env, 'chassis') or base_env.chassis is None:
+            return (0.0, 0.0, 0.0)
+
+        track_x = base_env.chassis.position.x * self.SCALE
+        cam_x = track_x - self.camera_dist
+        cam_y = base_env.chassis.position.y * self.SCALE + self.camera_height
+        cam_z = 0.0
+        return (cam_x, cam_y, cam_z)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the orbited FPV camera in world space."""
+        base_env = self.env.unwrapped
+        if not hasattr(base_env, 'chassis') or base_env.chassis is None:
+            return (0.0, 0.0, 0.0)
+
+        anchor_x, anchor_y, anchor_z = self._cam_anchor
+        # Camera frame -> world: depth = +x, lateral = -z, vertical = +y
+        off_d, off_lat, off_v = orbit_camera_offset(self.cam_yaw, self.cam_pitch, self.pivot_depth)
+        return (anchor_x + off_d, anchor_y + off_v, anchor_z - off_lat)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
+
     def render(self, camera_pose="Center"):
+        # 0. Accumulate camera orientation delta for 3D FPV
+        self.update_camera_pose(camera_pose)
+
         base_env = self.env.unwrapped
         
         top_surf = pygame.Surface((self.VIEWPORT_W, self.VIEWPORT_H))
@@ -239,7 +315,10 @@ class ExcavatorOrthographicWrapper(gym.Wrapper):
         cy, cx = self.VIEWPORT_H / 2, self.VIEWPORT_W / 2
         
         track_x = base_env.chassis.position.x * self.SCALE
-        cam_x, cam_y, cam_z = track_x - (0.5 * self.SCALE), base_env.chassis.position.y * self.SCALE + (1.5 * self.SCALE), 1.0 * self.SCALE 
+        # Get dynamically calculated position from our property (orbited, for logging)
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
+        # Projection stays relative to the un-orbited anchor; orbit_camera_frame applies the orbit
+        anchor_x, anchor_y, anchor_z = self._cam_anchor
         
         for p_vertices, color, layer in polys_3d:
             pts_t, pts_r, pts_s = [], [], []
@@ -254,20 +333,22 @@ class ExcavatorOrthographicWrapper(gym.Wrapper):
                 pts_s.append((vx_scrolled + cx, self.VIEWPORT_H - vy))
                 depths_s.append(vz) 
 
-            # FPV Clipping (Sutherland-Hodgman)
+            # FPV Clipping (Sutherland-Hodgman) on the orbited depth, so the trailing orbit camera clips correctly.
+            # Near plane at 1 world unit keeps projected ground coords inside gfxdraw's int16 range.
+            near = 1.0 * self.SCALE
             clipped_pts = []
-            rel_verts = [(vx - cam_x, vy - cam_y, vz - cam_z) for vx, vy, vz in p_vertices]
+            rel_verts = [orbit_camera_frame(vx - anchor_x, -(vz - anchor_z), vy - anchor_y, self.cam_yaw, self.cam_pitch, self.pivot_depth)
+                         for vx, vy, vz in p_vertices]
             for i in range(len(rel_verts)):
                 p_c, p_p = rel_verts[i], rel_verts[i - 1]
-                if p_c[0] >= 1.0 and p_p[0] >= 1.0: clipped_pts.append(p_c)
-                elif (p_c[0] >= 1.0) != (p_p[0] >= 1.0):
-                    t = (1.0 - p_p[0]) / (p_c[0] - p_p[0])
-                    clipped_pts.append((1.0, p_p[1] + t * (p_c[1] - p_p[1]), p_p[2] + t * (p_c[2] - p_p[2])))
-                    if p_c[0] >= 1.0: clipped_pts.append(p_c)
+                if p_c[0] >= near and p_p[0] >= near: clipped_pts.append(p_c)
+                elif (p_c[0] >= near) != (p_p[0] >= near):
+                    t = (near - p_p[0]) / (p_c[0] - p_p[0])
+                    clipped_pts.append((near, p_p[1] + t * (p_c[1] - p_p[1]), p_p[2] + t * (p_c[2] - p_p[2])))
+                    if p_c[0] >= near: clipped_pts.append(p_c)
 
             pts_fpv, depths_fpv = [], []
-            for dx, dy, dz in clipped_pts:
-                d_c, lat_c, dy_c = apply_camera_pose(dx, -dz, dy, camera_pose=camera_pose)
+            for d_c, lat_c, dy_c in clipped_pts:
                 dz_c = -lat_c
                 if d_c > 0.1:
                     pts_fpv.append((-(dz_c / d_c) * self.fov + cx, self.VIEWPORT_H - ((dy_c / d_c) * self.fov + cy)))

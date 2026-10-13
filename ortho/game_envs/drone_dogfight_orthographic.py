@@ -6,7 +6,7 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
-from .camera_utils import apply_camera_pose
+from .camera_utils import orbit_camera_frame, orbit_camera_offset
 try:
     from gymnasium import spaces
 except ImportError:
@@ -426,18 +426,105 @@ class DroneDogfightOrthographicWrapper(gym.Wrapper):
       Top-Down  : (X, Y) plan view  — bird's eye over the arena
       Rear      : (Y, Z) elevation  — looking from the West wall
       Side      : (X, Z) elevation  — looking from the South wall
-      FPV       : perspective from drone nose, looking along heading in X-Y plane
+      FPV       : true 3D third-person view; orbit camera trailing behind and above the
+                  player drone, looking along heading in X-Y plane (drone fully visible)
+
+    Maintains persistent camera xyz position, roll, yaw, and pitch state.
     """
 
     DRONE_Z_LO = (DRONE_ALT - 0.6)   # bottom extrusion (metres)
     DRONE_Z_HI = (DRONE_ALT + 0.6)   # top extrusion   (metres)
 
-    def __init__(self, env):
+    def __init__(self, env, step_yaw_deg=8.0, step_pitch_deg=5.0):
         super().__init__(env)
         self.SCALE = SCALE
         self.VIEWPORT_W = 800
         self.VIEWPORT_H = 600
         self.fov = 400.0
+
+        # Incremental turn step sizes
+        self.step_yaw = math.radians(step_yaw_deg)
+        self.step_pitch = math.radians(step_pitch_deg)
+
+        # Persistent camera orientation angles
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0 # Added roll state
+
+        # Follow/Orbit camera baseline offsets (relative to player drone, in pixel units)
+        self.camera_dist = 3.5 * SCALE    # Distance behind the drone along its heading (+X)
+        self.camera_height = 1.0 * SCALE  # Vertical offset above the drone
+
+        # Orbit focus: the player drone (camera_dist ahead along the optical axis)
+        self.pivot_depth = self.camera_dist
+
+        # Last computed camera world position
+        self.cam_x, self.cam_y, self.cam_z = 0.0, 0.0, 0.0
+
+    def reset(self, **kwargs):
+        # Reset camera angles to canonical trailing position upon reset
+        self.cam_yaw = 0.0
+        self.cam_pitch = 0.0
+        self.cam_roll = 0.0
+        return self.env.reset(**kwargs)
+
+    @property
+    def _cam_anchor(self):
+        """Un-orbited follow-camera anchor (behind and above the drone) in world space; the projection is relative to it."""
+        base = self.env.unwrapped
+        if not hasattr(base, 'player') or base.player is None:
+            return (0.0, 0.0, 0.0)
+
+        # Camera — trailing camera_dist behind the drone, camera_height above it,
+        # looking along heading (horizontal, in X-Y plane)
+        S = self.SCALE
+        p_angle = float(base.player.angle)
+        p_x = base.player.position.x * S
+        p_y = base.player.position.y * S
+        p_z = DRONE_ALT * S    # fixed altitude
+
+        cam_x = p_x - self.camera_dist * math.cos(p_angle)
+        cam_y = p_y - self.camera_dist * math.sin(p_angle)
+        cam_z = p_z + self.camera_height
+
+        return (cam_x, cam_y, cam_z)
+
+    @property
+    def cam_pos(self):
+        """Dynamically computes the exact X, Y, Z coordinates of the orbited camera in world space."""
+        base = self.env.unwrapped
+        if not hasattr(base, 'player') or base.player is None:
+            return (0.0, 0.0, 0.0)
+
+        ax, ay, az = self._cam_anchor
+        p_angle = float(base.player.angle)
+
+        # Camera-frame (depth, lateral, vertical) offset -> world (inverse of render's mapping:
+        # depth = dx*cos + dy*sin, lateral = dx*sin - dy*cos, vertical = dz)
+        d_off, lat_off, vert_off = orbit_camera_offset(self.cam_yaw, self.cam_pitch, self.pivot_depth)
+        cam_x = ax + d_off * math.cos(p_angle) + lat_off * math.sin(p_angle)
+        cam_y = ay + d_off * math.sin(p_angle) - lat_off * math.cos(p_angle)
+        cam_z = az + vert_off
+
+        return (cam_x, cam_y, cam_z)
+
+    def update_camera_pose(self, command):
+        """Accumulates continuous orbital displacement for the 3D FPV camera."""
+        if isinstance(command, (list, tuple)):
+            command = command[0] if len(command) > 0 else "Center"
+        cmd = str(command).strip().title()
+
+        if cmd == "Left":
+            self.cam_yaw -= self.step_yaw
+        elif cmd == "Right":
+            self.cam_yaw += self.step_yaw
+        elif cmd == "Up":
+            self.cam_pitch = min(self.cam_pitch + self.step_pitch, math.radians(45.0))
+        elif cmd == "Down":
+            self.cam_pitch = max(self.cam_pitch - self.step_pitch, math.radians(-30.0))
+        elif cmd == "Center":
+            self.cam_yaw *= 0.7
+            self.cam_pitch *= 0.7
 
     # ------------------------------------------------------------------
     def _surf_to_img(self, surf):
@@ -445,6 +532,9 @@ class DroneDogfightOrthographicWrapper(gym.Wrapper):
 
     # ------------------------------------------------------------------
     def render(self, camera_pose="Center"):
+        # 0. Accumulate camera orientation delta for 3D FPV
+        self.update_camera_pose(camera_pose)
+
         base = self.env.unwrapped
 
         # Initialise surfaces
@@ -604,16 +694,15 @@ class DroneDogfightOrthographicWrapper(gym.Wrapper):
         # ----------------------------------------------------------------
         # E. Multi-View Projections
         # ----------------------------------------------------------------
-        # Camera — FPV at drone nose, looking along heading (in X-Y plane)
+        # Camera — follow cam behind/above the drone, looking along heading (in X-Y plane)
         p_angle = float(base.player.angle)
         p_x = base.player.position.x * S
         p_y = base.player.position.y * S
-        p_z = DRONE_ALT * S    # fixed altitude
 
-        nose_offset = 1.2 * S
-        cam_x = p_x + nose_offset * math.cos(p_angle)
-        cam_y = p_y + nose_offset * math.sin(p_angle)
-        cam_z = p_z  # eye level at drone altitude
+        # Get dynamically calculated position from our property (orbited, for logging)
+        self.cam_x, self.cam_y, self.cam_z = self.cam_pos
+        # Un-orbited anchor for camera-relative vectors (orbit_camera_frame applies the orbit)
+        anc_x, anc_y, anc_z = self._cam_anchor
 
         cos_a = math.cos(-p_angle)
         sin_a = math.sin(-p_angle)
@@ -659,20 +748,21 @@ class DroneDogfightOrthographicWrapper(gym.Wrapper):
             if len(pts_r) >= 3: proj_rear.append((sum(dr)/len(dr),  pts_r, color, layer))
             if len(pts_s) >= 3: proj_side.append((sum(ds)/len(ds),  pts_s, color, layer))
 
-            # FPV — skip player self-body and env geometry (floor/walls)
-            if is_player or no_fpv:
+            # FPV — skip env geometry (floor/walls); the player drone is drawn (third-person view)
+            if no_fpv:
                 continue
 
-            # Sutherland-Hodgman near-plane clip (rx >= 1.0)
+            # Camera-relative vertices, orbited around the player (depth, lateral, vertical)
             rel_verts = []
             for vx, vy, vz in p_verts:
-                dx, dy = vx - cam_x, vy - cam_y
-                dz = vz - cam_z
+                dx, dy = vx - anc_x, vy - anc_y
+                dz = vz - anc_z
                 # Rotate into camera space (rotate around Z-axis)
                 rx = dx * cos_a - dy * sin_a
                 ry = dx * sin_a + dy * cos_a
-                rel_verts.append((rx, ry, dz))
+                rel_verts.append(orbit_camera_frame(rx, -ry, dz, self.cam_yaw, self.cam_pitch, self.pivot_depth))
 
+            # Sutherland-Hodgman near-plane clip on the orbited depth (d_c >= 1.0)
             clipped = []
             for i in range(len(rel_verts)):
                 pc, pp = rel_verts[i], rel_verts[i - 1]
@@ -685,8 +775,7 @@ class DroneDogfightOrthographicWrapper(gym.Wrapper):
                         clipped.append(pc)
 
             pts_fpv, df = [], []
-            for rx, ry, rz in clipped:
-                d_c, lat_c, rz_c = apply_camera_pose(rx, -ry, rz, camera_pose=camera_pose)
+            for d_c, lat_c, rz_c in clipped:
                 ry_c = -lat_c
                 if d_c > 0.1:
                     px_f = -(ry_c / d_c) * self.fov + cx

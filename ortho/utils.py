@@ -402,8 +402,8 @@ def compose_player_prompts(action_batch, env_name=None, camera_pose=None):
 
         cam_str = ""
         if sample_cam and str(sample_cam).strip().lower() not in ("none", ""):
-            clean_cam = str(sample_cam).strip().title()
-            cam_str = f", camera look {clean_cam}"
+            clean_cam = str(sample_cam).strip()
+            cam_str = f", Camera pose {clean_cam}"
 
         full_prompt = (
             f"{matched_template['title']}: {action_str}, {matched_template['suffix']}{cam_str}."
