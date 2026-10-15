@@ -44,6 +44,7 @@ COLOR_CATAPULT_ARM = (160, 82, 45)
 COLOR_BOULDER = (128, 128, 128)
 COLOR_ENEMY_STRUCTURE = (178, 34, 34)
 COLOR_ENEMY_WALL = (139, 0, 0)
+COLOR_ENEMY_TOPPLED = (90, 40, 40)
 COLOR_PLAYER_STRUCTURE = (34, 139, 34)
 COLOR_TRIGGER = (255, 215, 0)
 COLOR_TERRAIN = (194, 178, 128)
@@ -51,19 +52,61 @@ COLOR_DARK_GROUND = (101, 67, 33)
 
 
 class CatapultWarEnv(gym.Env):
+    """
+    Side-on siege game: a catapult at x~10 lobs boulders at a 5-block enemy tower at x~30-40.
+
+    Action (Box, 3 dims, all in [-1, 1]):
+      [0] winch:  >0 winds tension up, <0 lets it out (rate, 0.04 per step at |a|=1); tension in [0, 1]
+                  sets the launch speed (LAUNCH_SPEED_MIN at 0 .. LAUNCH_SPEED_MAX at 1).
+      [1] aim:    >0 raises the arm (steeper shot), <0 lowers it (flatter shot); rate-controlled,
+                  the aim angle is kept in [AIM_MIN, AIM_MAX] (20-70 deg above horizontal).
+      [2] fire:   >0.5 releases the loaded boulder along the arm's angle (tension resets to 0).
+    Each episode has SHOT_BUDGET boulders. A shot ends when the boulder leaves the field, comes to
+    rest or flies for MAX_SHOT_STEPS; the next boulder is then reloaded on the arm.
+    """
     metadata = {'render_modes': ['rgb_array', 'human'], 'render_fps': FPS}
+
+    # Launch / aim parameters
+    LAUNCH_SPEED_MIN = 5.0
+    LAUNCH_SPEED_MAX = 20.0
+    TENSION_RATE = 0.04
+    AIM_MIN = math.radians(20.0)
+    AIM_MAX = math.radians(70.0)
+    AIM_RATE = math.radians(60.0)  # rad/s at |aim action| = 1
+    ARM_FOLLOW_ANGLE = math.radians(85.0)  # follow-through swing after release (visual)
+    ARM_FOLLOW_STEPS = 12
+
+    # Episode structure
+    SHOT_BUDGET = 4
+    MAX_SHOT_STEPS = 200
+    SETTLE_STEPS = 40  # steps to let the tower settle after the last shot ends
+    N_BLOCKS = 5
+
+    # Reward
+    REWARD_TOPPLE = 10.0
+    REWARD_SUCCESS = 50.0
+    REWARD_PROXIMITY = 2.0      # one-off per shot, scaled by closest approach to the tower
+    PROXIMITY_RADIUS = 12.0
+
+    # Catapult geometry
+    PIVOT = (9.0, 3.5)
+    ARM_HALF_LEN = 2.5
+    ARM_PIVOT_OFFSET = 2.0  # arm centre lies this far from the pivot along the arm
+    BOULDER_RADIUS = 0.5
+    BOULDER_SEAT = (2.0, 0.2 + 0.5)  # boulder centre in arm-local coords (on top of the arm near the tip)
 
     def __init__(self, render_mode='rgb_array'):
         super().__init__()
         self.render_mode = render_mode
 
-        # Action space: [winch_tension, arm_angle_adjust, trigger_release]
+        # Action space: [winch_tension_rate, aim_rate, fire]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
 
-        # Observation space
-        # [arm_angle, arm_angular_vel, boulder_x, boulder_y, boulder_vx, boulder_vy,
-        #  tension, trigger_state, enemy_blocks_remaining (x5 positions)]
-        obs_size = 18
+        # Observation space (fixed slots):
+        # [0] arm_angle, [1] arm_angular_vel, [2] aim_angle, [3] tension, [4] loaded,
+        # [5] shots_left / SHOT_BUDGET, [6:10] boulder x, y, vx, vy, [10] wind, [11] tower_x,
+        # [12 + 4*i : 16 + 4*i] block i: x, y, angle, toppled   (i = 0..4)
+        obs_size = 12 + 4 * self.N_BLOCKS
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
@@ -75,31 +118,49 @@ class CatapultWarEnv(gym.Env):
         self.arm_joint = None
         self.boulder = None
         self.enemy_blocks = []
-        self.launched = False
+        self.block_spawn = []
+        self.block_toppled = []
         self.tension = 0.0
+        self.aim_angle = math.radians(45.0)
         self.trigger_locked = True
-        self.step_count = 0
-        self.max_steps = 500
-        self.initial_enemy_count = 5
         self.boulder_launched = False
-        self.prev_enemy_count = 0
+        self.step_count = 0
+        self.max_steps = 1000  # shot budget (not time) normally ends the episode
+        self.shots_left = self.SHOT_BUDGET
+        self.shot_steps = 0
+        self.rest_steps = 0
+        self.min_dist = float('inf')
+        self.follow_steps = 0
+        self.settle_steps = -1
+        self.tower_x = 35.0
+        self.wind = 0.0
 
         self.screen = None
         self.clock = None
 
     def reset(self, seed=None, options=None):
-        if seed is not None:
-            np.random.seed(seed)
+        super().reset(seed=seed)
 
         self.world = b2World(gravity=(0, -9.81))
-        self.launched = False
         self.tension = 0.0
+        self.aim_angle = math.radians(45.0)
         self.trigger_locked = True
-        self.step_count = 0
         self.boulder_launched = False
+        self.step_count = 0
+        self.shots_left = self.SHOT_BUDGET
+        self.shot_steps = 0
+        self.rest_steps = 0
+        self.min_dist = float('inf')
+        self.follow_steps = 0
+        self.settle_steps = -1
+        self.boulder = None
         self.enemy_blocks = []
 
-        # Ground
+        # Modest per-episode randomization: tower distance and a horizontal wind on the boulder
+        self.tower_x = float(self.np_random.uniform(30.0, 40.0))
+        self.wind = float(self.np_random.uniform(-1.5, 1.5))
+
+        # Ground (top surface at y = 1)
         self.ground = self.world.CreateStaticBody(
             position=(0, 0),
             shapes=b2PolygonShape(box=(100, 1))
@@ -111,69 +172,81 @@ class CatapultWarEnv(gym.Env):
             shapes=b2PolygonShape(box=(1.5, 1.0))
         )
 
-        # Catapult arm (dynamic) - pivoted at the left (rear) end, pointing right (East)
+        # Catapult arm (dynamic) - pivoted near its rear end, elevated at the aim angle
+        px, py = self.PIVOT
+        a = self.aim_angle
         self.catapult_arm = self.world.CreateDynamicBody(
-            position=(11.0, 3.5),
-            angle=0.0
+            position=(px + self.ARM_PIVOT_OFFSET * math.cos(a), py + self.ARM_PIVOT_OFFSET * math.sin(a)),
+            angle=a
         )
         self.catapult_arm.CreateFixture(
-            shape=b2PolygonShape(box=(2.5, 0.2)),
+            shape=b2PolygonShape(box=(self.ARM_HALF_LEN, 0.2)),
             density=2.0,
-            friction=0.3
+            friction=0.3,
+            groupIndex=-1  # never collides with the boulder (same negative group)
         )
 
-        # Joint connecting arm to base (Pivot at rear)
+        # Joint connecting arm to base (pivot at rear); joint angle == arm elevation
         jd = revoluteJointDef()
         jd.bodyA = self.catapult_base
         jd.bodyB = self.catapult_arm
-        jd.localAnchorA = (-1.0, 1.5)  # Rear left of the base
-        jd.localAnchorB = (-2.0, 0.0)  # Rear left of the arm
+        jd.localAnchorA = (px - 10.0, py - 2.0)
+        jd.localAnchorB = (-self.ARM_PIVOT_OFFSET, 0.0)
+        jd.referenceAngle = 0.0
         jd.enableMotor = True
         jd.motorSpeed = 0.0
-        jd.maxMotorTorque = 800.0
+        jd.maxMotorTorque = 2000.0
         jd.enableLimit = True
-        jd.lowerAngle = 0.0
-        jd.upperAngle = math.pi / 2.5
+        jd.lowerAngle = self.AIM_MIN
+        jd.upperAngle = self.ARM_FOLLOW_ANGLE
         self.arm_joint = self.world.CreateJoint(jd)
 
-        # Boulder on the arm tip
+        # Boulder seated on the arm
         self._create_boulder()
 
         # Enemy structures on the right side
         self._create_enemy_structures()
 
-        self.prev_enemy_count = len(self.enemy_blocks)
-
         obs = self._get_obs()
-        return obs, {}
+        return obs, self._get_info()
+
+    def _boulder_seat(self):
+        p = self.catapult_arm.GetWorldPoint(self.BOULDER_SEAT)
+        return (float(p[0]), float(p[1]))
 
     def _create_boulder(self):
-        arm_pos = self.catapult_arm.position
-        arm_angle = self.catapult_arm.angle
-        # Place boulder at the tip of the arm (right side)
-        tip_x = arm_pos[0] + 2.5 * math.cos(arm_angle) - 0.5 * math.sin(arm_angle)
-        tip_y = arm_pos[1] + 2.5 * math.sin(arm_angle) + 0.5 * math.cos(arm_angle)
-
         self.boulder = self.world.CreateDynamicBody(
-            position=(tip_x, tip_y),
-            bullet=True
+            position=self._boulder_seat(),
+            bullet=True,
+            angularDamping=3.0  # rolling resistance so a landed boulder comes to rest
         )
         self.boulder.CreateFixture(
-            shape=b2CircleShape(radius=0.5),
+            shape=b2CircleShape(radius=self.BOULDER_RADIUS),
             density=5.0,
             friction=0.5,
-            restitution=0.3
+            restitution=0.3,
+            groupIndex=-1
         )
+        self.boulder.gravityScale = 0.0  # held on the arm until released
         self.boulder_launched = False
+        self.trigger_locked = True
+
+    def _hold_boulder(self):
+        """Keep a loaded boulder seated on the arm (no overlap, no drift)."""
+        if self.boulder and not self.boulder_launched:
+            self.boulder.position = self._boulder_seat()
+            self.boulder.linearVelocity = (0, 0)
+            self.boulder.angularVelocity = 0.0
 
     def _create_enemy_structures(self):
-        base_x = 35.0
+        base_x = self.tower_x
+        g = 1.0  # ground top
         self.enemy_blocks = []
 
-        # Create a simple tower structure
+        # Central tower: 3 stacked blocks resting exactly on the ground / on each other
         for i in range(3):
             block = self.world.CreateDynamicBody(
-                position=(base_x, 1.5 + i * 2.0)
+                position=(base_x, g + 0.8 + i * 1.6)
             )
             block.CreateFixture(
                 shape=b2PolygonShape(box=(0.8, 0.8)),
@@ -186,7 +259,7 @@ class CatapultWarEnv(gym.Env):
         # Side pillars
         for dx in [-2.0, 2.0]:
             block = self.world.CreateDynamicBody(
-                position=(base_x + dx, 1.5)
+                position=(base_x + dx, g + 1.0)
             )
             block.CreateFixture(
                 shape=b2PolygonShape(box=(0.5, 1.0)),
@@ -196,132 +269,166 @@ class CatapultWarEnv(gym.Env):
             )
             self.enemy_blocks.append(block)
 
+        self.block_spawn = [(float(b.position[0]), float(b.position[1])) for b in self.enemy_blocks]
+        self.block_toppled = [False] * len(self.enemy_blocks)
+
+    def _is_toppled(self, i):
+        block = self.enemy_blocks[i]
+        sx, sy = self.block_spawn[i]
+        ang = (block.angle + math.pi) % (2 * math.pi) - math.pi
+        return (abs(ang) > math.pi / 4
+                or block.position[1] < sy - 0.6
+                or abs(block.position[0] - sx) > 2.5)
+
+    def _end_shot(self):
+        """Finish the current shot: one-off proximity bonus, remove boulder, reload if any shots remain."""
+        bonus = self.REWARD_PROXIMITY * max(0.0, 1.0 - self.min_dist / self.PROXIMITY_RADIUS)
+        if self.boulder:
+            self.world.DestroyBody(self.boulder)
+        self.boulder = None
+        self.boulder_launched = False
+        self.shot_steps = 0
+        self.rest_steps = 0
+        self.min_dist = float('inf')
+        if self.shots_left > 0:
+            self._create_boulder()
+        else:
+            self.settle_steps = self.SETTLE_STEPS
+        return bonus
+
     def step(self, action):
-        action = np.clip(action, -1.0, 1.0)
+        action = np.clip(np.asarray(action, dtype=np.float32).reshape(-1), -1.0, 1.0)
         self.step_count += 1
-
-        winch_tension = action[0]
-        arm_angle_adj = action[1]
-        trigger_release = action[2]
-
-        # Apply tension (builds up stored energy)
-        self.tension = np.clip(self.tension + winch_tension * 0.05, 0.0, 1.0)
-
-        # Adjust arm motor speed based on angle adjustment
-        if self.trigger_locked:
-            motor_speed = float(arm_angle_adj * 5.0)
-            self.arm_joint.motorSpeed = motor_speed
-
-            # Keep boulder attached to arm tip
-            if self.boulder and not self.boulder_launched:
-                arm_pos = self.catapult_arm.position
-                arm_angle = self.catapult_arm.angle
-                tip_x = arm_pos[0] + 2.5 * math.cos(arm_angle)
-                tip_y = arm_pos[1] + 2.5 * math.sin(arm_angle)
-                self.boulder.position = (tip_x, tip_y)
-                self.boulder.linearVelocity = (0, 0)
-
-        # Trigger release
-        if trigger_release > 0.5 and self.trigger_locked and not self.boulder_launched:
-            self.trigger_locked = False
-            self.boulder_launched = True
-            self.launched = True
-
-            # Launch boulder with force proportional to tension
-            arm_angle = self.catapult_arm.angle
-            launch_force = self.tension * 800.0
-            fx = float(launch_force * math.cos(arm_angle + math.pi / 4))
-            fy = float(launch_force * math.sin(arm_angle + math.pi / 4))
-            self.boulder.ApplyForceToCenter((fx, fy), True)
-
-            # Also give the arm a kick
-            self.arm_joint.motorSpeed = float(20.0)
-
-        # Step physics
-        self.world.Step(TIME_STEP, 8, 3)
-        self.world.ClearForces()
-
-        # Check enemy blocks status
-        destroyed_count = 0
-        remaining_blocks = []
-        for block in self.enemy_blocks:
-            # Consider block destroyed if it fell below ground or moved far
-            if block.position[1] < -2.0 or abs(block.position[0] - 35.0) > 10.0:
-                destroyed_count += 1
-            else:
-                remaining_blocks.append(block)
-
-        # Compute reward
         reward = 0.0
 
-        # Reward for destroying blocks
-        blocks_just_destroyed = self.prev_enemy_count - len(remaining_blocks)
-        if blocks_just_destroyed > 0:
-            reward += blocks_just_destroyed * 20.0
+        winch_tension = float(action[0])
+        aim_adj = float(action[1])
+        trigger_release = float(action[2])
 
-        # Small reward for building tension
-        if not self.boulder_launched:
-            reward += self.tension * 0.01
+        # Winch builds (or releases) stored tension
+        self.tension = float(np.clip(self.tension + winch_tension * self.TENSION_RATE, 0.0, 1.0))
 
-        # Reward for boulder getting close to enemy
+        # Aim: rate-controlled elevation within [AIM_MIN, AIM_MAX]
+        self.aim_angle = float(np.clip(self.aim_angle + aim_adj * self.AIM_RATE * TIME_STEP,
+                                       self.AIM_MIN, self.AIM_MAX))
+
+        # Trigger release
+        if (trigger_release > 0.5 and self.boulder and not self.boulder_launched
+                and self.shots_left > 0):
+            self.trigger_locked = False
+            self.boulder_launched = True
+            self.shots_left -= 1
+            self.shot_steps = 0
+            self.rest_steps = 0
+            self.min_dist = float('inf')
+
+            # Launch boulder along the arm with speed set by tension
+            arm_angle = self.catapult_arm.angle
+            speed = self.LAUNCH_SPEED_MIN + self.tension * (self.LAUNCH_SPEED_MAX - self.LAUNCH_SPEED_MIN)
+            self._hold_boulder()
+            self.boulder.gravityScale = 1.0
+            self.boulder.linearVelocity = (float(speed * math.cos(arm_angle)), float(speed * math.sin(arm_angle)))
+            self.boulder.awake = True
+            self.tension = 0.0
+            self.follow_steps = self.ARM_FOLLOW_STEPS
+
+        # Arm motor: track the aim angle (or swing through after a release)
+        target = self.ARM_FOLLOW_ANGLE if self.follow_steps > 0 else self.aim_angle
+        self.follow_steps = max(0, self.follow_steps - 1)
+        err = target - self.arm_joint.angle
+        self.arm_joint.motorSpeed = float(np.clip(10.0 * err, -6.0, 6.0))
+
+        # Wind pushes the boulder in flight
         if self.boulder and self.boulder_launched:
-            dist_to_enemy = abs(self.boulder.position[0] - 35.0)
-            reward += max(0, (25.0 - dist_to_enemy) * 0.1)
+            self.boulder.ApplyForceToCenter((float(self.boulder.mass * self.wind), 0.0), True)
 
-        # Terminal conditions
+        # Step physics
+        self._hold_boulder()
+        self.world.Step(TIME_STEP, 8, 3)
+        self.world.ClearForces()
+        self._hold_boulder()
+
+        # Toppled blocks (latched; bodies stay in the world and keep their obs slot)
+        newly_toppled = 0
+        for i in range(len(self.enemy_blocks)):
+            if not self.block_toppled[i] and self._is_toppled(i):
+                self.block_toppled[i] = True
+                newly_toppled += 1
+        reward += newly_toppled * self.REWARD_TOPPLE
+        n_remaining = self.block_toppled.count(False)
+
+        # Shot bookkeeping
+        if self.boulder and self.boulder_launched:
+            self.shot_steps += 1
+            bx, by = self.boulder.position
+            self.min_dist = min(self.min_dist, math.hypot(bx - self.tower_x, by - 3.4))
+            speed = self.boulder.linearVelocity.length
+            self.rest_steps = self.rest_steps + 1 if speed < 0.5 else 0
+            out_of_bounds = by < -5.0 or bx > 80.0 or bx < -10.0
+            if out_of_bounds or self.rest_steps >= 10 or self.shot_steps >= self.MAX_SHOT_STEPS:
+                reward += self._end_shot()
+        elif self.settle_steps > 0:
+            self.settle_steps -= 1
+
         terminated = False
         truncated = False
+        success = n_remaining == 0
 
-        # Success: all enemy blocks destroyed
-        if len(remaining_blocks) == 0:
-            reward += 100.0
+        # Success: every enemy block toppled
+        if success:
+            reward += self.REWARD_SUCCESS
+            terminated = True
+        # Out of ammunition and the tower has settled
+        elif self.settle_steps == 0:
             terminated = True
 
-        # Failure: boulder out of bounds or timeout
-        if self.boulder and self.boulder_launched:
-            if (self.boulder.position[1] < -5.0 or
-                    self.boulder.position[0] > 60.0 or
-                    self.boulder.position[0] < -10.0):
-                if len(remaining_blocks) > 0:
-                    reward -= 10.0
-
-        if self.step_count >= self.max_steps:
+        if not terminated and self.step_count >= self.max_steps:
             truncated = True
-            if len(remaining_blocks) > 0:
-                reward -= 50.0
-
-        self.prev_enemy_count = len(remaining_blocks)
-        self.enemy_blocks = remaining_blocks
 
         obs = self._get_obs()
-        info = {
-            'blocks_remaining': len(self.enemy_blocks),
-            'tension': self.tension,
-            'launched': self.boulder_launched
-        }
+        info = self._get_info()
+        info['success'] = success
 
         return obs, float(reward), terminated, truncated, info
 
+    def _get_info(self):
+        return {
+            'blocks_remaining': self.block_toppled.count(False),
+            'blocks_toppled': self.block_toppled.count(True),
+            'tension': self.tension,
+            'aim_deg': math.degrees(self.aim_angle),
+            'launched': self.boulder_launched,
+            'shots_left': self.shots_left,
+            'wind': self.wind,
+            'tower_x': self.tower_x,
+        }
+
     def _get_obs(self):
-        obs = np.zeros(18, dtype=np.float32)
+        obs = np.zeros(self.observation_space.shape[0], dtype=np.float32)
 
         if self.catapult_arm:
             obs[0] = self.catapult_arm.angle
             obs[1] = self.catapult_arm.angularVelocity
+        obs[2] = self.aim_angle
+        obs[3] = self.tension
+        obs[4] = 1.0 if (self.boulder and not self.boulder_launched) else 0.0
+        obs[5] = self.shots_left / float(self.SHOT_BUDGET)
 
         if self.boulder:
-            obs[2] = self.boulder.position[0]
-            obs[3] = self.boulder.position[1]
-            obs[4] = self.boulder.linearVelocity[0]
-            obs[5] = self.boulder.linearVelocity[1]
+            obs[6] = self.boulder.position[0]
+            obs[7] = self.boulder.position[1]
+            obs[8] = self.boulder.linearVelocity[0]
+            obs[9] = self.boulder.linearVelocity[1]
 
-        obs[6] = self.tension
-        obs[7] = 1.0 if self.trigger_locked else 0.0
+        obs[10] = self.wind
+        obs[11] = self.tower_x
 
-        # Enemy block positions (up to 5)
-        for i, block in enumerate(self.enemy_blocks[:5]):
-            obs[8 + i * 2] = block.position[0]
-            obs[9 + i * 2] = block.position[1]
+        # Enemy blocks: fixed slot per block
+        for i, block in enumerate(self.enemy_blocks[:self.N_BLOCKS]):
+            obs[12 + i * 4] = block.position[0]
+            obs[13 + i * 4] = block.position[1]
+            obs[14 + i * 4] = (block.angle + math.pi) % (2 * math.pi) - math.pi
+            obs[15 + i * 4] = 1.0 if self.block_toppled[i] else 0.0
 
         return obs
 
@@ -367,8 +474,9 @@ class CatapultWarEnv(gym.Env):
                 pygame.gfxdraw.aacircle(self.screen, bx, by, radius, (80, 80, 80))
 
         # Draw enemy blocks
-        for block in self.enemy_blocks:
-            self._draw_body(block, COLOR_ENEMY_STRUCTURE, world_to_screen)
+        for i, block in enumerate(self.enemy_blocks):
+            color = COLOR_ENEMY_TOPPLED if self.block_toppled[i] else COLOR_ENEMY_STRUCTURE
+            self._draw_body(block, color, world_to_screen)
 
         # Draw tension indicator
         tension_bar_width = int(self.tension * 100)
@@ -424,8 +532,11 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
         self.view_height = SCREEN_HEIGHT
 
         # Follow/Orbit camera baseline offsets (relative to catapult base)
-        self.camera_dist = 4.5    # Distance behind the catapult along -X (catapult is ~5 m long; FPV FOV is wide)
+        self.camera_dist = 6.5    # Orbit radius around the catapult (catapult is ~5 m long; FPV FOV is wide)
         self.camera_height = 2.0   # Vertical offset above the catapult base
+        # Default downward look: the orbit is raised high enough that the sight line over the arm tip lands
+        # short of the tower (x >= 30), so the tower shows above the catapult instead of hidden behind its arm
+        self.base_pitch = math.radians(50.0)
 
         # Incremental turn step sizes
         self.step_yaw = math.radians(step_yaw_deg)
@@ -473,12 +584,17 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
 
         anchor_x, anchor_y, anchor_z = self._cam_anchor
         # Orbit displacement in camera frame; FPV maps depth->+X, lateral->+Z, vertical->+Y
-        d_depth, d_lat, d_vert = orbit_camera_offset(self.cam_yaw, self.cam_pitch, self.pivot_depth)
+        d_depth, d_lat, d_vert = orbit_camera_offset(self.cam_yaw, self.orbit_pitch, self.pivot_depth)
         cam_x = anchor_x + d_depth
         cam_y = anchor_y + d_vert
         cam_z = anchor_z + d_lat
 
         return (cam_x, cam_y, cam_z)
+
+    @property
+    def orbit_pitch(self):
+        """Total orbit pitch: commanded cam_pitch on top of the default downward look, kept below overhead."""
+        return min(self.cam_pitch + self.base_pitch, math.radians(75.0))
 
     def update_camera_pose(self, command):
         """Accumulates continuous orbital displacement for the 3D FPV camera."""
@@ -508,7 +624,7 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
             pygame.init()
 
         # Get game state
-        env = self.env
+        env = self.env.unwrapped
 
         # Player reference position (catapult)
         if env.catapult_base:
@@ -588,7 +704,8 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
             })
 
         # Enemy blocks
-        for block in env.enemy_blocks:
+        for i, block in enumerate(env.enemy_blocks):
+            color = COLOR_ENEMY_TOPPLED if env.block_toppled[i] else COLOR_ENEMY_STRUCTURE
             for fixture in block.fixtures:
                 shape = fixture.shape
                 if isinstance(shape, b2PolygonShape):
@@ -598,7 +715,7 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                         'vertices_2d': [(v[0], v[1]) for v in verts],
                         'z_min': -0.8,
                         'z_max': 0.8,
-                        'color': COLOR_ENEMY_STRUCTURE,
+                        'color': color,
                         'depth': Z_STRUCTURE
                     })
 
@@ -756,9 +873,11 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
 
-        # Draw ground plane
+        # Draw ground plane up to the horizon, which rises on screen as the orbit looks further down
+        horizon_y = int(self.view_height / 2 - 200.0 * math.tan(self.orbit_pitch))
+        horizon_y = max(0, min(self.view_height, horizon_y))
         pygame.draw.rect(surface, COLOR_TERRAIN,
-                         (0, self.view_height // 2, self.view_width, self.view_height // 2))
+                         (0, horizon_y, self.view_width, self.view_height - horizon_y))
 
         # Simple perspective projection from un-orbited trailing camera; orbit_camera_frame applies the orbit
         eye_x, eye_y, eye_z = self._cam_anchor
@@ -767,10 +886,10 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
         def to_cam(x, y, z):
             # Camera-relative (depth=+X, lateral=+Z, vertical=+Y), then orbited around the catapult
             return orbit_camera_frame(x - eye_x, z - eye_z, y - eye_y,
-                                      self.cam_yaw, self.cam_pitch, self.pivot_depth)
+                                      self.cam_yaw, self.orbit_pitch, self.pivot_depth)
 
-        # Build drawable items (orbited depth, kind, color, data). Scene boxes are drawn as their
-        # z_min face; the player's (catapult) boxes are drawn as solid extruded volumes.
+        # Build drawable items (orbited depth, kind, color, data). Every box is drawn as a solid
+        # extruded volume so the tower and pillars stay visible when seen end-on from behind.
         items = []
         for obj in objects:
             if obj.get('no_fpv'):
@@ -778,15 +897,14 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
             if obj['type'] == 'box':
                 verts = obj['vertices_2d']
                 z0 = obj.get('z_min', 0)
-                faces = [(obj['color'], [(v[0], v[1], z0) for v in verts])]
-                if obj.get('player'):
-                    z1 = obj.get('z_max', 0)
-                    side = tuple(int(c * 0.75) for c in obj['color'])
-                    faces.append((obj['color'], [(v[0], v[1], z1) for v in verts]))
-                    for i in range(len(verts)):
-                        a, b = verts[i], verts[(i + 1) % len(verts)]
-                        faces.append((side, [(a[0], a[1], z0), (b[0], b[1], z0),
-                                             (b[0], b[1], z1), (a[0], a[1], z1)]))
+                z1 = obj.get('z_max', 0)
+                side = tuple(int(c * 0.75) for c in obj['color'])
+                faces = [(obj['color'], [(v[0], v[1], z0) for v in verts]),
+                         (obj['color'], [(v[0], v[1], z1) for v in verts])]
+                for i in range(len(verts)):
+                    a, b = verts[i], verts[(i + 1) % len(verts)]
+                    faces.append((side, [(a[0], a[1], z0), (b[0], b[1], z0),
+                                         (b[0], b[1], z1), (a[0], a[1], z1)]))
                 for color, face in faces:
                     cam_verts = [to_cam(*p) for p in face]
                     depth = sum(c[0] for c in cam_verts) / len(cam_verts)
@@ -874,11 +992,13 @@ if __name__ == '__main__':
     wrapper = CatapultWarOrthographicWrapper(env)
 
     total_reward = 0
-    for step in range(200):
-        # Build tension, then release
-        if step < 50:
-            action = np.array([0.8, 0.3, -1.0], dtype=np.float32)  # Build tension
-        elif step == 50:
+    for step in range(700):
+        # Wind up to ~0.6 tension at the default 45 deg aim, then release; repeat after each reload
+        base_env = wrapper.unwrapped
+        loaded = base_env.boulder is not None and not base_env.boulder_launched
+        if loaded and base_env.tension < 0.6:
+            action = np.array([1.0, 0.0, -1.0], dtype=np.float32)  # Build tension
+        elif loaded:
             action = np.array([0.0, 0.0, 1.0], dtype=np.float32)  # Release!
         else:
             action = np.array([0.0, 0.0, -1.0], dtype=np.float32)  # Wait

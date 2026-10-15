@@ -4,8 +4,10 @@ mountain_goat_orthographic.py
 Mountain Goat 🐐 Environment & 3D Multi-View Orthographic Wrapper
 
 Task:
-  A mountain goat climbs a steep, procedural mountain cliff moving East-to-West (-X direction, climbing upwards +Y).
-  The agent controls torso pitch lean and leg joint motors to traverse rocky ledges without tumbling downhill.
+  A quadruped mountain goat starts on a flat meadow at the East foot of a mountain and climbs
+  West (-X direction) up a ledged slope (+Y) to the summit plateau. The agent controls a torso
+  pitch torque plus the hip/knee motors of two diagonal leg pairs (trot gait) and must make
+  uphill progress without tumbling, belly-flopping or walking off the meadow into the valley.
 
 Views returned by MountainGoatOrthographicWrapper.render():
   1. Top-Down  : X-Z plan view (looking down from above, centered on goat)
@@ -34,6 +36,7 @@ from Box2D.b2 import (
     polygonShape,
     circleShape,
     revoluteJointDef,
+    weldJointDef,
     fixtureDef,
     rayCastCallback,
 )
@@ -45,15 +48,40 @@ FPS = 50
 SCALE = 28.0            # pixels per metre
 GRAVITY = -15.0         # mountain gravity
 
-# Mountain bounds (starts at X=60 on East, climbs West to X=0, Y from 2.0 to 25.0)
-MOUNTAIN_START_X = 60.0 # East start
-MOUNTAIN_PEAK_X  = 5.0  # West peak goal
-MOUNTAIN_MAX_H   = 22.0 # Height at peak
+# Mountain bounds (flat meadow East of X=60, slope climbs West to the summit plateau at X=PEAK)
+MOUNTAIN_START_X = 60.0 # East foot of the slope (meadow spans START_X .. START_X + 5)
+MOUNTAIN_PEAK_X  = 25.0 # West summit plateau edge (goal)
+MOUNTAIN_BASE_H  = 2.0  # Meadow height
+MOUNTAIN_MAX_H   = 12.0 # Summit plateau height (mean slope ~16 deg, steepest ledge faces ~28 deg)
+TERRAIN_STEP     = 1.25 # Horizontal length of each terrain segment
+LEDGE_A1, LEDGE_A2 = 0.30, 0.12  # Rocky ledge sine amplitudes (long / short wavelength)
+VALLEY_H         = 0.5  # Height of the valley floor East of the meadow
 
 # Goat physics sizes
-TORSO_W, TORSO_H = 0.6, 0.35    # torso width, height (metres)
+TORSO_W, TORSO_H = 0.6, 0.35    # torso half-width, half-height (metres)
 HEAD_R           = 0.22         # head radius
 HORN_W, HORN_H   = 0.08, 0.30   # horn size
+THIGH_LEN, SHIN_LEN = 0.45, 0.45
+STAND_H          = TORSO_H + THIGH_LEN + SHIN_LEN  # torso centre height above ground when standing
+GOAT_GROUP       = -1           # negative Box2D groupIndex: goat parts never collide with each other
+
+# Control & episode settings
+TORSO_TORQUE     = 60.0         # torso pitch torque (no reaction body: a deliberate balance aid)
+MOTOR_SPEED      = 5.0          # rad/s at |action| = 1
+HIP_TORQUE, KNEE_TORQUE = 80.0, 60.0
+LEG_DENSITY      = 12.0         # heavy-ish legs keep the torso/leg mass ratio solver-friendly
+TORSO_DENSITY    = 3.0
+FAR_SERVO_GAIN   = 10.0         # far legs servo onto their diagonal partner's angle
+MAX_EPISODE_STEPS = 2000
+LIDAR_RANGE      = 6.0
+N_LIDAR          = 10
+
+# Reward settings
+PROGRESS_X_W     = 3.0          # per metre moved West (-X)
+PROGRESS_Y_W     = 2.0          # per metre gained in height
+ENERGY_W         = 0.003
+GOAL_BONUS       = 100.0
+FAIL_PENALTY     = 10.0
 
 # 3D Extrusion depths (Z axis)
 Z_TERRAIN_LO, Z_TERRAIN_HI = -3.0, 3.0
@@ -85,14 +113,14 @@ Z_HORN_RIGHT_LO, Z_HORN_RIGHT_HI = -0.32, -0.12 # Right horn (negative Z)
 # BOX2D RAYCAST CALLBACK FOR LIDAR
 # ==============================================================================
 class LidarCallback(rayCastCallback):
-    def __init__(self, ignore_body=None):
+    """Closest-hit ray callback that ignores every goat fixture (they share GOAT_GROUP)."""
+    def __init__(self):
         super().__init__()
         self.fraction = 1.0
-        self.ignore_body = ignore_body
 
     def ReportFixture(self, fixture, point, normal, fraction):
-        if self.ignore_body and fixture.body == self.ignore_body:
-            return -1.0  # Ignore self
+        if fixture.filterData.groupIndex == GOAT_GROUP:
+            return -1.0  # Ignore goat body parts
         if fraction < self.fraction:
             self.fraction = fraction
         return fraction
@@ -103,35 +131,42 @@ class LidarCallback(rayCastCallback):
 # ==============================================================================
 class MountainGoatEnv(gym.Env):
     """
-    2D Physics Environment where a quadrupedal Mountain Goat climbs a steep cliff from East to West.
+    2D Physics Environment where a quadrupedal Mountain Goat climbs a ledged slope from East to West.
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": FPS}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, max_episode_steps=MAX_EPISODE_STEPS):
         super().__init__()
         self.render_mode = render_mode
+        self.max_episode_steps = max_episode_steps
         self.screen = None
         self.clock = None
 
-        # Actions (5D):
-        # 0: Torso lean torque [-1..1]
-        # 1: Front hip motor speed [-1..1]
-        # 2: Front knee motor speed [-1..1]
-        # 3: Rear hip motor speed [-1..1]
-        # 4: Rear knee motor speed [-1..1]
+        # Actions (5D), all in [-1..1]:
+        # 0: Torso pitch torque (+ = counter-clockwise = pitch nose down, - = pitch nose up toward the slope)
+        # 1: Pair A hip motor speed  (near-front + far-rear legs; + swings hoof East/back)
+        # 2: Pair A knee motor speed (near-front + far-rear legs; + folds shin East/back)
+        # 3: Pair B hip motor speed  (near-rear + far-front legs)
+        # 4: Pair B knee motor speed (near-rear + far-front legs)
+        # Far legs servo onto their diagonal partner's joint angles, giving a trot gait.
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
 
-        # Obs (22D):
-        # 0-3: Torso X, Y, Vx, Vy
-        # 4-5: Torso angle, angular velocity
-        # 6-13: 4 Joint angles & speeds (front hip, front knee, rear hip, rear knee)
-        # 14-21: 8 Lidar terrain distance sensors surrounding the goat
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(22,), dtype=np.float32)
+        # Obs (28D):
+        # 0-1:   Torso Vx, Vy (/5)
+        # 2-3:   Torso angle (rad), angular velocity (/5)
+        # 4:     Torso height above terrain minus standing height (m)
+        # 5:     Climb progress fraction (0 at slope foot, 1 at summit)
+        # 6-13:  Near joint angle (rad) & speed (/MOTOR_SPEED): front hip, front knee, rear hip, rear knee
+        # 14-17: Hoof ground contact flags: near front, near rear, far front, far rear
+        # 18-27: Lidar terrain distance fractions, 10 rays from forward-up (-X) through down to backward (+X)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(28,), dtype=np.float32)
 
         self.world = None
+        self.torso = None
         self.bodies = []
         self.terrain_polys = []
         self.joints = []
+        self.far_joints = []
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -140,48 +175,60 @@ class MountainGoatEnv(gym.Env):
         self.bodies = []
         self.terrain_polys = []
         self.joints = []
+        self.far_joints = []
 
-        # Generate Procedural Mountain Cliff (East to West: X from 65 down to 0)
+        # Modest per-episode terrain variety (ledge phase / amplitude)
+        self.ledge_phase = self.np_random.uniform(0.0, 2.0 * math.pi, size=2)
+        self.ledge_amp = float(self.np_random.uniform(0.7, 1.0))
+
+        # Generate Procedural Mountain (East meadow -> slope -> West summit plateau)
         self._generate_mountain()
 
-        # Spawn Goat near East foot of mountain (X=58.0, Y calculated from slope)
-        start_x = 58.0
-        start_y = self._get_mountain_y(start_x) + 2.5
+        # Spawn Goat standing on the flat East meadow, hooves on the ground
+        start_x = MOUNTAIN_START_X + 2.0 + float(self.np_random.uniform(-0.5, 0.5))
+        start_y = MOUNTAIN_BASE_H + STAND_H + 0.02
         self._spawn_goat(start_x, start_y)
 
-        self.prev_dist = start_x  # Distance remaining to peak (Peak is at X=5.0)
-        self.prev_height = start_y
+        self.prev_x = start_x
+        self.prev_y = start_y
         self.step_count = 0
 
-        return self._get_obs(), {}
+        if self.render_mode == "human":
+            self.render()
+
+        return self._get_obs(), self._get_info()
 
     def _get_mountain_y(self, x):
         """Returns height of mountain surface at X position."""
-        # Steep incline climbing from East (x=60, y=2) up to West peak (x=5, y=22)
+        # Linear incline from East foot (START_X, BASE_H) up to the West summit (PEAK_X, MAX_H)
         progress = (MOUNTAIN_START_X - x) / (MOUNTAIN_START_X - MOUNTAIN_PEAK_X)
-        progress = np.clip(progress, 0.0, 1.2)
-        base_h = 2.0 + 20.0 * (progress ** 1.3)
-        # Add jagged mountain ledges using sines
-        ledges = 0.8 * math.sin(x * 0.5) + 0.4 * math.sin(x * 1.2)
-        return max(1.0, base_h + ledges)
+        progress = float(np.clip(progress, 0.0, 1.0))
+        base_h = MOUNTAIN_BASE_H + (MOUNTAIN_MAX_H - MOUNTAIN_BASE_H) * progress
+        # Rocky ledges, faded out on the flat meadow and summit plateau
+        fade = float(np.clip((MOUNTAIN_START_X - x) / 3.0, 0.0, 1.0) * np.clip((x - MOUNTAIN_PEAK_X) / 3.0, 0.0, 1.0))
+        ph0, ph1 = getattr(self, 'ledge_phase', (0.0, 0.0))
+        ledges = LEDGE_A1 * math.sin(x * 0.6 + ph0) + LEDGE_A2 * math.sin(x * 1.3 + ph1)
+        return base_h + fade * getattr(self, 'ledge_amp', 1.0) * ledges
 
     def _generate_mountain(self):
         """Creates static Box2D bodies and 3D polygon structures for the mountain."""
-        x_steps = np.arange(MOUNTAIN_START_X + 5.0, MOUNTAIN_PEAK_X - 5.0, -2.5)
-        
+        x_steps = np.arange(MOUNTAIN_START_X + 5.0, MOUNTAIN_PEAK_X - 6.0, -TERRAIN_STEP)
+
         ground_body = self.world.CreateStaticBody(position=(0, 0))
+        self.ground = ground_body
         self.bodies.append(ground_body)
 
-        # Light gray floor outside mountain (East of start and West of peak)
-        floor_poly_east = [(MOUNTAIN_START_X + 5.0, -10.0), (100.0, -10.0), (100.0, 1.5), (MOUNTAIN_START_X + 5.0, 1.5)]
+        # Light gray valley floor East of the meadow (falling in here ends the episode)
+        floor_poly_east = [(MOUNTAIN_START_X + 5.0, -10.0), (100.0, -10.0), (100.0, VALLEY_H), (MOUNTAIN_START_X + 5.0, VALLEY_H)]
         ground_body.CreatePolygonFixture(vertices=floor_poly_east, friction=1.0)
         self.terrain_polys.append({
             'poly': floor_poly_east,
-            'top_edge': ((MOUNTAIN_START_X + 5.0, 1.5), (100.0, 1.5)),
+            'top_edge': ((MOUNTAIN_START_X + 5.0, VALLEY_H), (100.0, VALLEY_H)),
             'top_color': FLOOR_C,
             'body_color': FLOOR_C
         })
 
+        snow_h = MOUNTAIN_BASE_H + 0.75 * (MOUNTAIN_MAX_H - MOUNTAIN_BASE_H)
         for i in range(len(x_steps) - 1):
             x0, x1 = x_steps[i], x_steps[i+1]
             y0, y1 = self._get_mountain_y(x0), self._get_mountain_y(x1)
@@ -191,7 +238,7 @@ class MountainGoatEnv(gym.Env):
             ground_body.CreatePolygonFixture(vertices=poly_2d, friction=1.2, restitution=0.0)
 
             # High altitude has snow top, lower has grass top
-            is_snow = ((y0 + y1) / 2.0) > 12.0
+            is_snow = ((y0 + y1) / 2.0) > snow_h
             top_color = SNOW_C if is_snow else GRASS_C
             body_color = ROCK_C
 
@@ -205,113 +252,133 @@ class MountainGoatEnv(gym.Env):
         # Procedural Sky Clouds (3D puff volumes)
         self.clouds = []
         for cx in np.arange(MOUNTAIN_START_X + 10.0, MOUNTAIN_PEAK_X - 10.0, -6.0):
-            cy = 24.0 + 3.0 * math.sin(cx * 0.4)
+            cy = MOUNTAIN_MAX_H + 6.0 + 3.0 * math.sin(cx * 0.4)
             cz = 4.0 * math.cos(cx * 0.7)
             cw, ch, cd = 4.5, 1.4, 2.5
             self.clouds.append({'x': cx, 'y': cy, 'z': cz, 'w': cw, 'h': ch, 'd': cd})
 
     def _spawn_goat(self, x, y):
-        """Builds multi-body Mountain Goat with joints."""
+        """Builds multi-body Mountain Goat with joints (torso level, legs straight down)."""
         # 1. Main Torso
-        self.torso = self.world.CreateDynamicBody(position=(x, y), angle=0.1)
-        self.torso.CreatePolygonFixture(box=(TORSO_W, TORSO_H), density=6.0, friction=0.8)
+        self.torso = self.world.CreateDynamicBody(position=(x, y), angle=0.0)
+        self.torso.CreatePolygonFixture(box=(TORSO_W, TORSO_H), density=TORSO_DENSITY, friction=0.8, groupIndex=GOAT_GROUP)
         self.bodies.append(self.torso)
 
         # 2. Head & Left/Right Horns (facing West / -X side of torso)
-        head_pos = (x - TORSO_W - 0.1, y + TORSO_H + 0.15)
+        head_off = (-TORSO_W - 0.1, TORSO_H + 0.15)
+        head_pos = (x + head_off[0], y + head_off[1])
         self.head = self.world.CreateDynamicBody(position=head_pos)
-        self.head.CreateCircleFixture(radius=HEAD_R, density=2.0)
+        self.head.CreateCircleFixture(radius=HEAD_R, density=2.0, groupIndex=GOAT_GROUP)
         self.bodies.append(self.head)
 
-        # Weld head to torso
-        self.world.CreateJoint(revoluteJointDef(
+        # Weld head to torso (anchor at the head centre, matching the spawn pose)
+        self.world.CreateJoint(weldJointDef(
             bodyA=self.torso, bodyB=self.head,
-            localAnchorA=(-TORSO_W, TORSO_H), localAnchorB=(0, 0),
-            enableLimit=True, lowerAngle=-0.2, upperAngle=0.2
+            localAnchorA=head_off, localAnchorB=(0, 0)
         ))
 
-        # Left & Right Horns (curved backward/upward relative to head)
+        # Left & Right Horns (curved backward/upward relative to head), welded on top of the head
         horn_poly = [(0, 0), (-0.15, HORN_H), (0.05, HORN_H * 0.85)]
-        
-        self.horn_left = self.world.CreateDynamicBody(position=(head_pos[0] - 0.1, head_pos[1] + HEAD_R))
-        self.horn_left.CreatePolygonFixture(vertices=horn_poly, density=0.4)
+        horn_pos = (head_pos[0] - 0.1, head_pos[1] + HEAD_R)
+
+        self.horn_left = self.world.CreateDynamicBody(position=horn_pos)
+        self.horn_left.CreatePolygonFixture(vertices=horn_poly, density=0.4, groupIndex=GOAT_GROUP)
         self.bodies.append(self.horn_left)
-        self.world.CreateJoint(revoluteJointDef(
+        self.world.CreateJoint(weldJointDef(
             bodyA=self.head, bodyB=self.horn_left,
-            localAnchorA=(-0.1, HEAD_R), localAnchorB=(0, 0),
-            enableLimit=True, lowerAngle=-0.1, upperAngle=0.1
+            localAnchorA=(-0.1, HEAD_R), localAnchorB=(0, 0)
         ))
 
-        self.horn_right = self.world.CreateDynamicBody(position=(head_pos[0] - 0.1, head_pos[1] + HEAD_R))
-        self.horn_right.CreatePolygonFixture(vertices=horn_poly, density=0.4)
+        self.horn_right = self.world.CreateDynamicBody(position=horn_pos)
+        self.horn_right.CreatePolygonFixture(vertices=horn_poly, density=0.4, groupIndex=GOAT_GROUP)
         self.bodies.append(self.horn_right)
-        self.world.CreateJoint(revoluteJointDef(
+        self.world.CreateJoint(weldJointDef(
             bodyA=self.head, bodyB=self.horn_right,
-            localAnchorA=(-0.1, HEAD_R), localAnchorB=(0, 0),
-            enableLimit=True, lowerAngle=-0.1, upperAngle=0.1
+            localAnchorA=(-0.1, HEAD_R), localAnchorB=(0, 0)
         ))
 
         # 3. Legs & Hooves (Front = West side / -X, Rear = East side / +X)
+        # Order matters: the wrapper treats legs[0:4] as near legs and legs[4:8] as far legs.
         self.legs = []
+        self.hooves = []
         self.joints = []
+        self.far_joints = []
 
         leg_configs = [
-            # (name, torso_anchor_x, thigh_len, shin_len, is_front)
-            ("front_near", -TORSO_W + 0.15, 0.45, 0.45, True),
-            ("rear_near",   TORSO_W - 0.15, 0.45, 0.45, False),
-            ("front_far",  -TORSO_W + 0.15, 0.45, 0.45, True),
-            ("rear_far",    TORSO_W - 0.15, 0.45, 0.45, False),
+            # (name, torso_anchor_x)
+            ("front_near", -TORSO_W + 0.15),
+            ("rear_near",   TORSO_W - 0.15),
+            ("front_far",  -TORSO_W + 0.15),
+            ("rear_far",    TORSO_W - 0.15),
         ]
 
-        for name, ax, thigh_h, shin_h, is_front in leg_configs:
+        for name, ax in leg_configs:
             # Thigh
-            thigh_pos = (x + ax, y - TORSO_H - thigh_h/2)
+            thigh_pos = (x + ax, y - TORSO_H - THIGH_LEN/2)
             thigh = self.world.CreateDynamicBody(position=thigh_pos)
-            thigh.CreatePolygonFixture(box=(0.08, thigh_h/2), density=1.5, friction=0.9)
+            thigh.CreatePolygonFixture(box=(0.08, THIGH_LEN/2), density=LEG_DENSITY, friction=0.9, groupIndex=GOAT_GROUP)
             self.bodies.append(thigh)
 
             # Shin / Hoof
-            shin_pos = (x + ax, y - TORSO_H - thigh_h - shin_h/2)
+            shin_pos = (x + ax, y - TORSO_H - THIGH_LEN - SHIN_LEN/2)
             shin = self.world.CreateDynamicBody(position=shin_pos)
-            shin.CreatePolygonFixture(box=(0.07, shin_h/2), density=1.5, friction=1.5)
+            shin.CreatePolygonFixture(box=(0.07, SHIN_LEN/2), density=LEG_DENSITY, friction=1.5, groupIndex=GOAT_GROUP)
             self.bodies.append(shin)
 
             # Hip Joint
             hip_j = self.world.CreateJoint(revoluteJointDef(
                 bodyA=self.torso, bodyB=thigh,
-                localAnchorA=(ax, -TORSO_H), localAnchorB=(0, thigh_h/2),
-                enableMotor=True, maxMotorTorque=250.0, enableLimit=True,
+                localAnchorA=(ax, -TORSO_H), localAnchorB=(0, THIGH_LEN/2),
+                enableMotor=True, maxMotorTorque=HIP_TORQUE, enableLimit=True,
                 lowerAngle=-0.8, upperAngle=0.8
             ))
 
             # Knee Joint
             knee_j = self.world.CreateJoint(revoluteJointDef(
                 bodyA=thigh, bodyB=shin,
-                localAnchorA=(0, -thigh_h/2), localAnchorB=(0, shin_h/2),
-                enableMotor=True, maxMotorTorque=200.0, enableLimit=True,
+                localAnchorA=(0, -THIGH_LEN/2), localAnchorB=(0, SHIN_LEN/2),
+                enableMotor=True, maxMotorTorque=KNEE_TORQUE, enableLimit=True,
                 lowerAngle=-1.2, upperAngle=0.3
             ))
 
             self.legs.extend([thigh, shin])
+            self.hooves.append(shin)
             if "near" in name:
                 self.joints.extend([hip_j, knee_j])
+            else:
+                self.far_joints.extend([hip_j, knee_j])
+
+        # Diagonal trot coupling: far-front follows near-rear (pair B), far-rear follows near-front (pair A)
+        self.far_partners = [self.joints[2], self.joints[3], self.joints[0], self.joints[1]]
+
+    def _hoof_contacts(self):
+        # Goat parts never collide with each other, so any touching contact is with the terrain
+        return [1.0 if any(ce.contact.touching for ce in shin.contacts) else 0.0 for shin in self.hooves]
+
+    def _body_on_ground(self):
+        for body in (self.torso, self.head, self.horn_left, self.horn_right):
+            if any(ce.contact.touching for ce in body.contacts):
+                return True
+        return False
 
     def step(self, action):
+        assert self.torso is not None, "Call reset() before step()"
         self.step_count += 1
-        action = np.clip(action, -1.0, 1.0)
+        action = np.clip(np.asarray(action, dtype=np.float32).reshape(-1), -1.0, 1.0)
 
         # 1. Apply Actions
-        # Torso pitch lean
-        self.torso.ApplyTorque(float(action[0] * 120.0), True)
-        # Leg joint motor speeds
-        if len(self.joints) >= 4:
-            self.joints[0].motorSpeed = float(action[1] * 5.0)  # Front Hip
-            self.joints[1].motorSpeed = float(action[2] * 5.0)  # Front Knee
-            self.joints[2].motorSpeed = float(action[3] * 5.0)  # Rear Hip
-            self.joints[3].motorSpeed = float(action[4] * 5.0)  # Rear Knee
+        # Torso pitch torque
+        self.torso.ApplyTorque(float(action[0] * TORSO_TORQUE), True)
+        # Near leg joint motor speeds (front hip, front knee, rear hip, rear knee)
+        for j, a in zip(self.joints, action[1:5]):
+            j.motorSpeed = float(a * MOTOR_SPEED)
+        # Far legs: feed-forward partner command + servo onto the partner's angle
+        for fj, pj in zip(self.far_joints, self.far_partners):
+            cmd = pj.motorSpeed + FAR_SERVO_GAIN * (pj.angle - fj.angle)
+            fj.motorSpeed = float(np.clip(cmd, -2.0 * MOTOR_SPEED, 2.0 * MOTOR_SPEED))
 
         # Step physics
-        self.world.Step(1.0 / FPS, 6, 2)
+        self.world.Step(1.0 / FPS, 10, 10)
 
         obs = self._get_obs()
 
@@ -319,55 +386,78 @@ class MountainGoatEnv(gym.Env):
         curr_x = float(self.torso.position.x)
         curr_y = float(self.torso.position.y)
 
-        # Westward progress (+reward for moving -X toward peak) + Upward progress (+Y)
-        westward_progress = self.prev_dist - curr_x
-        upward_progress   = curr_y - self.prev_height
-        reward = float(westward_progress * 3.0 + upward_progress * 2.0)
+        # Telescoping Westward progress (-X toward the summit) + upward progress (+Y)
+        westward_progress = self.prev_x - curr_x
+        upward_progress   = curr_y - self.prev_y
+        reward = float(westward_progress * PROGRESS_X_W + upward_progress * PROGRESS_Y_W)
 
         # Small energy penalty
-        reward -= float(0.01 * np.sum(action ** 2))
+        reward -= float(ENERGY_W * np.sum(action ** 2))
 
-        self.prev_dist = curr_x
-        self.prev_height = curr_y
+        self.prev_x = curr_x
+        self.prev_y = curr_y
 
         terminated = False
+        outcome = None
 
-        # Victory: Reached mountain peak zone (X <= 8.0, Y >= 18.0)
-        if curr_x <= MOUNTAIN_PEAK_X + 3.0 and curr_y >= MOUNTAIN_MAX_H - 3.0:
-            reward += 100.0
+        # Victory: Reached the summit plateau
+        if curr_x <= MOUNTAIN_PEAK_X + 1.0:
+            reward += GOAL_BONUS
             terminated = True
-        # Failure: Tipped over or fell below cliff
-        elif abs(self.torso.angle) > 1.4 or curr_y < 0.5:
-            reward -= 50.0
+            outcome = "summit"
+        # Failure: tipped over, torso/head on the ground, or walked off the meadow into the valley
+        elif abs(self.torso.angle) > 1.2 or self._body_on_ground():
+            reward -= FAIL_PENALTY
             terminated = True
+            outcome = "fell"
+        elif curr_x > MOUNTAIN_START_X + 5.5 or curr_y < MOUNTAIN_BASE_H:
+            reward -= FAIL_PENALTY
+            terminated = True
+            outcome = "valley"
+
+        truncated = (not terminated) and self.step_count >= self.max_episode_steps
 
         if self.render_mode == "human":
             self.render()
 
-        return obs, reward, terminated, False, {}
+        info = self._get_info()
+        info["outcome"] = outcome
+        return obs, reward, terminated, truncated, info
+
+    def _get_info(self):
+        x = float(self.torso.position.x)
+        return {
+            "x": x,
+            "y": float(self.torso.position.y),
+            "progress": (MOUNTAIN_START_X - x) / (MOUNTAIN_START_X - MOUNTAIN_PEAK_X),
+            "step": self.step_count,
+        }
 
     def _get_obs(self):
         t_pos = self.torso.position
         t_vel = self.torso.linearVelocity
 
         obs = [
-            float(t_pos.x), float(t_pos.y),
-            float(t_vel.x), float(t_vel.y),
-            float(self.torso.angle), float(self.torso.angularVelocity)
+            float(t_vel.x) / 5.0, float(t_vel.y) / 5.0,
+            float(self.torso.angle), float(self.torso.angularVelocity) / 5.0,
+            float(t_pos.y - self._get_mountain_y(t_pos.x)) - STAND_H,
+            (MOUNTAIN_START_X - float(t_pos.x)) / (MOUNTAIN_START_X - MOUNTAIN_PEAK_X),
         ]
 
-        # 4 active joint states
+        # 4 near (actuated) joint states
         for j in self.joints[:4]:
             obs.append(float(j.angle))
-            obs.append(float(j.speed))
+            obs.append(float(j.speed) / MOTOR_SPEED)
 
-        # 8-ray Lidar scan around goat
-        lidar_range = 8.0
-        for i in range(8):
-            ang = self.torso.angle + (-math.pi/2.0 + i * (math.pi / 7.0))
+        # Hoof contacts
+        obs.extend(self._hoof_contacts())
+
+        # 10-ray Lidar fan in the torso frame: from 30 deg above forward (-X) down through vertical to backward (+X)
+        for i in range(N_LIDAR):
+            ang = self.torso.angle + math.radians(150.0) + i * (math.radians(210.0) / (N_LIDAR - 1))
             p1 = t_pos
-            p2 = (t_pos.x + lidar_range * math.cos(ang), t_pos.y + lidar_range * math.sin(ang))
-            cb = LidarCallback(ignore_body=self.torso)
+            p2 = (t_pos.x + LIDAR_RANGE * math.cos(ang), t_pos.y + LIDAR_RANGE * math.sin(ang))
+            cb = LidarCallback()
             self.world.RayCast(cb, p1, p2)
             obs.append(float(cb.fraction))
 
@@ -375,7 +465,7 @@ class MountainGoatEnv(gym.Env):
 
     def render(self):
         if self.render_mode is None:
-            return
+            return None
         w, h = 800, 600
         if self.screen is None:
             pygame.init()
@@ -396,10 +486,11 @@ class MountainGoatEnv(gym.Env):
             sp1 = (p1[0] * SCALE - scroll_x, h - (p1[1] * SCALE + scroll_y))
             pygame.draw.line(self.screen, t_info['top_color'], sp0, sp1, 5)
 
-        # Draw goat bodies
-        for body in self.bodies:
-            if body == self.bodies[0]:  # terrain body
-                continue
+        # Draw goat bodies (far legs first so near legs overlap them)
+        horns = (self.horn_left, self.horn_right)
+        far_legs = self.legs[4:]
+        draw_order = far_legs + [b for b in self.bodies[1:] if b not in far_legs]
+        for body in draw_order:
             for f in body.fixtures:
                 if isinstance(f.shape, circleShape):
                     pos = body.transform * f.shape.pos
@@ -410,15 +501,27 @@ class MountainGoatEnv(gym.Env):
                 elif hasattr(f.shape, 'vertices'):
                     pts = [(body.transform * v) * SCALE for v in f.shape.vertices]
                     spts = [(p[0] - scroll_x, h - (p[1] + scroll_y)) for p in pts]
-                    c = GOAT_HORN if body == self.horn else GOAT_FUR
+                    if body in horns:
+                        c = GOAT_HORN
+                    elif body in far_legs:
+                        c = GOAT_FAR_FUR
+                    else:
+                        c = GOAT_FUR
                     pygame.draw.polygon(self.screen, c, spts)
                     pygame.draw.polygon(self.screen, OUTLINE_C, spts, 1)
 
         if self.render_mode == "human":
+            pygame.event.pump()
             pygame.display.flip()
             self.clock.tick(FPS)
-        elif self.render_mode == "rgb_array":
-            return np.transpose(np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2))
+            return None
+        return np.transpose(np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2))
+
+    def close(self):
+        if self.screen is not None:
+            if self.render_mode == "human":
+                pygame.display.quit()
+            self.screen = None
 
 
 # ==============================================================================

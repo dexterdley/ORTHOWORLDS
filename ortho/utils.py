@@ -156,7 +156,46 @@ def _build_registry():
              lambda: ToxicGasEscapeOrthographicWrapper(ToxicGasEscapeEnv()))
     except Exception as e:
         print(f"[WARN] Could not register Toxic Gas Escape: {e}")
-        
+
+    return registry
+
+
+def _build_heldout_registry(obstacles=True):
+    """Return (display_name, factory_fn) tuples for the held-out obstacle-transfer test envs.
+    Kept out of _build_registry so world-model training never sees them.
+    obstacles=False builds each env's obstacle-free twin (same agent and physics, no obstacles).
+    """
+    registry = []
+
+    def _try(name, factory):
+        registry.append((name, factory))
+    # ------------------------------------------------------------------
+    # Rescue Ambulance (CarRacing car in a city grid; twin of MultiCar Racing)
+    try:
+        from game_envs.rescue_ambulance_orthographic import (
+            RescueAmbulanceEnv, RescueAmbulanceOrthographicWrapper)
+        _try("Rescue Ambulance",
+             lambda: RescueAmbulanceOrthographicWrapper(RescueAmbulanceEnv(obstacles=obstacles)))
+    except Exception as e:
+        print(f"[WARN] Could not register Rescue Ambulance: {e}")
+    # ------------------------------------------------------------------
+    # Parkour Runner (BipedalWalker body on an obstacle course; twin of Bipedal Walker)
+    try:
+        from game_envs.parkour_runner_orthographic import make_parkour_runner
+        _try("Parkour Runner",
+             lambda: make_parkour_runner(obstacles=obstacles))
+    except Exception as e:
+        print(f"[WARN] Could not register Parkour Runner: {e}")
+    # ------------------------------------------------------------------
+    # Snowball Fight (Drone Dogfight movement + Tank Duel cover, winter theme)
+    try:
+        from game_envs.snowball_fight_orthographic import (
+            SnowballFightEnv, SnowballFightOrthographicWrapper)
+        _try("Snowball Fight",
+             lambda: SnowballFightOrthographicWrapper(SnowballFightEnv(cover=obstacles)))
+    except Exception as e:
+        print(f"[WARN] Could not register Snowball Fight: {e}")
+
     return registry
 
 class ActorCritic(nn.Module):
@@ -249,8 +288,8 @@ ENV_PROMPT_TEMPLATES = {
     "mario escape": {
         "title": "Mario Escape platformer",
         "format": lambda a: (
-            f"horizontal move {a[0].item():+.2f}, {'jump impulse active' if a[1].item() > 0.5 else 'ground running'}"
-            if len(a) >= 2 else f"movement input {a[0].item():+.2f}"
+            f"run {a[0].item():+.2f}, {'jump pressed' if a[1].item() > 0.5 else 'no jump'}"
+            if len(a) >= 2 else f"run {a[0].item():+.2f}"
         ),
         "suffix": "navigating obstacles towards flagpole",
     },
@@ -268,7 +307,8 @@ ENV_PROMPT_TEMPLATES = {
     "drone dogfight": {
         "title": "Drone Dogfight aerial combat",
         "format": lambda a: (
-            f"thrust ({a[0].item():+.2f}, {a[1].item():+.2f}), {'firing weapon' if a[3].item() > 0.5 else 'holding fire'}"
+            f"thrust ({a[0].item():+.2f}, {a[1].item():+.2f}), aim heading {a[2].item() * 180.0:+.0f} deg, "
+            f"{'firing weapon' if a[3].item() > 0.5 else 'holding fire'}"
             if len(a) >= 4 else (
                 f"thrust ({a[0].item():+.2f}, {a[1].item():+.2f})"
                 if len(a) >= 2 else "maneuvering thrusters"
@@ -287,50 +327,78 @@ ENV_PROMPT_TEMPLATES = {
     "tank duel": {
         "title": "Tank Duel armored combat",
         "format": lambda a: (
-            f"treads ({a[0].item():+.2f}, {a[1].item():+.2f})"
-            if len(a) >= 2 else f"controls [{', '.join(f'{x.item():+.2f}' for x in a)}]"
+            f"drive {a[0].item():+.2f}, hull turn {a[1].item():+.2f}, turret rotate {a[2].item():+.2f}, "
+            f"{'firing cannon' if a[3].item() > 0.5 else 'holding fire'}"
+            if len(a) >= 4 else f"controls [{', '.join(f'{x.item():+.2f}' for x in a)}]"
         ),
         "suffix": "maneuvering and aiming turret",
     },
     "catapult war": {
         "title": "Catapult War siege artillery",
         "format": lambda a: (
-            f"tension {a[0].item():.2f}, angle {a[1].item():+.2f}"
-            if len(a) >= 2 else f"tension {a[0].item():.2f}"
+            f"winch tension {a[0].item():+.2f}, aim {a[1].item():+.2f}, {'firing boulder' if a[2].item() > 0.5 else 'holding fire'}"
+            if len(a) >= 3 else f"winch tension {a[0].item():+.2f}"
         ),
         "suffix": "aiming and launching projectile",
     },
     "robot sumo": {
         "title": "Robot Sumo wrestling arena",
         "format": lambda a: (
-            f"wheel drive ({a[0].item():+.2f}, {a[1].item():+.2f})"
-            if len(a) >= 2 else f"drive {a[0].item():+.2f}"
+            f"drive {a[0].item():+.2f}, turn {a[1].item():+.2f}, plow angle {a[2].item():+.2f}"
+            if len(a) >= 3 else f"drive {a[0].item():+.2f}"
         ),
         "suffix": "pushing opponent out of dohyo ring",
     },
     "mountain goat": {
         "title": "Mountain Goat cliff climbing",
         "format": lambda a: (
-            f"body pitch {a[0].item():+.2f}, leap impulse {a[1].item():.2f}"
-            if len(a) >= 2 else f"movement {a[0].item():+.2f}"
+            f"torso pitch {a[0].item():+.2f}, diagonal legs A [hip {a[1].item():+.2f}, knee {a[2].item():+.2f}], "
+            f"diagonal legs B [hip {a[3].item():+.2f}, knee {a[4].item():+.2f}]"
+            if len(a) >= 5 else f"movement {a[0].item():+.2f}"
         ),
-        "suffix": "ascending procedural rock cliffs",
+        "suffix": "trotting up a rocky mountain slope",
     },
     "wrecking ball": {
         "title": "Wrecking Ball demolition crane",
         "format": lambda a: (
-            f"boom rotation {a[0].item():+.2f}, hoist cable {a[1].item():+.2f}"
-            if len(a) >= 2 else f"crane control {a[0].item():+.2f}"
+            f"drive {a[0].item():+.2f}, boom {a[1].item():+.2f}, winch {a[2].item():+.2f}"
+            if len(a) >= 3 else f"crane control {a[0].item():+.2f}"
         ),
         "suffix": "swinging demolition ball into structures",
     },
     "toxic gas escape": {
-        "title": "Toxic Gas Escape platformer",
+        "title": "Toxic Gas Escape maze driving",
         "format": lambda a: (
-            f"horizontal run {a[0].item():+.2f}, {'jump impulse active' if a[1].item() > 0.5 else 'ground running'}"
-            if len(a) >= 2 else f"run {a[0].item():+.2f}"
+            f"throttle {a[0].item():+.2f}, steer {a[1].item():+.2f}"
+            if len(a) >= 2 else f"throttle {a[0].item():+.2f}"
         ),
-        "suffix": "scrambling outwards to evade toxic gas",
+        "suffix": "driving through the maze to escape spreading toxic gas",
+    },
+    "rescue ambulance": {
+        "title": "Rescue Ambulance city driving",
+        "format": lambda a: (
+            f"steer {a[0].item():+.2f}, throttle {a[1].item():.2f}, brake {a[2].item():.2f}"
+            if len(a) >= 3 else f"steer {a[0].item():+.2f}"
+        ),
+        "suffix": "driving through city streets to reach the victim",
+    },
+    "parkour runner": {
+        "title": "Parkour Runner 2D robot obstacle course",
+        "format": lambda a: (
+            f"leg torques [hip1: {a[0].item():+.2f}, knee1: {a[1].item():+.2f}, "
+            f"hip2: {a[2].item():+.2f}, knee2: {a[3].item():+.2f}]"
+            if len(a) >= 4 else f"joint torques [{', '.join(f'{x.item():+.2f}' for x in a)}]"
+        ),
+        "suffix": "crossing hurdles, crates and gaps",
+    },
+    "snowball fight": {
+        "title": "Snowball Fight winter combat",
+        "format": lambda a: (
+            f"forward {a[1].item():+.2f}, strafe {a[0].item():+.2f}, turn {a[2].item():+.2f}, "
+            f"{'throwing snowball' if a[3].item() > 0 else 'holding throw'}"
+            if len(a) >= 4 else f"forward {a[1].item():+.2f}, strafe {a[0].item():+.2f}"
+        ),
+        "suffix": "dodging behind snow forts and ice pillars",
     },
 }
 

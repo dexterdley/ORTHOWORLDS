@@ -1,17 +1,15 @@
 try:
-    import gym
-except ImportError:
     import gymnasium as gym
+    from gymnasium import spaces
+except ImportError:
+    import gym
+    from gym import spaces
 import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
-try:
-    from gymnasium import spaces
-except ImportError:
-    from gym import spaces
-from Box2D.b2 import (world, polygonShape)
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, rotate_camera_frame
+from Box2D.b2 import (world, polygonShape, contactListener)
 
 FPS      = 50
 SCALE    = 28.0        # pixels per metre
@@ -52,46 +50,80 @@ GROUND_SEGS = [
     (66.5,  -0.4,  5.5, 0.4),    # x = 61 .. 72   (exit area)
 ]
 
+# Pits (x_start, x_end) = gaps between consecutive ground segments
+PITS = [(a[0] + a[2], b[0] - b[2])
+        for a, b in zip(GROUND_SEGS[:-1], GROUND_SEGS[1:])
+        if b[0] - b[2] > a[0] + a[2] + 1e-6]
+
 # Floating platforms (cx, cy, hw, hh)
+# Low steps (top ~2.55m) are reachable with one ground jump; high steps (top ~4.95m)
+# are reachable from a low step. None overhangs a pit take-off / landing zone, so a
+# running jump over a pit never bonks its head on a platform underside.
 PLATFORMS = [
-    (19.0,  3.0,  2.0, 0.35),    # over/before pit 1
-    (22.5,  5.0,  1.5, 0.35),    # platform bridge
-    (25.0,  3.5,  1.5, 0.35),    # landing pad
-    (34.0,  3.0,  1.5, 0.35),    # before pit 2
-    (37.0,  5.5,  2.0, 0.35),    # mid-air
-    (48.5,  3.5,  1.5, 0.35),    # over gap
-    (52.0,  6.0,  2.0, 0.35),    # high platform
-    (60.0,  4.0,  1.5, 0.35),    # before pit 4
-    (63.0,  2.5,  1.5, 0.35),    # final step
+    (13.5,  2.2,  1.5, 0.35),    # low step before pit 1
+    (16.0,  4.6,  1.5, 0.35),    # high step before pit 1
+    (27.5,  2.2,  1.5, 0.35),    # low step after pit 1
+    (40.0,  2.2,  2.0, 0.35),    # low step after pit 2
+    (44.0,  4.6,  1.5, 0.35),    # high step before pit 3
+    (55.0,  2.2,  1.5, 0.35),    # low step after pit 3
+    (57.5,  4.6,  1.0, 0.35),    # high step before pit 4
 ]
 
 FLAGPOLE_X = 70.0
 FLAGPOLE_Y_TOP = 10.0    # top of pole
 
 SPAWN_X, SPAWN_Y = 2.0, 1.0   # Mario spawn pos (body centre)
+SPAWN_JITTER = 1.0             # +- metres of random spawn X offset (seeded)
 EXIT_DIST = 1.8                # metres from flagpole to win
+
+# Movement (velocity-controlled, no unbounded force)
+MAX_VX      = 7.0     # m/s top running speed
+GROUND_ACC  = 45.0    # m/s^2 acceleration towards target speed on the ground
+AIR_ACC     = 20.0    # m/s^2 acceleration towards target speed in the air
+JUMP_VY     = 19.0    # m/s take-off speed → ~3.6m apex (≥1m clearance over low steps), ~0.76s air time, ~5.3m at top speed
+PIT_OBS_CAP = 20.0    # metres; obs value when no pit lies ahead
 
 # ==============================================================================
 # 1. MARIO BASE ENVIRONMENT
 # ==============================================================================
+class OneWayPlatformListener(contactListener):
+    """Makes floating platforms one-way: Mario passes up through the underside and lands on top."""
+    def PreSolve(self, contact, old_manifold):
+        fa, fb = contact.fixtureA, contact.fixtureB
+        if fa.body.userData == 'player' and fb.body.userData == 'platform':
+            player, plat = fa.body, fb
+        elif fb.body.userData == 'player' and fa.body.userData == 'platform':
+            player, plat = fb.body, fa
+        else:
+            return
+        plat_top = float(plat.body.position.y) + max(float(v[1]) for v in plat.shape.vertices)
+        feet = float(player.position.y) - P_HH
+        if feet < plat_top - 0.05:   # feet below the top surface → pass through
+            contact.enabled = False
+
+
 class MarioEscapeEnv(gym.Env):
     """
     Mario Escape — simplified side-scrolling platformer.
 
-    Goal: Reach the flagpole at the far right of the level.
+    Goal: Reach the flagpole at the far right of the level, jumping over 4 pits.
 
-    Actions (2D continuous):
-      0: Horizontal force  [-1..1]  (+1 = move right, -1 = move left)
-      1: Jump              [>0.5]   fires a jump impulse when grounded
+    Actions (2D continuous, Box[-1, 1]):
+      0: Run     [-1..1]  target horizontal speed = action * MAX_VX
+                          (+1 = run right at full speed, -1 = run left, 0 = stop)
+      1: Jump    [>0.5]   jump when standing on top of ground/platform (<=0.5 = no jump)
 
-    Observation (10D):
+    Observation (8D):
       0-3: Player X, Y, Vx, Vy
-      4  : Player angle (should stay ~0 with fixedRotation)
-      5  : Is grounded (1.0 / 0.0)
-      6  : X distance to flagpole
-      7  : Y distance to flagpole top
-      8  : Distance to nearest pit edge (approximate)
-      9  : Step fraction (step_count / max_steps)
+      4  : Is grounded (1.0 / 0.0) — standing on the top surface of ground/platform
+      5  : Signed X distance from player centre to the start of the next pit ahead
+           (negative while above that pit; PIT_OBS_CAP if no pit ahead)
+      6  : Width of that pit (0.0 if no pit ahead)
+      7  : Step fraction (step_count / max_steps)
+
+    Reward: 3 * forward progress (metres) - 0.02 per step,
+            +200 on reaching the flagpole, -80 on falling into a pit.
+    Episode ends (terminated) on goal or fall; truncated after max_steps.
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": FPS}
 
@@ -101,15 +133,18 @@ class MarioEscapeEnv(gym.Env):
         self.clock       = None
 
         self.action_space      = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(10,), dtype=np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(8,), dtype=np.float32)
 
-        self.world   = world(gravity=(0, GRAVITY), doSleep=True)
+        self.platform_listener = OneWayPlatformListener()
+        self.world   = world(gravity=(0, GRAVITY), doSleep=True, contactListener=self.platform_listener)
         self.bodies  = []
         self.grounds = []     # ground segment bodies
         self.plats   = []     # platform bodies
+        self.player  = None
         self.max_steps = 1200
         self.step_count = 0
         self.is_grounded = False
+        self.facing_right = True
 
     # ------------------------------------------------------------------
     def _build_static(self, specs, color_tag):
@@ -117,7 +152,7 @@ class MarioEscapeEnv(gym.Env):
         for cx, cy, hw, hh in specs:
             b = self.world.CreateStaticBody(
                 position=(cx, cy), shapes=polygonShape(box=(hw, hh)))
-            b._color_tag = color_tag
+            b.userData = color_tag     # Box2D-persistent tag (ce.other returns a fresh wrapper)
             self.bodies.append(b)
             result.append(b)
         return result
@@ -143,7 +178,7 @@ class MarioEscapeEnv(gym.Env):
         pole = self.world.CreateStaticBody(
             position=(FLAGPOLE_X, FLAGPOLE_Y_TOP / 2),
             shapes=polygonShape(box=(0.1, FLAGPOLE_Y_TOP / 2)))
-        pole._color_tag = 'flag'
+        pole.userData = 'flag'
         self.bodies.append(pole)
         self.flagpole = pole
 
@@ -151,53 +186,72 @@ class MarioEscapeEnv(gym.Env):
         west_w = self.world.CreateStaticBody(
             position=(-0.2, LEVEL_H / 2),
             shapes=polygonShape(box=(0.2, LEVEL_H / 2)))
-        west_w._color_tag = 'wall'
+        west_w.userData = 'wall'
         self.bodies.append(west_w)
 
-        # Mario player body
+        # Mario player body (zero friction: speed is velocity-controlled, so no wall-sticking)
+        spawn_x = SPAWN_X + float(self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER))
         self.player = self.world.CreateDynamicBody(
-            position=(SPAWN_X, SPAWN_Y),
-            linearDamping=0.4,
+            position=(spawn_x, SPAWN_Y),
+            linearDamping=0.0,
             angularDamping=10.0,
             fixedRotation=True)
-        self.player.CreatePolygonFixture(box=(P_HW, P_HH), density=1.2, friction=0.8)
+        self.player.CreatePolygonFixture(box=(P_HW, P_HH), density=1.2, friction=0.0)
+        self.player.userData = 'player'
         self.bodies.append(self.player)
+
+        # Settle onto the ground so the first obs reports grounded correctly
+        for _ in range(5):
+            self.world.Step(1.0 / FPS, 8, 3)
+        self.is_grounded = self._check_grounded()
 
         self.prev_x = float(self.player.position.x)
         return self._get_obs(), {}
 
     # ------------------------------------------------------------------
+    def _check_grounded(self):
+        """True only if touching the TOP surface of ground/platform (contact normal points up)."""
+        if float(self.player.linearVelocity.y) > 1.0:   # still rising from a jump
+            return False
+        # Geometric test (independent of Box2D manifold-normal / enabled-flag conventions):
+        # touching a ground/platform block with the feet resting on its top face
+        feet = float(self.player.position.y) - P_HH
+        px = float(self.player.position.x)
+        for ce in self.player.contacts:
+            if not ce.contact.touching or ce.other.userData not in ('ground', 'platform'):
+                continue
+            other = ce.other
+            verts = [other.transform * v for f in other.fixtures for v in f.shape.vertices]
+            top = max(float(v[1]) for v in verts)
+            left = min(float(v[0]) for v in verts) - P_HW
+            right = max(float(v[0]) for v in verts) + P_HW
+            if abs(feet - top) < 0.1 and left < px < right:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
     def step(self, action):
-        action = np.clip(action, -1.0, 1.0)
+        action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
         self.step_count += 1
 
-        # --- Strict grounded detection: low vy + touching ground/platform from above (disables double jump)
+        vx = float(self.player.linearVelocity.x)
         vy = float(self.player.linearVelocity.y)
-        touching_ground = False
-        if abs(vy) < 1.0:
-            for ce in self.player.contacts:
-                if ce.contact.touching:
-                    other = ce.other
-                    if getattr(other, '_color_tag', None) in ('ground', 'platform'):
-                        if float(self.player.position.y) > float(other.position.y + 0.1):
-                            touching_ground = True
-                            break
-        self.is_grounded = touching_ground
 
-        # --- Horizontal movement
-        h_force = float(action[0]) * 220.0
-        self.player.ApplyForceToCenter((h_force, 0.0), wake=True)
+        # --- Horizontal movement: accelerate towards target speed (capped at MAX_VX)
+        target = float(action[0]) * MAX_VX
+        acc = (GROUND_ACC if self.is_grounded else AIR_ACC) / FPS
+        vx += float(np.clip(target - vx, -acc, acc))
 
-        # --- Jump (impulse when grounded)
+        # --- Jump (only from a top surface; is_grounded reflects the current, post-step state)
         if float(action[1]) > 0.5 and self.is_grounded:
-            # Zero out downward velocity first, then apply upward impulse
-            self.player.linearVelocity = (self.player.linearVelocity.x, 0.0)
-            mass = self.player.mass
-            self.player.ApplyLinearImpulse(
-                (0.0, mass * 22.0),           # jump strength
-                self.player.worldCenter, True)
+            vy = JUMP_VY
+            self.is_grounded = False
+
+        self.player.linearVelocity = (vx, vy)
+        self.player.awake = True
 
         self.world.Step(1.0 / FPS, 8, 3)
+        self.is_grounded = self._check_grounded()
         obs = self._get_obs()
 
         vx = float(self.player.linearVelocity.x)
@@ -215,6 +269,7 @@ class MarioEscapeEnv(gym.Env):
         self.prev_x = px
 
         terminated = False
+        truncated  = False
 
         # Success: reached flagpole
         if abs(px - FLAGPOLE_X) < EXIT_DIST:
@@ -228,28 +283,31 @@ class MarioEscapeEnv(gym.Env):
 
         # Timeout
         elif self.step_count >= self.max_steps:
-            terminated = True
+            truncated = True
 
         if self.render_mode == "human":
             self.render()
-        return obs, reward, terminated, False, {}
+        return obs, reward, terminated, truncated, {}
+
+    # ------------------------------------------------------------------
+    def _next_pit(self, px):
+        """(signed distance to start of next pit not yet passed, pit width)."""
+        for x0, x1 in PITS:
+            if px < x1:
+                return x0 - px, x1 - x0
+        return PIT_OBS_CAP, 0.0
 
     # ------------------------------------------------------------------
     def _get_obs(self):
         p  = self.player.position
         v  = self.player.linearVelocity
-        dx = FLAGPOLE_X - float(p.x)
-        dy = FLAGPOLE_Y_TOP - float(p.y)
-        # Nearest pit: approximate as distance to nearest ground-segment edge
-        # (simple: just use X distance to flagpole as proxy)
+        pit_d, pit_w = self._next_pit(float(p.x))
         frac = self.step_count / self.max_steps
         return np.array([
             float(p.x), float(p.y),
             float(v.x), float(v.y),
-            float(self.player.angle),
             float(self.is_grounded),
-            dx, dy,
-            0.0,   # reserved
+            min(pit_d, PIT_OBS_CAP), pit_w,
             frac
         ], dtype=np.float32)
 
@@ -280,7 +338,7 @@ class MarioEscapeEnv(gym.Env):
         pygame.draw.line(self.screen, (100, 210, 60), (0, wy(0)), (sw, wy(0)), 3)
 
         for b in self.grounds + self.plats:
-            tag = getattr(b, '_color_tag', 'ground')
+            tag = b.userData or 'ground'
             for f in b.fixtures:
                 verts = [(wx((b.transform * v)[0]), wy((b.transform * v)[1]))
                          for v in f.shape.vertices]
@@ -382,6 +440,12 @@ class MarioOrthographicWrapper(gym.Wrapper):
         # Orbit pivot: Mario himself (camera_dist ahead of the camera along +X)
         self.pivot_depth = self.camera_dist
 
+        # Camera always follows Mario: its height eases toward his (so jumps read against the
+        # ground/horizon), and a look-at tilt keeps Mario framed at the same screen spot
+        self.follow_y = None
+        self.follow_rate = 0.15   # fraction of the height gap closed per rendered frame
+        self.look_pitch = 0.0
+
         # Last computed camera world position (valid before first render)
         self.cam_x, self.cam_y, self.cam_z = 0.0, 0.0, 0.0
 
@@ -390,7 +454,21 @@ class MarioOrthographicWrapper(gym.Wrapper):
         self.cam_yaw = 0.0
         self.cam_pitch = 0.0
         self.cam_roll = 0.0
+        self.follow_y = None
+        self.look_pitch = 0.0
         return self.env.reset(**kwargs)
+
+    def _update_follow_y(self):
+        """Eases the camera height toward Mario's and aims the camera at him (look-at tilt)."""
+        base = self.env.unwrapped
+        if not hasattr(base, 'player') or base.player is None:
+            return
+        p_y = float(base.player.position.y)
+        if self.follow_y is None:
+            self.follow_y = p_y
+        self.follow_y += self.follow_rate * (p_y - self.follow_y)
+        # Tilt so Mario sits where he would if the camera were exactly at his height
+        self.look_pitch = math.atan2((p_y - self.follow_y) * self.SCALE, self.pivot_depth)
 
     @property
     def _cam_anchor(self):
@@ -401,7 +479,8 @@ class MarioOrthographicWrapper(gym.Wrapper):
             return None
         S = self.SCALE
         cam_x = float(base.player.position.x) * S - self.camera_dist   # trailing behind
-        cam_y = float(base.player.position.y) * S + self.camera_height # above body centre
+        follow_y = self.follow_y if self.follow_y is not None else float(base.player.position.y)
+        cam_y = follow_y * S + self.camera_height                      # above Mario's (eased) body centre
         cam_z = 0.0                                                    # center depth
         return (cam_x, cam_y, cam_z)
 
@@ -503,6 +582,7 @@ class MarioOrthographicWrapper(gym.Wrapper):
     def render(self, camera_pose="Center"):
         # 0. Accumulate camera orientation delta for 3D FPV
         self.update_camera_pose(camera_pose)
+        self._update_follow_y()
 
         base = self.env.unwrapped
 
@@ -527,10 +607,13 @@ class MarioOrthographicWrapper(gym.Wrapper):
         pygame.draw.rect(side_surf, GRASS_C, (0, VH - y_shift, VW, y_shift))
         pygame.draw.line(side_surf, (100, 210, 60), (0, VH - y_shift), (VW, VH - y_shift), 2)
 
-        # FPV: sky upper half, green grass lower half
+        # FPV: sky above, green grass below the horizon, which moves with the camera's net tilt
+        # (look-at tilt up lowers it, orbit pitch looking down raises it)
+        net_pitch = self.look_pitch - self.cam_pitch
+        horizon = int(max(0, min(VH, cy + self.fov * math.tan(net_pitch))))
         fpv_surf.fill(SKY_C)
-        pygame.draw.rect(fpv_surf, GRASS_C, (0, VH // 2, VW, VH // 2))
-        pygame.draw.line(fpv_surf, (100, 210, 60), (0, VH // 2), (VW, VH // 2), 2)
+        pygame.draw.rect(fpv_surf, GRASS_C, (0, horizon, VW, VH - horizon))
+        pygame.draw.line(fpv_surf, (100, 210, 60), (0, horizon), (VW, horizon), 2)
 
         if not hasattr(base, 'player'):
             return [np.zeros((VH, VW, 3), np.uint8)] * 4
@@ -720,6 +803,8 @@ class MarioOrthographicWrapper(gym.Wrapper):
                 dz = vz - anc_z    # left/right relative to camera
                 # Orbit first so near-plane clipping runs on the orbited depth
                 d_c, lat_c, dy_c = orbit_camera_frame(dx, -dz, dy, self.cam_yaw, self.cam_pitch, self.pivot_depth)
+                # Look-at tilt keeps Mario framed while the camera height eases after him
+                d_c, lat_c, dy_c = rotate_camera_frame(d_c, lat_c, dy_c, 0.0, self.look_pitch)
                 rel_verts.append((d_c, dy_c, -lat_c))
 
             clipped = []

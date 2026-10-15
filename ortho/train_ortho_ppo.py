@@ -20,7 +20,7 @@ from torch.utils.checkpoint import checkpoint as ckpt_fn
 from IPython.display import display, clear_output
 from tqdm import tqdm
 from PIL import Image
-from utils import _build_registry, ActorCritic
+from utils import _build_registry, _build_heldout_registry, ActorCritic
 
 # ------------------------------------------------------------------
 # PPO (Proximal Policy Optimization) Implementation
@@ -199,6 +199,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=10, help="Number of PPO update epochs")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--heldout", action="store_true", help="Train on the held-out obstacle-transfer test envs instead")
     return parser.parse_args()
 
 
@@ -209,7 +210,7 @@ def main():
     print(f"Using device: {device}")
     print(f"Hyperparameters: total_timesteps={args.total_timesteps}, rollout_steps={args.rollout_steps}, batch_size={args.batch_size}, epochs={args.epochs}, lr={args.lr}, seed={args.seed}")
 
-    registry = _build_registry()
+    registry = _build_heldout_registry() if args.heldout else _build_registry()
     if not registry:
         print("No environments could be loaded. Exiting.")
         return

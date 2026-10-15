@@ -1,138 +1,282 @@
-import gym
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+except ImportError:
+    import gym
+    from gym import spaces
 import numpy as np
 import pygame
 from pygame import gfxdraw
-import math 
+import math
 import cv2
 from .camera_utils import orbit_camera_frame, orbit_camera_offset
-from gymnasium import spaces
 from Box2D.b2 import (world, polygonShape, circleShape, revoluteJointDef)
 
 FPS = 50
-SCALE = 30.0   
+SCALE = 30.0
+
+# World / layout constants (metres, Box2D units)
+GROUND_Y = 2.0            # Top surface of the terrain slab
+WORLD_HALF_W = 50.0       # Terrain spans x in [-50, 50]
+CHASSIS_START_X = 8.0
+BIN_X = 17.0              # Hopper bin between the excavator and the rock face; the rock must be lifted over its walls
+BIN_INNER_HALF_W = 1.7
+BIN_WALL_TOP = GROUND_Y + 1.8
+FACE_X = 24.0             # Near side of the rock face (static cliff) that ends the work area
+FACE_H = 3.0
+PAYLOAD_RADIUS = 0.35     # Octagonal rock: flat faces so it rests instead of rolling away
+PAYLOAD_GAP = 1.0         # Rock starts up to this far from the rock face (seeded); the face backs the scoop
+
+# Arm geometry: anchors are (local point on parent, local point on child)
+SHOULDER_ANCHOR = (1.0, 1.0)              # On the chassis (top front)
+BOOM_ANCHORS = ((-2.8, 0.0), (2.8, 0.0))  # Boom root / boom tip  -> length 5.6
+DIPPER_ANCHORS = ((-1.8, 0.0), (1.8, 0.0))  # Dipper root / dipper tip -> length 3.6
+BUCKET_ANCHOR = (-0.9, 0.0)               # Bucket pivot (just behind its back wall)
+BUCKET_CUP = (0.0, -0.45)                 # Centre of the bucket's cup, in bucket coordinates
+
+# Initial relative joint angles (rad): boom raised, dipper folded down, bucket cup facing up
+INIT_BOOM, INIT_DIPPER, INIT_BUCKET = 0.9, -2.0, 1.1
+
+DRIVE_SPEED = 4.0         # Track speed (m/s) at |drive| = 1
+DRIVE_MAX_FORCE = 1500.0
+JOINT_SPEED = 2.0         # Hydraulic joint speed (rad/s) at |action| = 1
+
+SUCCESS_BONUS = 100.0
+FAIL_PENALTY = 50.0       # Tipping over / payload or machine leaving the world
+SETTLE_STEPS = 10         # Payload must rest in the bin this many consecutive steps
+
+ARM_GROUP = -1            # Arm parts and chassis never collide with each other
+
 
 class ExcavatorEnv(gym.Env):
     """
-    Excavator task: Scoop a dynamic payload and drive it backward to drop it in a bin.
+    Excavator task: drive up to a hopper bin, reach over it to scoop a loose rock lying at the foot of a
+    rock face beyond the bin (the face backs the scoop), lift the rock back over the bin wall and dump it
+    so it comes to rest inside the bin.
+    Layout along x: excavator (start x=8) -> bin (x=17, walls 1.8 high) -> rock (x~23-23.6) -> rock face (x>=24).
+
+    Action (Box(-1, 1, (4,))):
+        0 drive  : track speed, +1 = forward (+x, toward bin and rock), -1 = reverse, 0 = brake/hold
+        1 boom   : boom joint speed, +1 = raise boom, -1 = lower boom
+        2 dipper : dipper (stick) joint speed, +1 = swing stick up/outward, -1 = fold stick down/in
+        3 bucket : bucket joint speed, +1 = curl bucket up (mouth tilts up, holds load), -1 = tip forward (dump)
+
+    Observation (23 floats):
+        0-5   chassis x, y, vx, vy, angle, angular velocity
+        6-11  boom angle, boom speed, dipper angle, dipper speed, bucket angle, bucket speed (relative joint angles)
+        12-14 bucket cup centre x, y and bucket world angle
+        15-18 payload x, y, vx, vy
+        19-20 payload minus bucket cup (dx, dy)
+        21-22 payload x minus bin centre x, payload height above the ground
+
+    Reward: potential-based shaping r = Phi(s') - Phi(s) with
+        Phi = -1.0 * min(dist(bucket cup, payload), 10) - 2.0 * |payload x - bin x| + 1.0 * lift
+        (lift = payload height above ground capped at the bin wall height, counted as full once the
+        payload is horizontally inside the bin), +100 when the payload rests inside the bin (below the
+        wall top, between the walls, slow, not touching the bucket, for 10 steps), -50 and terminate
+        when the machine tips over or the payload / chassis leaves the world. Truncated at max_episode_steps.
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": FPS}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, max_episode_steps=1000):
         self.render_mode = render_mode
         self.screen = None
         self.clock = None
-        
+        self.max_episode_steps = max_episode_steps
+
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
-        
-        # State space increased to 14 to include Payload X, Y, Vx, Vy
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32)
-        
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(23,), dtype=np.float32)
+
         self.world = world(gravity=(0, -10), doSleep=True)
         self.bodies = []
-        
+
+    @staticmethod
+    def _place(body_anchor_world, local_anchor, angle):
+        """Body origin such that local_anchor (rotated by angle) lands on body_anchor_world."""
+        c, s = math.cos(angle), math.sin(angle)
+        return (body_anchor_world[0] - (c * local_anchor[0] - s * local_anchor[1]),
+                body_anchor_world[1] - (s * local_anchor[0] + c * local_anchor[1]))
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        
-        for body in self.bodies:
-            self.world.DestroyBody(body)
+
+        # Fresh world each episode so the same seed replays identically (no warm-started contacts)
+        self.world = world(gravity=(0, -10), doSleep=True)
         self.bodies = []
-        
+        self.steps = 0
+        self.settle_count = 0
+
         # 1. Terrain
-        self.terrain = self.world.CreateStaticBody(position=(0, 0), shapes=polygonShape(box=(50, 2)))
+        self.terrain = self.world.CreateStaticBody(position=(0, 0), shapes=polygonShape(box=(WORLD_HALF_W, GROUND_Y)))
+        self.terrain.fixtures[0].friction = 0.8
         self.bodies.append(self.terrain)
-        
-        # 2. Goal Bin (Behind the excavator at X=2)
-        self.goal_bin = self.world.CreateStaticBody(position=(2.0, 2.0))
-        self.goal_bin.CreatePolygonFixture(box=(2.0, 0.2, (0, 0), 0))       # Bottom
-        self.goal_bin.CreatePolygonFixture(box=(0.2, 1.0, (-2.0, 1.0), 0))  # Left wall
-        self.goal_bin.CreatePolygonFixture(box=(0.2, 1.0, (2.0, 1.0), 0))   # Right wall
+
+        # 2. Goal hopper bin (ahead of the excavator, walls taller than the rock)
+        wall_h = (BIN_WALL_TOP - GROUND_Y - 0.2) / 2.0
+        self.goal_bin = self.world.CreateStaticBody(position=(BIN_X, GROUND_Y))
+        self.goal_bin.CreatePolygonFixture(box=(BIN_INNER_HALF_W + 0.3, 0.1, (0, 0.1), 0), friction=0.8)                    # Floor
+        self.goal_bin.CreatePolygonFixture(box=(0.15, wall_h, (-BIN_INNER_HALF_W - 0.15, 0.2 + wall_h), 0), friction=0.8)  # Left wall
+        self.goal_bin.CreatePolygonFixture(box=(0.15, wall_h, (BIN_INNER_HALF_W + 0.15, 0.2 + wall_h), 0), friction=0.8)   # Right wall
         self.bodies.append(self.goal_bin)
 
-        # 3. Dynamic Payload (The rock to pick up, placed in front of excavator)
-        self.payload = self.world.CreateDynamicBody(position=(17.0, 2.5))
-        self.payload.CreateCircleFixture(radius=0.4, density=0.5, friction=0.8)
+        # Rock face beyond the bin: a loose rock can only be scooped when backed against something
+        self.rock_face = self.world.CreateStaticBody(position=(FACE_X + 1.5, GROUND_Y + FACE_H / 2.0),
+                                                     shapes=polygonShape(box=(1.5, FACE_H / 2.0)))
+        self.rock_face.fixtures[0].friction = 0.8
+        self.bodies.append(self.rock_face)
+
+        # 3. Dynamic Payload: octagonal rock at the foot of the rock face (rests on a face, damped so it can be scooped and carried)
+        half_w = PAYLOAD_RADIUS * math.cos(math.pi / 8)
+        px = FACE_X - half_w - 0.02 - float(self.np_random.uniform(0.0, PAYLOAD_GAP))
+        octagon = [(PAYLOAD_RADIUS * math.cos(a), PAYLOAD_RADIUS * math.sin(a))
+                   for a in np.linspace(0, 2 * math.pi, 8, endpoint=False) + math.pi / 8]
+        self.payload = self.world.CreateDynamicBody(position=(px, GROUND_Y + half_w),
+                                                    linearDamping=0.2, angularDamping=2.0)
+        self.payload.CreatePolygonFixture(vertices=octagon, density=2.0, friction=0.9, restitution=0.0)
         self.bodies.append(self.payload)
 
-        # 4. Excavator Kinematic Chain
-        self.chassis = self.world.CreateDynamicBody(position=(10, 3.0))
-        self.chassis.CreatePolygonFixture(box=(2.0, 1.0), density=5.0, friction=0.8)
+        # 4. Excavator Kinematic Chain (bodies created at joint-consistent poses)
+        self.chassis = self.world.CreateDynamicBody(position=(CHASSIS_START_X, GROUND_Y + 1.0))
+        self.chassis.CreatePolygonFixture(box=(2.0, 1.0), density=10.0, friction=0.3, groupIndex=ARM_GROUP)
         self.bodies.append(self.chassis)
-        
-        self.boom = self.world.CreateDynamicBody(position=(11.5, 4.5))
-        self.boom.CreatePolygonFixture(box=(3.0, 0.4), density=1.0)
+
+        shoulder = self.chassis.GetWorldPoint(SHOULDER_ANCHOR)
+        a_boom = INIT_BOOM
+        self.boom = self.world.CreateDynamicBody(position=self._place(shoulder, BOOM_ANCHORS[0], a_boom), angle=a_boom)
+        self.boom.CreatePolygonFixture(box=(3.0, 0.4), density=1.0, groupIndex=ARM_GROUP)
         self.bodies.append(self.boom)
-        
-        self.dipper = self.world.CreateDynamicBody(position=(14.5, 4.5))
-        self.dipper.CreatePolygonFixture(box=(2.0, 0.3), density=1.0)
+
+        elbow = self.boom.GetWorldPoint(BOOM_ANCHORS[1])
+        a_dipper = a_boom + INIT_DIPPER
+        self.dipper = self.world.CreateDynamicBody(position=self._place(elbow, DIPPER_ANCHORS[0], a_dipper), angle=a_dipper)
+        self.dipper.CreatePolygonFixture(box=(2.0, 0.3), density=1.0, groupIndex=ARM_GROUP)
         self.bodies.append(self.dipper)
-        
-        # CONCAVE BUCKET: Composed of 3 separate fixtures
-        self.bucket = self.world.CreateDynamicBody(position=(16.5, 4.5))
-        self.bucket.CreatePolygonFixture(box=(0.6, 0.1, (0, -0.5), 0), density=1.0)    # Bottom plate
-        self.bucket.CreatePolygonFixture(box=(0.1, 0.5, (-0.5, 0), 0), density=1.0)    # Back wall
-        self.bucket.CreatePolygonFixture(box=(0.1, 0.3, (0.5, -0.2), 0), density=1.0)  # Front lip
+
+        # BUCKET: back wall + wedge-edged floor; open mouth toward +x (loader-style scoop, curl to hold)
+        wrist = self.dipper.GetWorldPoint(DIPPER_ANCHORS[1])
+        a_bucket = a_dipper + INIT_BUCKET
+        self.bucket = self.world.CreateDynamicBody(position=self._place(wrist, BUCKET_ANCHOR, a_bucket), angle=a_bucket)
+        # Smooth steel (low friction) so the cutting edge slides under the rock
+        self.bucket.CreatePolygonFixture(box=(0.08, 0.55, (-0.8, -0.35), 0), density=1.0, friction=0.2, groupIndex=ARM_GROUP)  # Back wall
+        self.bucket.CreatePolygonFixture(vertices=[(-0.88, -0.92), (1.05, -0.92), (0.55, -0.8), (-0.88, -0.8)],
+                                         density=1.0, friction=0.2, groupIndex=ARM_GROUP)                                   # Floor + cutting edge
         self.bodies.append(self.bucket)
-        
-        # Joints
+
+        # Joints (joint angle = child angle - parent angle, so the reset pose reads INIT_BOOM / INIT_DIPPER / INIT_BUCKET)
         self.boom_joint = self.world.CreateJoint(revoluteJointDef(
-            bodyA=self.chassis, bodyB=self.boom, localAnchorA=(1.0, 1.0), localAnchorB=(-2.8, 0),
-            enableMotor=True, maxMotorTorque=800, enableLimit=True, lowerAngle=-np.pi/6, upperAngle=np.pi/2
+            bodyA=self.chassis, bodyB=self.boom, localAnchorA=SHOULDER_ANCHOR, localAnchorB=BOOM_ANCHORS[0],
+            referenceAngle=0.0, enableMotor=True, maxMotorTorque=1200, enableLimit=True,
+            lowerAngle=-0.6, upperAngle=1.3
         ))
         self.dipper_joint = self.world.CreateJoint(revoluteJointDef(
-            bodyA=self.boom, bodyB=self.dipper, localAnchorA=(2.8, 0), localAnchorB=(-1.8, 0),
-            enableMotor=True, maxMotorTorque=500, enableLimit=True, lowerAngle=-np.pi/2, upperAngle=np.pi/2
+            bodyA=self.boom, bodyB=self.dipper, localAnchorA=BOOM_ANCHORS[1], localAnchorB=DIPPER_ANCHORS[0],
+            referenceAngle=0.0, enableMotor=True, maxMotorTorque=800, enableLimit=True,
+            lowerAngle=-2.6, upperAngle=0.6
         ))
         self.bucket_joint = self.world.CreateJoint(revoluteJointDef(
-            bodyA=self.dipper, bodyB=self.bucket, localAnchorA=(1.8, 0), localAnchorB=(-0.8, 0),
-            enableMotor=True, maxMotorTorque=300, enableLimit=True, lowerAngle=-np.pi/1.2, upperAngle=np.pi/3
+            bodyA=self.dipper, bodyB=self.bucket, localAnchorA=DIPPER_ANCHORS[1], localAnchorB=BUCKET_ANCHOR,
+            referenceAngle=0.0, enableMotor=True, maxMotorTorque=400, enableLimit=True,
+            lowerAngle=-1.0, upperAngle=2.8
         ))
-        
+
+        self.prev_potential = self._potential()
         return self._get_obs(), {}
 
+    # --- Helpers ---
+    def _bucket_cup(self):
+        return self.bucket.GetWorldPoint(BUCKET_CUP)
+
+    def _payload_in_bin(self):
+        p = self.payload.position
+        return abs(p.x - BIN_X) < BIN_INNER_HALF_W and p.y < BIN_WALL_TOP
+
+    def _touching(self, a, b):
+        for ce in a.contacts:
+            if ce.other == b and ce.contact.touching:
+                return True
+        return False
+
+    def _potential(self):
+        cup = self._bucket_cup()
+        p = self.payload.position
+        d_reach = min(math.hypot(cup[0] - p.x, cup[1] - p.y), 10.0)
+        d_bin = min(abs(p.x - BIN_X), 30.0)
+        lift_cap = BIN_WALL_TOP - GROUND_Y
+        if abs(p.x - BIN_X) < BIN_INNER_HALF_W:
+            lift = lift_cap
+        else:
+            lift = float(np.clip(p.y - (GROUND_Y + PAYLOAD_RADIUS), 0.0, lift_cap))
+        return -1.0 * d_reach - 2.0 * d_bin + 1.0 * lift
+
     def step(self, action):
-        action = np.clip(action, -1.0, 1.0)
-        
-        self.chassis.ApplyForceToCenter((float(action[0] * 200.0), 0.0), wake=True)
-        self.boom_joint.motorSpeed = float(action[1] * 2.0)
-        self.dipper_joint.motorSpeed = float(action[2] * 2.0)
-        self.bucket_joint.motorSpeed = float(action[3] * 2.0)
-        
+        action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        self.steps += 1
+
+        # Tracks: velocity-tracking drive with a force limit (0 = brake / hold position)
+        target_v = float(action[0]) * DRIVE_SPEED
+        force = float(np.clip(self.chassis.mass * 20.0 * (target_v - self.chassis.linearVelocity.x), -DRIVE_MAX_FORCE, DRIVE_MAX_FORCE))
+        self.chassis.ApplyForceToCenter((force, 0.0), wake=True)
+        self.boom_joint.motorSpeed = float(action[1] * JOINT_SPEED)
+        self.dipper_joint.motorSpeed = float(action[2] * JOINT_SPEED)
+        self.bucket_joint.motorSpeed = float(action[3] * JOINT_SPEED)
+
         self.world.Step(1.0 / FPS, 6, 2)
         obs = self._get_obs()
-        
-        # --- Dense Reward Function ---
-        dist_bucket_to_payload = np.linalg.norm([self.bucket.position.x - self.payload.position.x, self.bucket.position.y - self.payload.position.y])
-        dist_payload_to_goal = np.linalg.norm([self.payload.position.x - self.goal_bin.position.x, self.payload.position.y - (self.goal_bin.position.y + 1.0)])
-        
-        # 1. Small penalty for bucket being far from payload
-        # 2. Large penalty for payload being far from bin
-        reward = float(- (dist_bucket_to_payload * 0.1) - (dist_payload_to_goal * 1.0))
-        
+
+        # --- Potential-based shaping ---
+        potential = self._potential()
+        reward = float(potential - self.prev_potential)
+        self.prev_potential = potential
+
         terminated = False
-        
-        # Success Condition: Payload is inside the bin
-        if dist_payload_to_goal < 1.5:
-            reward += 100.0
+        info = {"success": False}
+        p, c = self.payload.position, self.chassis.position
+
+        # Success: payload resting inside the bin, released from the bucket
+        if self._payload_in_bin() and self.payload.linearVelocity.length < 0.3 and not self._touching(self.payload, self.bucket):
+            self.settle_count += 1
+        else:
+            self.settle_count = 0
+
+        if self.settle_count >= SETTLE_STEPS:
+            reward += SUCCESS_BONUS
             terminated = True
-            
-        # Failure Condition: Tipped over
-        elif abs(self.chassis.angle) > np.pi / 2:
-            reward -= 50.0
+            info["success"] = True
+        # Failure: tipped over, or payload / machine left the world
+        elif (abs(self.chassis.angle) > np.pi / 2
+              or abs(p.x) > WORLD_HALF_W or p.y < 0.0
+              or abs(c.x) > WORLD_HALF_W or c.y < 0.0):
+            reward -= FAIL_PENALTY
             terminated = True
-        
+
+        truncated = (not terminated) and self.steps >= self.max_episode_steps
         if self.render_mode == "human": self.render()
-        return obs, reward, terminated, False, {}
+        return obs, reward, terminated, truncated, info
 
     def _get_obs(self):
-        return np.array([
-            self.chassis.position.x, self.chassis.linearVelocity.x,
-            self.chassis.position.y, self.chassis.linearVelocity.y,
+        cup = self._bucket_cup()
+        p = self.payload.position
+        obs = np.array([
+            self.chassis.position.x, self.chassis.position.y,
+            self.chassis.linearVelocity.x, self.chassis.linearVelocity.y,
+            self.chassis.angle, self.chassis.angularVelocity,
             self.boom_joint.angle, self.boom_joint.speed,
             self.dipper_joint.angle, self.dipper_joint.speed,
             self.bucket_joint.angle, self.bucket_joint.speed,
-            self.payload.position.x, self.payload.position.y,
-            self.payload.linearVelocity.x, self.payload.linearVelocity.y
+            cup[0], cup[1], self.bucket.angle,
+            p.x, p.y,
+            self.payload.linearVelocity.x, self.payload.linearVelocity.y,
+            p.x - cup[0], p.y - cup[1],
+            p.x - BIN_X, p.y - GROUND_Y
         ], dtype=np.float32)
+        return np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    def close(self):
+        if self.screen is not None:
+            if self.render_mode == "human":
+                pygame.display.quit()
+            self.screen = None
+            self.clock = None
 
     def render(self):
         if self.render_mode is None: return
@@ -146,7 +290,7 @@ class ExcavatorEnv(gym.Env):
         colors = {
             self.terrain: (100, 200, 100), self.chassis: (255, 200, 0), self.boom: (255, 200, 0), 
             self.dipper: (255, 200, 0), self.bucket: (150, 150, 150), self.goal_bin: (100, 100, 200),
-            self.payload: (200, 100, 50)
+            self.payload: (200, 100, 50), self.rock_face: (140, 120, 100)
         }
 
         for body in self.bodies:
@@ -285,7 +429,8 @@ class ExcavatorOrthographicWrapper(gym.Wrapper):
             base_env.dipper: (-0.5, 0.5, (255, 200, 0), (200, 150, 0)),
             base_env.bucket: (-0.8, 0.8, (150, 150, 150), (100, 100, 100)),
             base_env.goal_bin: (-2.0, 2.0, (100, 100, 200), (80, 80, 150)),
-            base_env.payload: (-0.4, 0.4, (200, 100, 50), (150, 80, 40))
+            base_env.payload: (-0.4, 0.4, (200, 100, 50), (150, 80, 40)),
+            base_env.rock_face: (-4.0, 4.0, (140, 120, 100), (110, 95, 80))
         }
 
         for body in base_env.bodies:

@@ -1,6 +1,14 @@
 """
 Robot Sumo - A Box2D physics-based sumo wrestling game with orthographic multi-view rendering.
 Two robots compete to push each other out of a circular ring.
+
+Conventions:
+- A robot's forward (plow side) is its local +y axis, i.e. world heading (-sin a, cos a) for body angle a.
+- The ring is visual only (no walls): a robot whose centre goes beyond RING_RADIUS is out.
+- Action (player): [drive, turn, plow], each in [-1, 1].
+    drive: +1 full throttle forward (plow first), -1 full reverse.
+    turn:  +1 turn left (counter-clockwise), -1 turn right.
+    plow:  target plow yaw; +1 swing plow fully left, -1 fully right, 0 straight.
 """
 
 import math
@@ -14,15 +22,9 @@ except ImportError:
     import gym
     from gym import spaces
 
-import Box2D
 from Box2D.b2 import (
     world as b2World,
-    polygonShape as b2PolygonShape,
-    circleShape as b2CircleShape,
     revoluteJointDef as b2RevoluteJointDef,
-    edgeShape as b2EdgeShape,
-    fixtureDef as b2FixtureDef,
-    contactListener as b2ContactListener,
 )
 
 import pygame
@@ -52,6 +54,29 @@ ROBOT_MASS = 5.0
 WHEEL_RADIUS = 0.25
 PLOW_WIDTH = 1.2
 PLOW_LENGTH = 0.3
+PLOW_ANCHOR_Y = ROBOT_LENGTH * 0.6       # Plow hinge on the robot (local +y = front)
+PLOW_HINGE_Y = -PLOW_LENGTH * 0.3        # Hinge point in the plow's own frame
+PLOW_MAX_ANGLE = 0.5                     # Plow yaw limit (rad)
+
+# Control parameters
+DRIVE_FORCE = 40.0      # Max forward/reverse force (N) along the robot's heading
+TURN_TORQUE = 8.0       # Max turning torque (N*m)
+LATERAL_GRIP = 0.3      # Fraction of sideways slip removed per step (wheels resist sliding sideways)
+PLOW_GAIN = 8.0         # Plow servo gain (motor speed per rad of angle error)
+OPPONENT_POWER_RANGE = (0.55, 0.75)  # Opponent drive strength relative to the player (sampled per episode)
+
+# Start pose randomization
+START_RADIUS = 2.5
+START_RADIUS_JITTER = 0.3
+START_ANGLE_JITTER = 0.35   # Jitter of the robots' bearing around the ring (rad)
+START_HEADING_JITTER = 0.3  # Jitter of each robot's heading relative to facing the centre (rad)
+
+# Reward parameters
+REWARD_WIN = 10.0
+REWARD_LOSS = -10.0
+SHAPING_EDGE = 1.0      # Weight of the (opp_dist - player_dist) potential
+SHAPING_APPROACH = 0.2  # Weight of the (-separation) potential
+SEPARATION_CAP = 2.0 * RING_RADIUS
 
 # Colors (RGB)
 COLOR_RING = (200, 180, 140)  # Sandy/tan
@@ -68,16 +93,18 @@ COLOR_GROUND = (80, 60, 40)  # Dark brown ground
 COLOR_SKY = (20, 20, 40)  # Dark sky
 
 
-class ContactDetector(b2ContactListener):
-    def __init__(self, env):
-        super().__init__()
-        self.env = env
+def heading_vector(angle):
+    """World-space forward (plow side) unit vector for a robot with body angle `angle` (local +y)."""
+    return -math.sin(angle), math.cos(angle)
 
-    def BeginContact(self, contact):
-        pass
 
-    def EndContact(self, contact):
-        pass
+def heading_to_angle(dx, dy):
+    """Body angle whose forward (local +y) axis points along world direction (dx, dy)."""
+    return math.atan2(-dx, dy)
+
+
+def wrap_angle(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
 
 
 class RobotSumoEnv(gym.Env):
@@ -91,18 +118,23 @@ class RobotSumoEnv(gym.Env):
         self.screen = None
         self.clock = None
 
-        # Action space: [left_wheel_torque, right_wheel_torque, plow_angle] for player
-        # Opponent uses simple AI
+        # Action space (player): [drive, turn, plow]
+        #   drive: +1 forward (plow first) / -1 reverse, force along the robot's heading
+        #   turn:  +1 turn left (counter-clockwise) / -1 turn right
+        #   plow:  target plow yaw, +1 fully left / -1 fully right / 0 straight
+        # Opponent uses a simple scripted AI
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(3,), dtype=np.float32
         )
 
-        # Observation: player_x, player_y, player_angle, player_vx, player_vy, player_omega,
-        #              opponent_x, opponent_y, opponent_angle, opponent_vx, opponent_vy, opponent_omega,
-        #              plow_angle_player, plow_angle_opponent,
-        #              dist_to_center_player, dist_to_center_opponent
+        # Observation (20,):
+        #   [0:7]   player:   x, y, sin(angle), cos(angle), vx, vy, omega
+        #   [7:14]  opponent: x, y, sin(angle), cos(angle), vx, vy, omega
+        #   [14:16] plow_angle_player, plow_angle_opponent
+        #   [16:18] dist_to_center_player, dist_to_center_opponent
+        #   [18:20] opponent position relative to the player, in the player's frame (forward, left)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(16,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32
         )
 
         self.world = None
@@ -114,12 +146,19 @@ class RobotSumoEnv(gym.Env):
         self.opponent_plow_joint = None
         self.player_wheels = []
         self.opponent_wheels = []
-        self.ring_bodies = []
         self.step_count = 0
         self.max_steps = 500
+        self.opponent_power = 1.0
+        self._potential = 0.0
 
-    def _create_robot(self, position, angle, is_player=True):
-        """Create a robot body with wheels and plow."""
+    def _create_robot(self, position, angle):
+        """Create a robot body with (visual, free-spinning) side wheels and a front plow (local +y)."""
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+
+        def to_world(lx, ly):
+            return (position[0] + lx * cos_a - ly * sin_a,
+                    position[1] + lx * sin_a + ly * cos_a)
+
         # Main body
         body = self.world.CreateDynamicBody(
             position=position,
@@ -134,14 +173,12 @@ class RobotSumoEnv(gym.Env):
             restitution=0.3,
         )
 
-        # Wheels (left and right)
+        # Wheels (left and right, on local -x / +x). Zero gravity, so they give no traction:
+        # they are free-spinning visuals; sideways grip is modelled in _apply_robot_actions.
         wheels = []
         for side in [-1, 1]:
             wheel = self.world.CreateDynamicBody(
-                position=(
-                    position[0] + side * ROBOT_WIDTH * 0.6 * math.cos(angle),
-                    position[1] + side * ROBOT_WIDTH * 0.6 * math.sin(angle),
-                ),
+                position=to_world(side * ROBOT_WIDTH * 0.6, 0),
                 angle=angle,
             )
             wheel.CreateCircleFixture(
@@ -149,24 +186,18 @@ class RobotSumoEnv(gym.Env):
                 density=2.0,
                 friction=1.5,
             )
-            # Attach wheel to body with revolute joint
             jd = b2RevoluteJointDef(
                 bodyA=body,
                 bodyB=wheel,
                 localAnchorA=(side * ROBOT_WIDTH * 0.6, 0),
                 localAnchorB=(0, 0),
-                enableMotor=True,
-                maxMotorTorque=50.0,
-                motorSpeed=0.0,
             )
             joint = self.world.CreateJoint(jd)
             wheels.append((wheel, joint))
 
-        # Plow (wedge at front)
-        plow_offset_x = ROBOT_LENGTH * 0.6 * math.cos(angle)
-        plow_offset_y = ROBOT_LENGTH * 0.6 * math.sin(angle)
+        # Plow (front, local +y), spawned exactly where the hinge places it
         plow = self.world.CreateDynamicBody(
-            position=(position[0] + plow_offset_x, position[1] + plow_offset_y),
+            position=to_world(0, PLOW_ANCHOR_Y - PLOW_HINGE_Y),
             angle=angle,
         )
         plow.CreatePolygonFixture(
@@ -179,12 +210,12 @@ class RobotSumoEnv(gym.Env):
         plow_jd = b2RevoluteJointDef(
             bodyA=body,
             bodyB=plow,
-            localAnchorA=(0, ROBOT_LENGTH * 0.6),
-            localAnchorB=(0, -PLOW_LENGTH * 0.3),
+            localAnchorA=(0, PLOW_ANCHOR_Y),
+            localAnchorB=(0, PLOW_HINGE_Y),
             enableMotor=True,
             enableLimit=True,
-            lowerAngle=-0.5,
-            upperAngle=0.5,
+            lowerAngle=-PLOW_MAX_ANGLE,
+            upperAngle=PLOW_MAX_ANGLE,
             maxMotorTorque=30.0,
             motorSpeed=0.0,
         )
@@ -193,195 +224,176 @@ class RobotSumoEnv(gym.Env):
         return body, wheels, plow, plow_joint
 
     def reset(self, seed=None, options=None):
-        if seed is not None:
-            np.random.seed(seed)
+        super().reset(seed=seed)
+        rng = self.np_random
 
-        # Destroy old world
         self.world = b2World(gravity=(0, 0), doSleep=True)
-        contact_listener = ContactDetector(self)
-        self.world.contactListener = contact_listener
-
-        self.ring_bodies = []
         self.player_wheels = []
         self.opponent_wheels = []
         self.step_count = 0
 
-        # Create ring boundary (static edges forming a circle)
-        ring_body = self.world.CreateStaticBody(position=(0, 0))
-        for i in range(RING_SEGMENTS):
-            a1 = 2 * math.pi * i / RING_SEGMENTS
-            a2 = 2 * math.pi * (i + 1) / RING_SEGMENTS
-            x1 = RING_RADIUS * math.cos(a1)
-            y1 = RING_RADIUS * math.sin(a1)
-            x2 = RING_RADIUS * math.cos(a2)
-            y2 = RING_RADIUS * math.sin(a2)
-            ring_body.CreateEdgeFixture(
-                vertices=[(x1, y1), (x2, y2)],
-                density=0,
-                friction=0.3,
-            )
-        self.ring_bodies.append(ring_body)
+        # Ring is visual only (no walls): leaving it is checked in step().
+
+        # Randomized start: robots on opposite sides of the centre, roughly facing it
+        bearing = rng.uniform(-math.pi, math.pi)
+        poses = []
+        for b in (bearing, bearing + math.pi + rng.uniform(-START_ANGLE_JITTER, START_ANGLE_JITTER)):
+            r = START_RADIUS + rng.uniform(-START_RADIUS_JITTER, START_RADIUS_JITTER)
+            x, y = r * math.cos(b), r * math.sin(b)
+            heading = heading_to_angle(-x, -y) + rng.uniform(-START_HEADING_JITTER, START_HEADING_JITTER)
+            poses.append(((x, y), heading))
 
         # Create player robot
-        player_start = (0, -2.5)
         self.player_body, self.player_wheels, self.player_plow, self.player_plow_joint = (
-            self._create_robot(player_start, math.pi / 2, is_player=True)
+            self._create_robot(*poses[0])
         )
 
         # Create opponent robot
-        opponent_start = (0, 2.5)
         self.opponent_body, self.opponent_wheels, self.opponent_plow, self.opponent_plow_joint = (
-            self._create_robot(opponent_start, -math.pi / 2, is_player=False)
+            self._create_robot(*poses[1])
         )
+        self.opponent_power = float(rng.uniform(*OPPONENT_POWER_RANGE))
+
+        player_dist, opponent_dist = self._center_dists()
+        self._potential = self._compute_potential(player_dist, opponent_dist)
 
         obs = self._get_obs()
-        return obs, {}
+        return obs, {"player_dist": player_dist, "opponent_dist": opponent_dist, "step": 0}
+
+    def _center_dists(self):
+        p = self.player_body.position
+        o = self.opponent_body.position
+        return math.sqrt(p.x ** 2 + p.y ** 2), math.sqrt(o.x ** 2 + o.y ** 2)
+
+    def _compute_potential(self, player_dist, opponent_dist):
+        """Shaping potential: opponent near the edge, player near the centre, robots close together."""
+        p = self.player_body.position
+        o = self.opponent_body.position
+        separation = min(math.sqrt((p.x - o.x) ** 2 + (p.y - o.y) ** 2), SEPARATION_CAP)
+        return SHAPING_EDGE * (opponent_dist - player_dist) - SHAPING_APPROACH * separation
 
     def _get_obs(self):
         p = self.player_body
         o = self.opponent_body
 
-        player_dist = math.sqrt(p.position.x ** 2 + p.position.y ** 2)
-        opponent_dist = math.sqrt(o.position.x ** 2 + o.position.y ** 2)
+        player_dist, opponent_dist = self._center_dists()
 
         plow_angle_player = self.player_plow_joint.angle if self.player_plow_joint else 0.0
         plow_angle_opponent = self.opponent_plow_joint.angle if self.opponent_plow_joint else 0.0
 
+        # Opponent in the player's frame: forward = local +y, left = local -x
+        fx, fy = heading_vector(p.angle)
+        dx = o.position.x - p.position.x
+        dy = o.position.y - p.position.y
+        rel_forward = dx * fx + dy * fy
+        rel_left = -dx * fy + dy * fx
+
         obs = np.array([
-            p.position.x, p.position.y, p.angle,
+            p.position.x, p.position.y, math.sin(p.angle), math.cos(p.angle),
             p.linearVelocity.x, p.linearVelocity.y, p.angularVelocity,
-            o.position.x, o.position.y, o.angle,
+            o.position.x, o.position.y, math.sin(o.angle), math.cos(o.angle),
             o.linearVelocity.x, o.linearVelocity.y, o.angularVelocity,
             plow_angle_player, plow_angle_opponent,
             player_dist, opponent_dist,
+            rel_forward, rel_left,
         ], dtype=np.float32)
         return obs
 
-    def _apply_robot_actions(self, body, wheels, plow_joint, actions):
-        """Apply wheel torques and plow motor speed."""
-        left_torque = float(actions[0]) * 50.0
-        right_torque = float(actions[1]) * 50.0
-        plow_speed = float(actions[2]) * 5.0
+    def _apply_robot_actions(self, body, plow_joint, actions, power=1.0):
+        """Apply drive force along the heading, turning torque, sideways grip and plow servo."""
+        drive = float(actions[0]) * DRIVE_FORCE * power
+        turn = float(actions[1]) * TURN_TORQUE * power
+        plow_target = float(actions[2]) * PLOW_MAX_ANGLE
 
-        # Apply wheel motor speeds
-        if len(wheels) >= 2:
-            wheels[0][1].motorSpeed = left_torque
-            wheels[1][1].motorSpeed = right_torque
+        # Drive along the robot's forward (plow) axis
+        fx, fy = heading_vector(body.angle)
+        body.ApplyForceToCenter((drive * fx, drive * fy), True)
 
-        # Apply force in forward direction based on wheel torques
-        angle = body.angle
-        forward_force = (left_torque + right_torque) * 0.5
-        fx = forward_force * math.cos(angle)
-        fy = forward_force * math.sin(angle)
-        body.ApplyForceToCenter((float(fx), float(fy)), True)
+        # Turning torque (+ = counter-clockwise = left)
+        body.ApplyTorque(turn, True)
 
-        # Apply turning torque
-        turn_torque = (right_torque - left_torque) * 0.3
-        body.ApplyTorque(float(turn_torque), True)
+        # Wheels resist sideways sliding: remove part of the lateral velocity
+        rx, ry = fy, -fx  # robot's right (local +x)
+        v = body.linearVelocity
+        v_lat = v.x * rx + v.y * ry
+        impulse = -LATERAL_GRIP * body.mass * v_lat
+        body.ApplyLinearImpulse((impulse * rx, impulse * ry), body.worldCenter, True)
 
-        # Plow motor
+        # Plow servo toward the target yaw
         if plow_joint:
-            plow_joint.motorSpeed = plow_speed
+            plow_joint.motorSpeed = PLOW_GAIN * (plow_target - plow_joint.angle)
 
     def _opponent_ai(self):
-        """Simple AI for opponent: move toward player and try to push."""
+        """Simple AI for opponent: turn its plow toward the player and push."""
         p = self.player_body
         o = self.opponent_body
 
         # Direction to player
         dx = p.position.x - o.position.x
         dy = p.position.y - o.position.y
-        dist = math.sqrt(dx * dx + dy * dy) + 1e-6
-        target_angle = math.atan2(dy, dx)
+        target_angle = heading_to_angle(dx, dy)
 
-        # Angle difference
-        angle_diff = target_angle - o.angle
-        while angle_diff > math.pi:
-            angle_diff -= 2 * math.pi
-        while angle_diff < -math.pi:
-            angle_diff += 2 * math.pi
+        # Heading error (opponent's forward is its local +y)
+        angle_diff = wrap_angle(target_angle - o.angle)
 
         # Simple proportional control
         turn = np.clip(angle_diff * 2.0, -1.0, 1.0)
-        forward = np.clip(1.0 - abs(angle_diff) / math.pi, 0.3, 1.0)
+        forward = np.clip(1.0 - abs(angle_diff) / (math.pi / 2), 0.2, 1.0)
 
-        left_action = forward - turn * 0.5
-        right_action = forward + turn * 0.5
-        plow_action = 0.3 if dist < 2.0 else -0.3
-
-        return np.array([
-            np.clip(left_action, -1, 1),
-            np.clip(right_action, -1, 1),
-            np.clip(plow_action, -1, 1),
-        ], dtype=np.float32)
+        return np.array([forward, turn, 0.0], dtype=np.float32)
 
     def step(self, action):
-        action = np.clip(action, -1.0, 1.0)
+        if self.world is None:
+            raise RuntimeError("RobotSumoEnv.step() called before reset()")
+        action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
         self.step_count += 1
 
         # Apply player actions
-        self._apply_robot_actions(
-            self.player_body, self.player_wheels, self.player_plow_joint, action
-        )
+        self._apply_robot_actions(self.player_body, self.player_plow_joint, action)
 
         # Apply opponent AI actions
         opp_actions = self._opponent_ai()
         self._apply_robot_actions(
-            self.opponent_body, self.opponent_wheels, self.opponent_plow_joint, opp_actions
+            self.opponent_body, self.opponent_plow_joint, opp_actions, self.opponent_power
         )
 
         # Step physics
         self.world.Step(1.0 / 50.0, 8, 3)
         self.world.ClearForces()
 
-        # Calculate distances from center
-        player_dist = math.sqrt(
-            self.player_body.position.x ** 2 + self.player_body.position.y ** 2
-        )
-        opponent_dist = math.sqrt(
-            self.opponent_body.position.x ** 2 + self.opponent_body.position.y ** 2
-        )
+        player_dist, opponent_dist = self._center_dists()
 
-        # Rewards
-        reward = 0.0
+        # Potential-based shaping (telescopes over an episode, so it cannot be farmed by idling)
+        potential = self._compute_potential(player_dist, opponent_dist)
+        reward = potential - self._potential
+        self._potential = potential
+
         terminated = False
         truncated = False
+        winner = None
 
-        # Dense reward: encourage pushing opponent away from center
-        reward += (opponent_dist - player_dist) * 0.1
-
-        # Reward for being close to center
-        reward -= player_dist * 0.02
-
-        # Reward for pushing opponent toward edge
-        reward += opponent_dist * 0.03
-
-        # Check termination conditions
+        # Ring-out: a robot whose centre leaves the ring loses
         if player_dist > RING_RADIUS:
-            # Player pushed out - failure
-            reward -= 50.0
+            reward += REWARD_LOSS
             terminated = True
+            winner = "opponent"
         elif opponent_dist > RING_RADIUS:
-            # Opponent pushed out - success
-            reward += 100.0
+            reward += REWARD_WIN
             terminated = True
-
-        if self.step_count >= self.max_steps:
+            winner = "player"
+        elif self.step_count >= self.max_steps:
             truncated = True
-            # Partial reward based on positions
-            if opponent_dist > player_dist:
-                reward += 10.0
-            else:
-                reward -= 10.0
 
         obs = self._get_obs()
         info = {
             "player_dist": player_dist,
             "opponent_dist": opponent_dist,
             "step": self.step_count,
+            "winner": winner,
+            "is_success": winner == "player",
         }
 
-        return obs, reward, terminated, truncated, info
+        return obs, float(reward), terminated, truncated, info
 
     def _world_to_screen(self, x, y):
         """Convert world coordinates to screen coordinates."""
@@ -478,9 +490,10 @@ class RobotSumoEnv(gym.Env):
             wheel_r = int(WHEEL_RADIUS * scale)
             pygame.draw.circle(self.screen, COLOR_WHEEL, screen_pos, wheel_r)
 
-        # Draw direction indicator
-        front_x = cx + ROBOT_LENGTH * 0.3 * math.cos(angle)
-        front_y = cy + ROBOT_LENGTH * 0.3 * math.sin(angle)
+        # Draw direction indicator (forward = local +y, plow side)
+        hx, hy = heading_vector(angle)
+        front_x = cx + ROBOT_LENGTH * 0.3 * hx
+        front_y = cy + ROBOT_LENGTH * 0.3 * hy
         pygame.draw.circle(self.screen, (255, 255, 0),
                            self._world_to_screen(front_x, front_y), 3)
 
