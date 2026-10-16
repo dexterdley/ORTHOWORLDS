@@ -244,27 +244,50 @@ def voxel_iou(vox_a, vox_b):
     a, b = vox_a[0] > 0.5, vox_b[0] > 0.5
     return ((a & b).sum() / (a | b).sum().clamp(min=1)).item()
 
-class VoxelEncoder(nn.Module):
+class VoxelHead(nn.Module):
     """
-    (B, 4, N, N, N) voxel indexed [x, y, z] -> (B, lat_ch, 1, N/8, N/8): one extra Wan latent frame.
-    The z axis is folded into channels (BEV-style); spatial layout (y, x) matches the top-view latent.
+    Predicts the t+1 voxel occupancy from the model's predicted clean ortho latents.
+    Each view's features are lifted along its missing axis (tri-plane, like the visual hull) with the
+    same axis convention as build_voxel_batch, then refined by 3D convs.
+    in:  (B, lat_ch, 3, h, w) predicted x0 latents for (top, side, rear)
+    out: (B, 1, 8h, 8h, 8h) occupancy logits indexed [x, y, z] (h=12 -> 96^3, same as the GT voxel)
     """
-    def __init__(self, in_ch=4, lat_ch=16, hidden=32, N=96):
+    def __init__(self, lat_ch=16, hidden=64):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv3d(in_ch, hidden, kernel_size=4, stride=4), nn.SiLU(),    # N   -> N/4
-            nn.Conv3d(hidden, hidden, kernel_size=2, stride=2), nn.SiLU(),   # N/4 -> N/8 (= VAE latent size)
-        )
-        self.out = nn.Conv2d(hidden * (N // 8), lat_ch, kernel_size=1)
-        # Zero-init: starts as an all-zero frame, so the pretrained model is unaffected at step 0
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
+        self.proj = nn.ModuleList([nn.Conv2d(lat_ch, hidden, kernel_size=3, padding=1) for _ in range(3)])
 
-    def forward(self, voxel):
-        h = self.net(voxel)                                    # (B, C, X, Y, Z)
-        b, c, x, y, z = h.shape
-        h = h.permute(0, 1, 4, 3, 2).reshape(b, c * z, y, x)   # fold z into channels -> (B, C*Z, Y, X)
-        return self.out(h).unsqueeze(2)                        # (B, lat_ch, 1, Y, X)
+        def up(c_in, c_out):
+            # x2 trilinear upsample + conv; channels halve as resolution grows to keep 96^3 memory manageable
+            return [nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False),
+                    nn.Conv3d(c_in, c_out, kernel_size=3, padding=1), nn.SiLU()]
+
+        self.net = nn.Sequential(
+            nn.Conv3d(hidden, hidden, kernel_size=3, padding=1), nn.SiLU(),   # h
+            *up(hidden, hidden // 2),                                         # 2h  (24)
+            *up(hidden // 2, hidden // 4),                                    # 4h  (48)
+            *up(hidden // 4, hidden // 8),                                    # 8h  (96)
+            nn.Conv3d(hidden // 8, 1, kernel_size=1),
+        )
+
+    def forward(self, ortho_latents):
+        top, side, rear = [proj(ortho_latents[:, :, i].float()) for i, proj in enumerate(self.proj)]  # (B, C, h, w)
+        T = top.transpose(2, 3)                 # T[x, y]
+        S = side.flip(2).transpose(2, 3)        # S[x, z]
+        R = rear.flip(2).transpose(2, 3)        # R[y, z]
+        vol = T[:, :, :, :, None] + S[:, :, :, None, :] + R[:, :, None, :, :]   # (B, C, x, y, z)
+        return self.net(F.silu(vol))
+
+def voxel_occupancy_loss(logits, gt_voxel):
+    """
+    Per-sample BCE + soft dice between predicted occupancy logits (B, 1, N, N, N) and the occupancy
+    channel of the GT voxel (B, 4, N, N, N), at the same resolution. Dice handles the empty-space imbalance.
+    """
+    target = gt_voxel[:, :1].float()
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none").mean(dim=(1, 2, 3, 4))
+    p = torch.sigmoid(logits)
+    inter = (p * target).sum(dim=(1, 2, 3, 4))
+    dice = 1.0 - (2.0 * inter + 1.0) / (p.sum(dim=(1, 2, 3, 4)) + target.sum(dim=(1, 2, 3, 4)) + 1.0)
+    return bce + dice
 
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
@@ -274,17 +297,18 @@ def train_voxel_ortho_flow_step(
     latents_t,
     latents_next,
     prompt_embeds,
-    voxel_enc,
-    voxel,
+    voxel_head,
+    voxel_next,
     shift=3.0,
     ctx_noise_max=0.15,
-    vox_drop_prob=0.1,
+    vox_weight=0.5,
 ):
     """
     Single transition Flow-Matching step (used inside multi-step trajectory rollout).
     Applies mild context noise to `latents_t` to prevent autoregressive drift,
     and optionally returns the model's reconstructed clean latent `pred_x0` at t+1.
-    `voxel` (B, 4, N, N, N) is encoded by the trainable `voxel_enc` into one extra conditioning frame.
+    Auxiliary voxel loss: `voxel_head` predicts voxel(t+1) from the model's clean estimate of the
+    t+1 ortho latents, supervised by the GT voxel `voxel_next` (B, 4, N, N, N) built from the GT views.
     """
     b, c, num_views, h, w = latents_next.shape
 
@@ -307,13 +331,8 @@ def train_voxel_ortho_flow_step(
     noisy_latents_next_fp32 = (1.0 - tau_exp) * latents_next_fp32 + tau_exp * noise
     noisy_latents_next = noisy_latents_next_fp32.to(dtype=transformer.dtype)
 
-    # 4. Voxel conditioning frame (trainable encoder, with grad).
-    vox_latent = voxel_enc(voxel)
-    keep = (torch.rand((b, 1, 1, 1, 1), device=vox_latent.device) >= vox_drop_prob).to(vox_latent.dtype)
-    vox_latent = (keep * vox_latent).to(dtype=transformer.dtype)
-
-    # Concatenate conditioning views (frames 0:4), noisy target views (frames 4:8), voxel frame (frame 8)
-    combined_latents = torch.cat([cond_latents_t, noisy_latents_next, vox_latent], dim=2)
+    # 4. Concatenate conditioning views (frames 0:4), noisy target views (frames 4:8)
+    combined_latents = torch.cat([cond_latents_t, noisy_latents_next], dim=2)
 
     # 5. Ground truth velocity: v_target = noise - x_0
     target_velocity = noise - latents_next_fp32
@@ -326,7 +345,7 @@ def train_voxel_ortho_flow_step(
         encoder_hidden_states=prompt_embeds,
     ).sample
 
-    # 7. Supervise target views at t+1 (indices num_views:2*num_views; voxel frame is not supervised)
+    # 7. Supervise target views at t+1 (indices num_views:2*num_views)
     pred_velocity = model_pred[:, :, num_views : 2 * num_views].float()
 
     per_view_losses = [
@@ -335,26 +354,34 @@ def train_voxel_ortho_flow_step(
     ]
     loss = sum(per_view_losses) / float(num_views)
 
+    # 8. Voxel supervision: predict voxel(t+1) from the model's clean estimate of the ortho views.
+    #    pred_x0 keeps its graph, so the voxel loss also trains the DiT (not just the head).
+    pred_x0_grad = noisy_latents_next_fp32 - tau_exp * pred_velocity
+    vox_logits = voxel_head(pred_x0_grad[:, :, :3])                       # top, side, rear
+    vox_w = 1.0 - tau                                                      # x0 estimate is unreliable at high noise
+    vox_loss = (vox_w * voxel_occupancy_loss(vox_logits, voxel_next)).mean()
+
+    loss = loss + vox_weight * vox_loss
+
     # Reconstruct 1-step denoised prediction: x_0_hat = x_tau - tau * v_pred
     with torch.no_grad():
         pred_x0 = (noisy_latents_next_fp32 - tau_exp * pred_velocity.detach()).clamp(-6.0, 6.0)
         # Weight confidence by (1 - tau) so highly noisy steps blend smoothly with GT
         confidence = (1.0 - tau_exp).clamp(0.2, 1.0)
         rollout_latent = (confidence * pred_x0 + (1.0 - confidence) * latents_next_fp32).to(dtype=transformer.dtype)
-    return loss, [l.item() for l in per_view_losses], rollout_latent
+    return loss, [l.item() for l in per_view_losses], rollout_latent, vox_loss.item()
 
 def train_ortho_trajectory_step(
     transformer,
-    vae,
-    voxel_enc,
+    voxel_head,
     latents_t0,
-    views_t0,
     latents_next_seq,
     views_next_seq,
     prompt_embeds_seq,
     shift=3.0,
     teacher_forcing_prob=0.5,
     ctx_noise_max=0.15,
+    vox_weight=0.1,
 ):
     """
     Unrolls a multi-step trajectory of length `seq_len` during training.
@@ -362,16 +389,15 @@ def train_ortho_trajectory_step(
     - At step s>0, with probability `teacher_forcing_prob`, conditions on the model's own predicted
       latent from step s-1 (student forcing) so the model learns to recover from its
       own rollout errors over multi-step horizons.
-    - The voxel for each step is built lazily from that step's context views: GT views, or the
-      model's own decoded predictions for student-forced samples (matching inference).
+    - Each step's auxiliary voxel target is the GT voxel built from that step's target views (t+1).
     - Backpropagates `(loss_s / seq_len)` at each step so peak VRAM remains constant.
     """
     seq_len = len(latents_next_seq)
     num_views = latents_t0.shape[2]
 
     curr_latents = latents_t0
-    curr_views = views_t0
     total_loss = 0.0
+    avg_vox_loss = 0.0
     avg_per_view = [0.0] * num_views
 
     for s in range(seq_len):
@@ -379,19 +405,19 @@ def train_ortho_trajectory_step(
         prompt_embeds = prompt_embeds_seq[s]
         is_last_step = (s == seq_len - 1)
 
-        # Lazily build the voxel from the current context views
-        with torch.no_grad():
-            voxel = build_voxel_batch(curr_views)
+        # GT voxel of this step's target frame (t+1), built lazily
+        voxel_next = build_voxel_batch(views_next_seq[s])
 
-        step_loss, step_view_losses, pred_next_latents = train_voxel_ortho_flow_step(
+        step_loss, step_view_losses, pred_next_latents, step_vox_loss = train_voxel_ortho_flow_step(
             transformer=transformer,
             latents_t=curr_latents,
             latents_next=target_latents,
             prompt_embeds=prompt_embeds,
-            voxel_enc=voxel_enc,
-            voxel=voxel,
+            voxel_head=voxel_head,
+            voxel_next=voxel_next,
             shift=shift,
             ctx_noise_max=ctx_noise_max,
+            vox_weight=vox_weight,
         )
 
         # Normalize loss across trajectory length and backpropagate immediately to save VRAM
@@ -399,45 +425,35 @@ def train_ortho_trajectory_step(
         scaled_loss.backward()
 
         total_loss += step_loss.item() / float(seq_len)
+        avg_vox_loss += step_vox_loss / float(seq_len)
         for v_idx in range(num_views):
             avg_per_view[v_idx] += step_view_losses[v_idx] / float(seq_len)
 
         # Prepare context for step s + 1 (Student Forcing vs. Teacher Forcing per sample)
         if not is_last_step:
-            curr_views = views_next_seq[s]
             if teacher_forcing_prob > 0.0:
                 b = curr_latents.shape[0]
                 use_ar_mask = (torch.rand((b, 1, 1, 1, 1), device=curr_latents.device) < teacher_forcing_prob).to(dtype=transformer.dtype)
                 curr_latents = use_ar_mask * pred_next_latents + (1.0 - use_ar_mask) * target_latents
-
-                # Student-forced samples build their next voxel from their OWN predicted ortho views
-                ar = use_ar_mask.view(-1).bool()
-                if ar.any():
-                    with torch.no_grad():
-                        pred_views = decode_latents_to_views(vae, pred_next_latents[ar][:, :, :3]) * 2.0 - 1.0
-                    curr_views = curr_views.clone()
-                    curr_views[ar, :3] = pred_views.to(curr_views.dtype)
             else:
                 curr_latents = target_latents
 
-    return total_loss, avg_per_view
+    return total_loss, avg_per_view, avg_vox_loss
 
 # ==========================================
 # AUTOREGRESSIVE VIDEO ROLLOUT & SAMPLING
 # ==========================================
 @torch.no_grad()
-def predict_next_view_latents(transformer, latents_t, prompt_embeds, vox_latent, steps=20, shift=3.0):
+def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, shift=3.0):
     """
     Simultaneously denoises all 4 orthographic views at t+1 via reverse Euler Flow Matching.
     Input:
-      latents_t:  (B, C, 4, h, w) - clean past views at time t
-      vox_latent: (B, C, 1, h, w) - encoded voxel frame built from the views at time t
+      latents_t: (B, C, 4, h, w) - clean past views at time t
     Output:
       latents_next: (B, C, 4, h, w) - predicted views at time t+1
     """
     b, c, num_views, h, w = latents_t.shape
     latents_t = latents_t.to(dtype=transformer.dtype)
-    vox_latent = vox_latent.to(dtype=transformer.dtype)
 
     # Keep Euler state in float32 to prevent bfloat16 rounding stagnation
     x_tau = torch.randn((b, c, num_views, h, w), device=latents_t.device, dtype=torch.float32)
@@ -452,7 +468,7 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, vox_latent,
         dt = sigma_curr - sigma_next
 
         t_tensor = torch.full((b,), sigma_curr * 1000.0, device=latents_t.device, dtype=transformer.dtype)
-        combined = torch.cat([latents_t, x_tau.to(dtype=transformer.dtype), vox_latent], dim=2)  # (B, C, 9, h, w)
+        combined = torch.cat([latents_t, x_tau.to(dtype=transformer.dtype)], dim=2)  # (B, C, 8, h, w)
 
         pred_velocity = transformer(
             hidden_states=combined,
@@ -465,15 +481,16 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, vox_latent,
     return x_tau.to(dtype=transformer.dtype)
 
 @torch.no_grad()
-def autoregressive_rollout(transformer, vae, voxel_enc, text_encoder, tokenizer, buffer, env_name=None, env=None, rollout_steps=16, steps=20):
+def autoregressive_rollout(transformer, vae, voxel_head, text_encoder, tokenizer, buffer, env_name=None, env=None, rollout_steps=16, steps=20):
     """
     Autoregressive video rollout for all 4 orthographic views.
-    The voxel at each step is built from the model's OWN generated views (GT only at step 0).
     Returns:
       gen_views: (vid_top, vid_rear, vid_side, vid_fpv) each (1, T, 3, H, W) in [0, 1]
       gt_views:  (gt_top,  gt_rear,  gt_side,  gt_fpv)  each (1, T, 3, H, W) in [0, 1]
       vid_gen_vox, vid_gt_vox: (1, T, 3, S, S) renders of voxels built from generated / GT views at t+1
-      vox_iou: mean occupancy IoU between generated and GT voxels over the rollout
+      vid_pred_vox: (1, T, 3, S, S) renders of the voxel predicted by `voxel_head` at t+1
+      vox_iou: mean occupancy IoU between generated-view and GT voxels over the rollout
+      pred_vox_iou: mean occupancy IoU between the head's predicted voxel and the GT voxel
     """
     transformer.eval()
 
@@ -498,8 +515,7 @@ def autoregressive_rollout(transformer, vae, voxel_enc, text_encoder, tokenizer,
     # Frame storage (0: Top, 1: Side, 2: Rear, 3: FPV)
     gen_top, gen_side, gen_rear, gen_fpv = [], [], [], []
     gt_top,  gt_side,  gt_rear,  gt_fpv  = [], [], [], []
-    gen_vox, gt_vox, vox_ious = [], [], []
-    voxel = None  # voxel of the current context views; built from GT at step 0, then from generated views
+    gen_vox, gt_vox, pred_vox, vox_ious, pred_vox_ious = [], [], [], [], []
 
     print(f"Starting {rollout_steps}-step Autoregressive Rollout for [{env_name or 'Default'}]...")
 
@@ -543,16 +559,10 @@ def autoregressive_rollout(transformer, vae, voxel_enc, text_encoder, tokenizer,
         
         prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
 
-        # Voxel of the current views (GT at step 0, generated views afterwards, cached from the previous step)
-        if voxel is None:
-            voxel = build_voxel_batch(curr_views)
-        vox_latent = voxel_enc(voxel)
-
         next_latents = predict_next_view_latents(
             transformer=transformer,
             latents_t=curr_latents,
             prompt_embeds=prompt_embeds,
-            vox_latent=vox_latent,
             steps=steps,
         )
 
@@ -590,14 +600,18 @@ def autoregressive_rollout(transformer, vae, voxel_enc, text_encoder, tokenizer,
         # Re-encode decoded RGB frame back through VAE to stay on the clean VAE manifold
         next_views_norm = decoded_views * 2.0 - 1.0
         curr_latents = encode_views_to_latents(vae, next_views_norm, out_dtype=transformer.dtype)
-        curr_views = next_views_norm
 
-        # Voxel from the GENERATED top/side/rear at t+1 (logged, and reused as next step's conditioning)
+        # Voxels at t+1: built from the GENERATED views, built from the GT views, and predicted by the head
         voxel = build_voxel_batch(next_views_norm)
         voxel_gt = build_voxel_batch((gt_vn * 2.0 - 1.0).unsqueeze(0).to(device))
         gen_vox.append(torch.from_numpy(render_voxel_image(voxel[0])))
         gt_vox.append(torch.from_numpy(render_voxel_image(voxel_gt[0])))
         vox_ious.append(voxel_iou(voxel[0], voxel_gt[0]))
+
+        pred_occ = (torch.sigmoid(voxel_head(next_latents[:, :, :3].float())) > 0.5).float()  # (1, 1, N, N, N)
+        voxel_pred = torch.cat([pred_occ, 0.6 * pred_occ.expand(-1, 3, -1, -1, -1)], dim=1)  # grey occupancy
+        pred_vox.append(torch.from_numpy(render_voxel_image(voxel_pred[0])))
+        pred_vox_ious.append(voxel_iou(voxel_pred[0], voxel_gt[0]))
 
     vid_gen_top  = torch.stack(gen_top,  dim=0).unsqueeze(0)
     vid_gen_side = torch.stack(gen_side, dim=0).unsqueeze(0)
@@ -611,17 +625,19 @@ def autoregressive_rollout(transformer, vae, voxel_enc, text_encoder, tokenizer,
 
     vid_gen_vox  = torch.stack(gen_vox,  dim=0).unsqueeze(0)
     vid_gt_vox   = torch.stack(gt_vox,   dim=0).unsqueeze(0)
+    vid_pred_vox = torch.stack(pred_vox, dim=0).unsqueeze(0)
     vox_iou      = float(np.mean(vox_ious)) if vox_ious else 0.0
+    pred_vox_iou = float(np.mean(pred_vox_ious)) if pred_vox_ious else 0.0
 
     transformer.train()
     env.close()
     return (vid_gen_top, vid_gen_rear, vid_gen_side, vid_gen_fpv,
             vid_gt_top,  vid_gt_rear,  vid_gt_side,  vid_gt_fpv,
-            vid_gen_vox, vid_gt_vox,   vox_iou)
+            vid_gen_vox, vid_gt_vox,   vid_pred_vox, vox_iou, pred_vox_iou)
 
 
 @torch.no_grad()
-def evaluate_and_log_videos(transformer, vae, voxel_enc, buffer, text_encoder, tokenizer, writer, epoch, rollout_steps=16, steps=20, fps=15):
+def evaluate_and_log_videos(transformer, vae, voxel_head, buffer, text_encoder, tokenizer, writer, epoch, rollout_steps=16, steps=20, fps=15):
     """
     Performs autoregressive video rollouts for each view and writes the videos to TensorBoard.
     """
@@ -637,10 +653,10 @@ def evaluate_and_log_videos(transformer, vae, voxel_enc, buffer, text_encoder, t
 
         (vid_top_down, vid_rear, vid_side, vid_fpv,
          vid_gt_top_down, vid_gt_rear, vid_gt_side, vid_gt_fpv,
-         vid_gen_vox, vid_gt_vox, vox_iou) = autoregressive_rollout(
+         vid_gen_vox, vid_gt_vox, vid_pred_vox, vox_iou, pred_vox_iou) = autoregressive_rollout(
             transformer=transformer,
             vae=vae,
-            voxel_enc=voxel_enc,
+            voxel_head=voxel_head,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             buffer=buffer,
@@ -668,6 +684,7 @@ def evaluate_and_log_videos(transformer, vae, voxel_enc, buffer, text_encoder, t
         writer.add_scalar(f"Validation/{clean_tag}/PSNR/FPV",      psnr_fpv,      epoch)
         writer.add_scalar(f"Validation/{clean_tag}/PSNR/Mean",     psnr_mean,     epoch)
         writer.add_scalar(f"Validation/{clean_tag}/Voxel_IoU",     vox_iou,       epoch)
+        writer.add_scalar(f"Validation/{clean_tag}/Voxel_Pred_IoU", pred_vox_iou, epoch)
 
         print(f"  [Epoch {epoch}] [{env_name}] Autoregressive Video PSNR: {psnr_mean:.2f} dB "
               f"(Top-Down: {psnr_top_down:.2f}dB, Rear: {psnr_rear:.2f}dB, Side: {psnr_side:.2f}dB, FPV: {psnr_fpv:.2f}dB)")
@@ -680,6 +697,7 @@ def evaluate_and_log_videos(transformer, vae, voxel_enc, buffer, text_encoder, t
         # Voxels built from the generated (vs GT) top/side/rear views at each step
         writer.add_video(f"Test/{clean_tag}/Voxel_Generated", vid_gen_vox, epoch, fps=fps)
         writer.add_video(f"Test/{clean_tag}/Voxel_GT",        vid_gt_vox,  epoch, fps=fps)
+        writer.add_video(f"Test/{clean_tag}/Voxel_Predicted", vid_pred_vox, epoch, fps=fps)
 
     transformer.train()
 
@@ -819,10 +837,10 @@ def main(args):
         model_id=args.model_id, lora_rank=args.lora_rank
     )
 
-    # Trainable voxel encoder: voxel (B,4,96,96,96) -> one extra latent frame (B,16,1,12,12)
-    voxel_enc = VoxelEncoder(in_ch=4, lat_ch=getattr(vae.config, "z_dim", 16), N=96).to(device)
+    # Trainable voxel head: predicted t+1 ortho latents (B,16,3,12,12) -> voxel occupancy logits (B,1,24,24,24)
+    voxel_head = VoxelHead(lat_ch=getattr(vae.config, "z_dim", 16)).to(device)
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad] + list(voxel_enc.parameters())
+    trainable_params = [p for p in model.parameters() if p.requires_grad] + list(voxel_head.parameters())
     optimizer = optim.AdamW(
         trainable_params,
         lr=args.lr,
@@ -888,17 +906,16 @@ def main(args):
             optimizer.zero_grad(set_to_none=True)
 
             # Unroll multi-step trajectory with student forcing & context noise
-            loss, per_view_losses = train_ortho_trajectory_step(
+            loss, per_view_losses, vox_loss = train_ortho_trajectory_step(
                 transformer=model,
-                vae=vae,
-                voxel_enc=voxel_enc,
+                voxel_head=voxel_head,
                 latents_t0=latents_t,
-                views_t0=views_t,
                 latents_next_seq=latents_next_seq,
                 views_next_seq=views_next_seq,
                 prompt_embeds_seq=prompt_embeds_seq,
                 teacher_forcing_prob=curr_teacher_forcing_prob,
                 ctx_noise_max=args.ctx_noise_max,
+                vox_weight=args.vox_weight,
             )
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -911,6 +928,7 @@ def main(args):
             writer.add_scalar("Train/Loss", loss, global_step)
             writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
             writer.add_scalar("Train/Teacher_Student_Prob", curr_teacher_forcing_prob, global_step)
+            writer.add_scalar("Train/Loss_Voxel", vox_loss, global_step)
             for v_idx, v_name in enumerate(view_names):
                 writer.add_scalar(f"Train/Loss_{v_name}", per_view_losses[v_idx], global_step)
 
@@ -919,6 +937,7 @@ def main(args):
                 "Loss": f"{loss:.4f}",
                 "Top": f"{per_view_losses[0]:.3f}",
                 "FPV": f"{per_view_losses[3]:.3f}",
+                "Vox": f"{vox_loss:.3f}",
                 "Envs": env_summary,
             })
 
@@ -930,7 +949,7 @@ def main(args):
             evaluate_and_log_videos(
                 transformer=model,
                 vae=vae,
-                voxel_enc=voxel_enc,
+                voxel_head=voxel_head,
                 buffer=buffer,
                 text_encoder=text_encoder,
                 tokenizer=tokenizer,
@@ -946,14 +965,14 @@ def main(args):
             ckpt_dir = f"./checkpoints/wan_ortho_lora_epoch_{epoch+1}"
             os.makedirs(ckpt_dir, exist_ok=True)
             model.save_pretrained(ckpt_dir)
-            torch.save(voxel_enc.state_dict(), os.path.join(ckpt_dir, "voxel_encoder.pt"))
-            print(f"  [SAVED] LoRA + voxel encoder checkpoint to {ckpt_dir}")
+            torch.save(voxel_head.state_dict(), os.path.join(ckpt_dir, "voxel_head.pt"))
+            print(f"  [SAVED] LoRA + voxel head checkpoint to {ckpt_dir}")
 
     print("\nTraining Complete! Saving final LoRA weights...")
     final_dir = f"./checkpoints/wan_ortho_voxel_cam_{args.num_envs}_lora_final"
     os.makedirs(final_dir, exist_ok=True)
     model.save_pretrained(final_dir)
-    torch.save(voxel_enc.state_dict(), os.path.join(final_dir, "voxel_encoder.pt"))
+    torch.save(voxel_head.state_dict(), os.path.join(final_dir, "voxel_head.pt"))
     writer.close()
 
     for _, env in active_envs:
@@ -972,6 +991,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per gradient step")
     parser.add_argument("--train_seq_len", type=int, default=16, help="Contiguous trajectory steps unrolled per training update")
     parser.add_argument("--teacher_forcing_prob", type=float, default=1.0, help="Max prob of using self-predicted latents onto next trajectory step")
+    parser.add_argument("--vox_weight", type=float, default=0.5, help="Weight of the auxiliary voxel(t+1) prediction loss")
     parser.add_argument("--ctx_noise_max", type=float, default=0.15, help="Max Gaussian noise added to conditioning context latents to prevent drift")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--steps_per_epoch", type=int, default=200, help="Training steps per epoch")
