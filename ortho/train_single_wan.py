@@ -468,15 +468,17 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
 
     pose_hold = 0
 
+    # Render once per env step (each render advances the camera), so views_next[k] == views_t[k+1]
+    # and every transition is one camera increment, matching the validation rollout.
+    # "Center" is a no-op right after reset (yaw = pitch = 0).
+    img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
+
     for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
         if pose_hold <= 0:
           current_pose = random.choice(["Center", "Up", "Down", "Left", "Right"])
           pose_hold = random.randint(8, 16)
         else:
           pose_hold -= 1
-
-        # Render pass returns orthographic views + FPV
-        img_top, im_rear, im_side, im_fpv = env.render(camera_pose=current_pose)
 
         with torch.inference_mode():
           if hasattr(agent, "predict"):
@@ -519,10 +521,11 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
 
         if done:
           obs, _ = env.reset()
-          current_pose = "Center"
           pose_hold = 0
+          img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
         else:
           obs = next_obs
+          img_top, im_rear, im_side, im_fpv = next_top, next_rear, next_side, next_fpv
         state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
     env.close()
 
@@ -732,7 +735,6 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Single Game Views")
-    parser.add_argument("--env", type=str, default="all", help="Environment to train on: 'all' to train across all envs, or a specific name like 'Bipedal Walker'")
     parser.add_argument("--rollout_steps", type=int, default=2048, help="Rollout steps when training on a single environment")
     parser.add_argument("--buffer_capacity", type=int, default=40000, help="Capacity of multi-environment transition buffer")
     parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", help="HuggingFace model ID")

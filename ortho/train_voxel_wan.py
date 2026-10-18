@@ -244,50 +244,88 @@ def voxel_iou(vox_a, vox_b):
     a, b = vox_a[0] > 0.5, vox_b[0] > 0.5
     return ((a & b).sum() / (a | b).sum().clamp(min=1)).item()
 
-class VoxelHead(nn.Module):
+# ==========================================
+# PROJECTION CONSISTENCY
+# ==========================================
+def mask_border(img, thresh=0.1):
+    """img (B, V, 3, H, W) in [0, 1] -> (B, V, H, W) bool. Background = median border colour per image."""
+    border = torch.cat([img[..., 0, :], img[..., -1, :], img[..., :, 0], img[..., :, -1]], dim=-1)
+    bg = border.median(dim=-1).values[..., None, None]
+    return (img - bg).abs().sum(dim=2) > thresh
+
+@torch.no_grad()
+def silhouettes_from_views(views, thresh=0.1):
+    """views (B, 4, 3, H, W) in [-1, 1] ordered (top, side, rear, fpv) -> (B, 3, H, W) float masks (top, side, rear)."""
+    img = (views[:, :3].float() + 1.0) / 2.0
+    return mask_border(img, thresh).float()
+
+class SilhouetteProbe(nn.Module):
     """
-    Predicts the t+1 voxel occupancy from the model's predicted clean ortho latents.
-    Each view's features are lifted along its missing axis (tri-plane, like the visual hull) with the
-    same axis convention as build_voxel_batch, then refined by 3D convs.
-    in:  (B, lat_ch, 3, h, w) predicted x0 latents for (top, side, rear)
-    out: (B, 1, 8h, 8h, 8h) occupancy logits indexed [x, y, z] (h=12 -> 96^3, same as the GT voxel)
+    Latent -> silhouette decoder, pre-trained on GT latents and then FROZEN, so the consistency loss
+    can only be lowered by the DiT (a trainable head could absorb the error instead).
+    in:  (B, lat_ch, V, h, w) latents -> out: (B, V, 8h, 8w) silhouette logits
     """
     def __init__(self, lat_ch=16, hidden=64):
         super().__init__()
-        self.proj = nn.ModuleList([nn.Conv2d(lat_ch, hidden, kernel_size=3, padding=1) for _ in range(3)])
-
-        def up(c_in, c_out):
-            # x2 trilinear upsample + conv; channels halve as resolution grows to keep 96^3 memory manageable
-            return [nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False),
-                    nn.Conv3d(c_in, c_out, kernel_size=3, padding=1), nn.SiLU()]
-
         self.net = nn.Sequential(
-            nn.Conv3d(hidden, hidden, kernel_size=3, padding=1), nn.SiLU(),   # h
-            *up(hidden, hidden // 2),                                         # 2h  (24)
-            *up(hidden // 2, hidden // 4),                                    # 4h  (48)
-            *up(hidden // 4, hidden // 8),                                    # 8h  (96)
-            nn.Conv3d(hidden // 8, 1, kernel_size=1),
+            nn.Conv2d(lat_ch, hidden, kernel_size=3, padding=1), nn.SiLU(),
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1), nn.SiLU(),
+            nn.Conv2d(hidden, 64, kernel_size=1), nn.PixelShuffle(8),   # 64 = 1 x 8 x 8 -> (1, 8h, 8w)
         )
 
-    def forward(self, ortho_latents):
-        top, side, rear = [proj(ortho_latents[:, :, i].float()) for i, proj in enumerate(self.proj)]  # (B, C, h, w)
-        T = top.transpose(2, 3)                 # T[x, y]
-        S = side.flip(2).transpose(2, 3)        # S[x, z]
-        R = rear.flip(2).transpose(2, 3)        # R[y, z]
-        vol = T[:, :, :, :, None] + S[:, :, :, None, :] + R[:, :, None, :, :]   # (B, C, x, y, z)
-        return self.net(F.silu(vol))
+    def forward(self, latents):
+        b, c, v, h, w = latents.shape
+        flat = latents.float().permute(0, 2, 1, 3, 4).reshape(b * v, c, h, w)
+        return self.net(flat).view(b, v, 8 * h, 8 * w)
 
-def voxel_occupancy_loss(logits, gt_voxel):
+def projection_error(masks):
     """
-    Per-sample BCE + soft dice between predicted occupancy logits (B, 1, N, N, N) and the occupancy
-    channel of the GT voxel (B, 4, N, N, N), at the same resolution. Dice handles the empty-space imbalance.
+    Per-sample disagreement of the extents two views share. Same axes as build_voxel_batch:
+    top rows=y cols=x, side rows=z cols=x, rear rows=z cols=y (rows of side/rear share the same z flip).
+    masks: (B, 3, H, W) soft silhouettes (top, side, rear) -> (B,) mean L1 over the 3 shared axes.
     """
-    target = gt_voxel[:, :1].float()
-    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none").mean(dim=(1, 2, 3, 4))
-    p = torch.sigmoid(logits)
-    inter = (p * target).sum(dim=(1, 2, 3, 4))
-    dice = 1.0 - (2.0 * inter + 1.0) / (p.sum(dim=(1, 2, 3, 4)) + target.sum(dim=(1, 2, 3, 4)) + 1.0)
-    return bce + dice
+    top, side, rear = masks.unbind(1)
+    err_x = (top.amax(1) - side.amax(1)).abs().mean(-1)   # x: column extents of top vs side
+    err_y = (top.amax(2) - rear.amax(1)).abs().mean(-1)   # y: row extents of top vs column extents of rear
+    err_z = (side.amax(2) - rear.amax(2)).abs().mean(-1)  # z: row extents of side vs rear
+    return (err_x + err_y + err_z) / 3.0
+
+def projection_consistency_loss(pred_masks, gt_masks):
+    """
+    Hinge on the GT floor: only penalise inconsistency beyond what the GT masks themselves have
+    (renders/masks are never perfectly consistent, e.g. ground planes, so don't fight that).
+    """
+    return F.relu(projection_error(pred_masks) - projection_error(gt_masks))
+
+def pretrain_silhouette_probe(probe, vae, buffer, steps=500, batch_size=32, lr=1e-3, noise_max=0.3, writer=None):
+    """Fits the probe on GT latents (with mild noise so it tolerates imperfect x0 estimates), then freezes it."""
+    opt = optim.AdamW(probe.parameters(), lr=lr)
+    pbar = tqdm(range(steps), desc="Pre-training silhouette probe")
+    for it in pbar:
+        views, *_ = buffer.sample_trajectory_batch(batch_size=batch_size, seq_len=1)
+        with torch.no_grad():
+            lat = encode_views_to_latents(vae, views)[:, :, :3].float()
+            s = torch.rand(lat.shape[0], 1, 1, 1, 1, device=lat.device) * noise_max
+            lat = (1.0 - s) * lat + s * torch.randn_like(lat)
+            target = silhouettes_from_views(views)
+
+        logits = probe(lat)
+        p = torch.sigmoid(logits)
+        bce = F.binary_cross_entropy_with_logits(logits, target)
+        dice = 1.0 - (2.0 * (p * target).sum() + 1.0) / (p.sum() + target.sum() + 1.0)
+        loss = bce + dice
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        iou = (((p > 0.5) & (target > 0.5)).sum() / ((p > 0.5) | (target > 0.5)).sum().clamp(min=1)).item()
+        pbar.set_postfix({"Loss": f"{loss.item():.3f}", "IoU": f"{iou:.3f}"})
+        if writer is not None:
+            writer.add_scalar("Probe/Loss", loss.item(), it)
+            writer.add_scalar("Probe/IoU", iou, it)
+
+    probe.eval().requires_grad_(False)
+    return probe
 
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
@@ -297,18 +335,18 @@ def train_voxel_ortho_flow_step(
     latents_t,
     latents_next,
     prompt_embeds,
-    voxel_head,
-    voxel_next,
+    sil_probe=None,
+    gt_masks_next=None,
     shift=3.0,
     ctx_noise_max=0.15,
-    vox_weight=0.5,
+    cons_weight=0.0,
 ):
     """
     Single transition Flow-Matching step (used inside multi-step trajectory rollout).
     Applies mild context noise to `latents_t` to prevent autoregressive drift,
     and optionally returns the model's reconstructed clean latent `pred_x0` at t+1.
-    Auxiliary voxel loss: `voxel_head` predicts voxel(t+1) from the model's clean estimate of the
-    t+1 ortho latents, supervised by the GT voxel `voxel_next` (B, 4, N, N, N) built from the GT views.
+    Auxiliary projection consistency loss: the frozen `sil_probe` reads top/side/rear silhouettes off the
+    model's clean estimate of the t+1 latents, whose shared-axis extents must agree (GT masks `gt_masks_next` set the floor).
     """
     b, c, num_views, h, w = latents_next.shape
 
@@ -354,14 +392,15 @@ def train_voxel_ortho_flow_step(
     ]
     loss = sum(per_view_losses) / float(num_views)
 
-    # 8. Voxel supervision: predict voxel(t+1) from the model's clean estimate of the ortho views.
-    #    pred_x0 keeps its graph, so the voxel loss also trains the DiT (not just the head).
-    pred_x0_grad = noisy_latents_next_fp32 - tau_exp * pred_velocity
-    vox_logits = voxel_head(pred_x0_grad[:, :, :3])                       # top, side, rear
-    vox_w = 1.0 - tau                                                      # x0 estimate is unreliable at high noise
-    vox_loss = (vox_w * voxel_occupancy_loss(vox_logits, voxel_next)).mean()
-
-    loss = loss + vox_weight * vox_loss
+    # 8. Projection consistency: the frozen probe reads silhouettes off pred_x0 and the shared-axis
+    #    extents of top/side/rear must agree. No trainable params, so only the DiT can reduce it.
+    #    pred_x0 keeps its graph so the loss trains the DiT; (1 - tau) since x0 is unreliable at high noise.
+    cons_loss = torch.zeros((), device=latents_next.device)
+    if cons_weight > 0.0 and sil_probe is not None:
+        pred_x0_grad = noisy_latents_next_fp32 - tau_exp * pred_velocity
+        pred_masks = torch.sigmoid(sil_probe(pred_x0_grad[:, :, :3]))   # top, side, rear
+        cons_loss = ((1.0 - tau) * projection_consistency_loss(pred_masks, gt_masks_next)).mean()
+        loss = loss + cons_weight * cons_loss
 
     # Reconstruct 1-step denoised prediction: x_0_hat = x_tau - tau * v_pred
     with torch.no_grad():
@@ -369,19 +408,19 @@ def train_voxel_ortho_flow_step(
         # Weight confidence by (1 - tau) so highly noisy steps blend smoothly with GT
         confidence = (1.0 - tau_exp).clamp(0.2, 1.0)
         rollout_latent = (confidence * pred_x0 + (1.0 - confidence) * latents_next_fp32).to(dtype=transformer.dtype)
-    return loss, [l.item() for l in per_view_losses], rollout_latent, vox_loss.item()
+    return loss, [l.item() for l in per_view_losses], rollout_latent, cons_loss.item()
 
 def train_ortho_trajectory_step(
     transformer,
-    voxel_head,
     latents_t0,
     latents_next_seq,
     views_next_seq,
     prompt_embeds_seq,
+    sil_probe=None,
     shift=3.0,
     teacher_forcing_prob=0.5,
     ctx_noise_max=0.15,
-    vox_weight=0.1,
+    cons_weight=0.0,
 ):
     """
     Unrolls a multi-step trajectory of length `seq_len` during training.
@@ -389,7 +428,7 @@ def train_ortho_trajectory_step(
     - At step s>0, with probability `teacher_forcing_prob`, conditions on the model's own predicted
       latent from step s-1 (student forcing) so the model learns to recover from its
       own rollout errors over multi-step horizons.
-    - Each step's auxiliary voxel target is the GT voxel built from that step's target views (t+1).
+    - Each step's projection consistency floor comes from the GT masks of that step's target views (t+1).
     - Backpropagates `(loss_s / seq_len)` at each step so peak VRAM remains constant.
     """
     seq_len = len(latents_next_seq)
@@ -397,7 +436,7 @@ def train_ortho_trajectory_step(
 
     curr_latents = latents_t0
     total_loss = 0.0
-    avg_vox_loss = 0.0
+    avg_cons_loss = 0.0
     avg_per_view = [0.0] * num_views
 
     for s in range(seq_len):
@@ -405,19 +444,19 @@ def train_ortho_trajectory_step(
         prompt_embeds = prompt_embeds_seq[s]
         is_last_step = (s == seq_len - 1)
 
-        # GT voxel of this step's target frame (t+1), built lazily
-        voxel_next = build_voxel_batch(views_next_seq[s])
+        # GT silhouettes of this step's target frame (t+1), built lazily
+        gt_masks_next = silhouettes_from_views(views_next_seq[s]) if cons_weight > 0.0 else None
 
-        step_loss, step_view_losses, pred_next_latents, step_vox_loss = train_voxel_ortho_flow_step(
+        step_loss, step_view_losses, pred_next_latents, step_cons_loss = train_voxel_ortho_flow_step(
             transformer=transformer,
             latents_t=curr_latents,
             latents_next=target_latents,
             prompt_embeds=prompt_embeds,
-            voxel_head=voxel_head,
-            voxel_next=voxel_next,
+            sil_probe=sil_probe,
+            gt_masks_next=gt_masks_next,
             shift=shift,
             ctx_noise_max=ctx_noise_max,
-            vox_weight=vox_weight,
+            cons_weight=cons_weight,
         )
 
         # Normalize loss across trajectory length and backpropagate immediately to save VRAM
@@ -425,7 +464,7 @@ def train_ortho_trajectory_step(
         scaled_loss.backward()
 
         total_loss += step_loss.item() / float(seq_len)
-        avg_vox_loss += step_vox_loss / float(seq_len)
+        avg_cons_loss += step_cons_loss / float(seq_len)
         for v_idx in range(num_views):
             avg_per_view[v_idx] += step_view_losses[v_idx] / float(seq_len)
 
@@ -438,7 +477,7 @@ def train_ortho_trajectory_step(
             else:
                 curr_latents = target_latents
 
-    return total_loss, avg_per_view, avg_vox_loss
+    return total_loss, avg_per_view, avg_cons_loss
 
 # ==========================================
 # AUTOREGRESSIVE VIDEO ROLLOUT & SAMPLING
@@ -481,16 +520,15 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
     return x_tau.to(dtype=transformer.dtype)
 
 @torch.no_grad()
-def autoregressive_rollout(transformer, vae, voxel_head, text_encoder, tokenizer, buffer, env_name=None, env=None, rollout_steps=16, steps=20):
+def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, env_name=None, env=None, rollout_steps=16, steps=20):
     """
     Autoregressive video rollout for all 4 orthographic views.
     Returns:
       gen_views: (vid_top, vid_rear, vid_side, vid_fpv) each (1, T, 3, H, W) in [0, 1]
       gt_views:  (gt_top,  gt_rear,  gt_side,  gt_fpv)  each (1, T, 3, H, W) in [0, 1]
       vid_gen_vox, vid_gt_vox: (1, T, 3, S, S) renders of voxels built from generated / GT views at t+1
-      vid_pred_vox: (1, T, 3, S, S) renders of the voxel predicted by `voxel_head` at t+1
       vox_iou: mean occupancy IoU between generated-view and GT voxels over the rollout
-      pred_vox_iou: mean occupancy IoU between the head's predicted voxel and the GT voxel
+      proj_err, proj_err_gt: mean projection error of the generated / GT views over the rollout
     """
     transformer.eval()
 
@@ -515,7 +553,8 @@ def autoregressive_rollout(transformer, vae, voxel_head, text_encoder, tokenizer
     # Frame storage (0: Top, 1: Side, 2: Rear, 3: FPV)
     gen_top, gen_side, gen_rear, gen_fpv = [], [], [], []
     gt_top,  gt_side,  gt_rear,  gt_fpv  = [], [], [], []
-    gen_vox, gt_vox, pred_vox, vox_ious, pred_vox_ious = [], [], [], [], []
+    gen_vox, gt_vox, vox_ious = [], [], []
+    proj_errs, proj_errs_gt = [], []
 
     print(f"Starting {rollout_steps}-step Autoregressive Rollout for [{env_name or 'Default'}]...")
 
@@ -601,17 +640,16 @@ def autoregressive_rollout(transformer, vae, voxel_head, text_encoder, tokenizer
         next_views_norm = decoded_views * 2.0 - 1.0
         curr_latents = encode_views_to_latents(vae, next_views_norm, out_dtype=transformer.dtype)
 
-        # Voxels at t+1: built from the GENERATED views, built from the GT views, and predicted by the head
+        # Voxels at t+1: built from the GENERATED views and from the GT views
         voxel = build_voxel_batch(next_views_norm)
         voxel_gt = build_voxel_batch((gt_vn * 2.0 - 1.0).unsqueeze(0).to(device))
         gen_vox.append(torch.from_numpy(render_voxel_image(voxel[0])))
         gt_vox.append(torch.from_numpy(render_voxel_image(voxel_gt[0])))
         vox_ious.append(voxel_iou(voxel[0], voxel_gt[0]))
 
-        pred_occ = (torch.sigmoid(voxel_head(next_latents[:, :, :3].float())) > 0.5).float()  # (1, 1, N, N, N)
-        voxel_pred = torch.cat([pred_occ, 0.6 * pred_occ.expand(-1, 3, -1, -1, -1)], dim=1)  # grey occupancy
-        pred_vox.append(torch.from_numpy(render_voxel_image(voxel_pred[0])))
-        pred_vox_ious.append(voxel_iou(voxel_pred[0], voxel_gt[0]))
+        # Pixel-space projection error of the generated views (no probe), and the GT floor
+        proj_errs.append(projection_error(silhouettes_from_views(next_views_norm)).item())
+        proj_errs_gt.append(projection_error(silhouettes_from_views((gt_vn * 2.0 - 1.0).unsqueeze(0).to(device))).item())
 
     vid_gen_top  = torch.stack(gen_top,  dim=0).unsqueeze(0)
     vid_gen_side = torch.stack(gen_side, dim=0).unsqueeze(0)
@@ -625,19 +663,19 @@ def autoregressive_rollout(transformer, vae, voxel_head, text_encoder, tokenizer
 
     vid_gen_vox  = torch.stack(gen_vox,  dim=0).unsqueeze(0)
     vid_gt_vox   = torch.stack(gt_vox,   dim=0).unsqueeze(0)
-    vid_pred_vox = torch.stack(pred_vox, dim=0).unsqueeze(0)
     vox_iou      = float(np.mean(vox_ious)) if vox_ious else 0.0
-    pred_vox_iou = float(np.mean(pred_vox_ious)) if pred_vox_ious else 0.0
+    proj_err     = float(np.mean(proj_errs)) if proj_errs else 0.0
+    proj_err_gt  = float(np.mean(proj_errs_gt)) if proj_errs_gt else 0.0
 
     transformer.train()
     env.close()
     return (vid_gen_top, vid_gen_rear, vid_gen_side, vid_gen_fpv,
             vid_gt_top,  vid_gt_rear,  vid_gt_side,  vid_gt_fpv,
-            vid_gen_vox, vid_gt_vox,   vid_pred_vox, vox_iou, pred_vox_iou)
+            vid_gen_vox, vid_gt_vox,   vox_iou,      proj_err,     proj_err_gt)
 
 
 @torch.no_grad()
-def evaluate_and_log_videos(transformer, vae, voxel_head, buffer, text_encoder, tokenizer, writer, epoch, rollout_steps=16, steps=20, fps=15):
+def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, writer, epoch, rollout_steps=16, steps=20, fps=15):
     """
     Performs autoregressive video rollouts for each view and writes the videos to TensorBoard.
     """
@@ -653,10 +691,9 @@ def evaluate_and_log_videos(transformer, vae, voxel_head, buffer, text_encoder, 
 
         (vid_top_down, vid_rear, vid_side, vid_fpv,
          vid_gt_top_down, vid_gt_rear, vid_gt_side, vid_gt_fpv,
-         vid_gen_vox, vid_gt_vox, vid_pred_vox, vox_iou, pred_vox_iou) = autoregressive_rollout(
+         vid_gen_vox, vid_gt_vox, vox_iou, proj_err, proj_err_gt) = autoregressive_rollout(
             transformer=transformer,
             vae=vae,
-            voxel_head=voxel_head,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             buffer=buffer,
@@ -684,7 +721,8 @@ def evaluate_and_log_videos(transformer, vae, voxel_head, buffer, text_encoder, 
         writer.add_scalar(f"Validation/{clean_tag}/PSNR/FPV",      psnr_fpv,      epoch)
         writer.add_scalar(f"Validation/{clean_tag}/PSNR/Mean",     psnr_mean,     epoch)
         writer.add_scalar(f"Validation/{clean_tag}/Voxel_IoU",     vox_iou,       epoch)
-        writer.add_scalar(f"Validation/{clean_tag}/Voxel_Pred_IoU", pred_vox_iou, epoch)
+        writer.add_scalar(f"Validation/{clean_tag}/Proj_Err",    proj_err,      epoch)
+        writer.add_scalar(f"Validation/{clean_tag}/Proj_Err_GT", proj_err_gt,   epoch)
 
         print(f"  [Epoch {epoch}] [{env_name}] Autoregressive Video PSNR: {psnr_mean:.2f} dB "
               f"(Top-Down: {psnr_top_down:.2f}dB, Rear: {psnr_rear:.2f}dB, Side: {psnr_side:.2f}dB, FPV: {psnr_fpv:.2f}dB)")
@@ -697,7 +735,6 @@ def evaluate_and_log_videos(transformer, vae, voxel_head, buffer, text_encoder, 
         # Voxels built from the generated (vs GT) top/side/rear views at each step
         writer.add_video(f"Test/{clean_tag}/Voxel_Generated", vid_gen_vox, epoch, fps=fps)
         writer.add_video(f"Test/{clean_tag}/Voxel_GT",        vid_gt_vox,  epoch, fps=fps)
-        writer.add_video(f"Test/{clean_tag}/Voxel_Predicted", vid_pred_vox, epoch, fps=fps)
 
     transformer.train()
 
@@ -837,10 +874,7 @@ def main(args):
         model_id=args.model_id, lora_rank=args.lora_rank
     )
 
-    # Trainable voxel head: predicted t+1 ortho latents (B,16,3,12,12) -> voxel occupancy logits (B,1,24,24,24)
-    voxel_head = VoxelHead(lat_ch=getattr(vae.config, "z_dim", 16)).to(device)
-
-    trainable_params = [p for p in model.parameters() if p.requires_grad] + list(voxel_head.parameters())
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(
         trainable_params,
         lr=args.lr,
@@ -854,6 +888,12 @@ def main(args):
     log_dir = f"./runs/wan_ortho_multienv_voxel_cam_{args.num_envs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging to: {log_dir}")
+
+    # Frozen silhouette probe for the projection consistency loss (fit on GT latents before LoRA training)
+    sil_probe = None
+    if args.cons_weight > 0.0:
+        sil_probe = SilhouetteProbe(lat_ch=getattr(vae.config, "z_dim", 16)).to(device)
+        pretrain_silhouette_probe(sil_probe, vae, buffer, steps=args.probe_steps, writer=writer)
 
     view_names = ["Top", "Side", "Rear", "3D_FPV"]
 
@@ -906,16 +946,16 @@ def main(args):
             optimizer.zero_grad(set_to_none=True)
 
             # Unroll multi-step trajectory with student forcing & context noise
-            loss, per_view_losses, vox_loss = train_ortho_trajectory_step(
+            loss, per_view_losses, cons_loss = train_ortho_trajectory_step(
                 transformer=model,
-                voxel_head=voxel_head,
+                sil_probe=sil_probe,
                 latents_t0=latents_t,
                 latents_next_seq=latents_next_seq,
                 views_next_seq=views_next_seq,
                 prompt_embeds_seq=prompt_embeds_seq,
                 teacher_forcing_prob=curr_teacher_forcing_prob,
                 ctx_noise_max=args.ctx_noise_max,
-                vox_weight=args.vox_weight,
+                cons_weight=args.cons_weight,
             )
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -928,7 +968,7 @@ def main(args):
             writer.add_scalar("Train/Loss", loss, global_step)
             writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
             writer.add_scalar("Train/Teacher_Student_Prob", curr_teacher_forcing_prob, global_step)
-            writer.add_scalar("Train/Loss_Voxel", vox_loss, global_step)
+            writer.add_scalar("Train/Loss_Proj", cons_loss, global_step)
             for v_idx, v_name in enumerate(view_names):
                 writer.add_scalar(f"Train/Loss_{v_name}", per_view_losses[v_idx], global_step)
 
@@ -937,7 +977,7 @@ def main(args):
                 "Loss": f"{loss:.4f}",
                 "Top": f"{per_view_losses[0]:.3f}",
                 "FPV": f"{per_view_losses[3]:.3f}",
-                "Vox": f"{vox_loss:.3f}",
+                "Proj": f"{cons_loss:.3f}",
                 "Envs": env_summary,
             })
 
@@ -949,7 +989,6 @@ def main(args):
             evaluate_and_log_videos(
                 transformer=model,
                 vae=vae,
-                voxel_head=voxel_head,
                 buffer=buffer,
                 text_encoder=text_encoder,
                 tokenizer=tokenizer,
@@ -965,14 +1004,16 @@ def main(args):
             ckpt_dir = f"./checkpoints/wan_ortho_lora_epoch_{epoch+1}"
             os.makedirs(ckpt_dir, exist_ok=True)
             model.save_pretrained(ckpt_dir)
-            torch.save(voxel_head.state_dict(), os.path.join(ckpt_dir, "voxel_head.pt"))
-            print(f"  [SAVED] LoRA + voxel head checkpoint to {ckpt_dir}")
+            if sil_probe is not None:
+                torch.save(sil_probe.state_dict(), os.path.join(ckpt_dir, "sil_probe.pt"))
+            print(f"  [SAVED] LoRA + silhouette probe checkpoint to {ckpt_dir}")
 
     print("\nTraining Complete! Saving final LoRA weights...")
     final_dir = f"./checkpoints/wan_ortho_voxel_cam_{args.num_envs}_lora_final"
     os.makedirs(final_dir, exist_ok=True)
     model.save_pretrained(final_dir)
-    torch.save(voxel_head.state_dict(), os.path.join(final_dir, "voxel_head.pt"))
+    if sil_probe is not None:
+        torch.save(sil_probe.state_dict(), os.path.join(final_dir, "sil_probe.pt"))
     writer.close()
 
     for _, env in active_envs:
@@ -991,7 +1032,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per gradient step")
     parser.add_argument("--train_seq_len", type=int, default=16, help="Contiguous trajectory steps unrolled per training update")
     parser.add_argument("--teacher_forcing_prob", type=float, default=1.0, help="Max prob of using self-predicted latents onto next trajectory step")
-    parser.add_argument("--vox_weight", type=float, default=0.5, help="Weight of the auxiliary voxel(t+1) prediction loss")
+    parser.add_argument("--cons_weight", type=float, default=1.0, help="Weight of the projection consistency loss (0 disables it and the probe)")
+    parser.add_argument("--probe_steps", type=int, default=500, help="Pre-training steps for the frozen silhouette probe")
     parser.add_argument("--ctx_noise_max", type=float, default=0.15, help="Max Gaussian noise added to conditioning context latents to prevent drift")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--steps_per_epoch", type=int, default=200, help="Training steps per epoch")

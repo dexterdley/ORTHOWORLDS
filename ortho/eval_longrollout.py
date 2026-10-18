@@ -1,638 +1,413 @@
 """
-eval_longrollout.py — Experiment 3.1
-Long-Horizon Rollout Degradation Curve & Multi-View vs. Single-View Comparison
+eval_longrollout.py — FPV-centred long-horizon rollout evaluation.
 
-Evaluates trained world model checkpoints (Multi-View OWM vs. Single-View Baseline)
-by autoregressively rolling out T steps and measuring:
-  - Per-step PSNR degradation curves & AUC-PSNR
-  - Drift onset step (threshold PSNR < 20 dB)
-  - Fréchet Video Distance (FVD)
-  - Cross-Projection Consistency Error (CPCE) across orthographic views
-  - Occlusion Error in occluded / non-overlapping regions
-  - Side-by-side visual rollouts (MP4, GIF, PNG strips)
+The 3D FPV view is the main output of the world model; the orthographic top / side / rear views
+are supporting views. Any number of models are rolled out from the same ground-truth start frames
+with the same logged actions and camera commands, and compared on the FPV view:
+  - Per-step PSNR / SSIM / LPIPS (step 1 = single-step prediction), AUC-PSNR, drift onset (PSNR < 20 dB)
+  - FVD on FPV clips (R3D-18 features, see train_ortho_diffusion.compute_fvd)
+Multi-view models additionally report the consistency of their supporting views:
+  - Projection Error (PE) of the decoded top/side/rear silhouettes, next to the ground-truth PE floor
+  - Hull IoU between the visual hulls carved from generated and ground-truth silhouettes
 
-Saves:
-  - results/exp3_1/metrics.csv        <- per-step numbers for Table / LaTeX
-  - results/exp3_1/degradation.png    <- the paper comparison figure
-  - results/exp3_1/comparison_*.mp4   <- stitched video comparison
+Models are LoRA checkpoint folders, named after the folder:
+  --multi   predicts all 4 views jointly (train_voxel_wan.py / train_ortho_wan.py); FPV is view 3
+  --single  predicts the FPV view only (train_single_wan.py)
 
 Usage:
-  # Compare Multi-View OWM vs. Single-View Baseline:
-  python eval_longrollout.py --ckpt_dir ./checkpoints/wan_ortho_lora_final \\
-                             --single_ckpt_dir ./checkpoints/wan_single_lora_epoch_8 \\
-                             --target_view 3D_FPV \\
-                             --rollout_steps 32 --n_rollouts 50 --eval_steps 20
+  python eval_longrollout.py \\
+      --multi ./checkpoints/runs/ours ./checkpoints/runs/ours_lambda0 \\
+      --single ./checkpoints/runs/fpv_only \\
+      --envs all --rollout_steps 32 --n_rollouts 20
 
-  # Evaluate Multi-View OWM standalone:
-  python eval_longrollout.py --ckpt_dir ./checkpoints/wan_ortho_lora_final \\
-                             --rollout_steps 32 --n_rollouts 50
+Saves to results/eval/<tag>/:
+  per_step.csv        <- env, model, step, metric means (curves)
+  summary.csv         <- one row per (env, model); "Train (mean)" / "Held-out (mean)" aggregate rows
+  summary_main.tex    <- main-results table rows (training environments)
+  summary_per_env.tex <- per-environment table rows
+  <env>_curves.png    <- FPV PSNR and PE versus rollout step
+  <env>_strip.png     <- GT and every model's FPV frames at selected steps
 """
 
 import os
-import math
-import argparse
+import re
 import csv
+import argparse
 from collections import defaultdict
-from typing import Optional, Dict, Tuple, List
+from datetime import datetime
 
-import torch
-import torch.nn.functional as F
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 import cv2
-from PIL import Image
+import torch
+import matplotlib.pyplot as plt
+from skimage.metrics import structural_similarity
+from tqdm import tqdm
 
-from utils import _build_registry, load_base_model, compose_player_prompts, set_seed
+from utils import _build_registry, _build_heldout_registry, load_base_model, load_agent, compose_player_prompts, set_seed
 from buffer import OrthoTransitionBuffer
-from train_ortho_wan import (
+from train_voxel_wan import (
     collect_rollouts,
     encode_views_to_latents,
     decode_latents_to_views,
     predict_next_view_latents,
-    load_agent,
+    silhouettes_from_views,
+    projection_error,
 )
-from train_ortho_diffusion import compute_fvd
+from train_ortho_diffusion import compute_fvd, _get_lpips_fn
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-VIEW_NAMES = ["Top", "Side", "Rear", "3D_FPV"]
-VIEW_NAME_TO_INDEX = {
-    "top": 0, "top_down": 0, "topdown": 0,
-    "side": 1,
-    "rear": 2, "back": 2,
-    "3d_fpv": 3, "fpv": 3, "3d": 3,
-}
-
-def resolve_view_index(view_name_or_idx) -> int:
-    """Resolves view name string or index to 0..3."""
-    if isinstance(view_name_or_idx, int):
-        return max(0, min(3, view_name_or_idx))
-    clean_k = str(view_name_or_idx).lower().replace("-", "_").replace(" ", "_").strip()
-    if clean_k not in VIEW_NAME_TO_INDEX:
-        raise ValueError(f"Unknown view '{view_name_or_idx}'. Choose from {VIEW_NAMES}")
-    return VIEW_NAME_TO_INDEX[clean_k]
+FPV_IDX = 3
+DRIFT_DB = 20.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# METRIC HELPERS
+# METRICS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def psnr(pred: torch.Tensor, gt: torch.Tensor) -> float:
-    """PSNR for tensors in [0,1]."""
-    mse = F.mse_loss(pred.float(), gt.float()).item()
-    if mse <= 0:
-        return 100.0
-    return 20.0 * math.log10(1.0) - 10.0 * math.log10(max(mse, 1e-10))
+def psnr_per_sample(pred, gt):
+    """pred, gt: (B, 3, H, W) in [0, 1] -> (B,) PSNR in dB."""
+    mse = (pred.float() - gt.float()).pow(2).mean(dim=(1, 2, 3)).clamp(min=1e-10)
+    return (-10.0 * torch.log10(mse)).tolist()
 
+def ssim_per_sample(pred, gt):
+    """pred, gt: (B, 3, H, W) in [0, 1] -> (B,) SSIM."""
+    p = pred.permute(0, 2, 3, 1).float().cpu().numpy()
+    g = gt.permute(0, 2, 3, 1).float().cpu().numpy()
+    return [float(structural_similarity(a, b, channel_axis=2, data_range=1.0)) for a, b in zip(p, g)]
 
-def compute_cross_projection_consistency(pred_views: torch.Tensor) -> float:
-    """
-    Cross-Projection Consistency Error (CPCE):
-    Measures 3D geometric agreement across orthographic projections:
-      - Top col (X) vs Side col (X)
-      - Top row (Y) vs Rear col (Y)
-      - Side row (Z) vs Rear row (Z)
+@torch.no_grad()
+def lpips_per_sample(pred, gt):
+    """pred, gt: (B, 3, H, W) in [0, 1] -> (B,) LPIPS (VGG)."""
+    fn = _get_lpips_fn()
+    return fn(pred.float().to(device) * 2.0 - 1.0, gt.float().to(device) * 2.0 - 1.0).flatten().tolist()
 
-    pred_views: (B, 4, 3, H, W) in [0, 1]
-    """
-    top  = pred_views[:, 0]  # (B, 3, H, W)
-    side = pred_views[:, 1]
-    rear = pred_views[:, 2]
+def pe_per_sample(views):
+    """views: (B, 4, 3, H, W) in [0, 1] -> (B,) projection error of the top/side/rear silhouettes."""
+    return projection_error(silhouettes_from_views(views.float() * 2.0 - 1.0)).tolist()
 
-    # Shared X axis: Top col profile vs Side col profile
-    top_x  = top.mean(dim=2)   # (B, 3, W)
-    side_x = side.mean(dim=2)  # (B, 3, W)
-    err_top_side = F.mse_loss(top_x, side_x)
+def visual_hull(views):
+    """views: (B, 4, 3, H, W) in [0, 1] -> (B, N, N, N) bool hull indexed [x, y, z] (axes as build_voxel_batch)."""
+    m = silhouettes_from_views(views.float() * 2.0 - 1.0) > 0.5   # (B, 3, N, N) top, side, rear
+    T = m[:, 0].transpose(1, 2)                 # T[x, y]
+    S = m[:, 1].flip(1).transpose(1, 2)         # S[x, z]
+    R = m[:, 2].flip(1).transpose(1, 2)         # R[y, z]
+    return T[:, :, :, None] & S[:, :, None, :] & R[:, None, :, :]
 
-    # Shared Y axis: Top row profile vs Rear col profile
-    top_y  = top.mean(dim=3)   # (B, 3, H)
-    rear_y = rear.mean(dim=3)  # (B, 3, H)
-    err_top_rear = F.mse_loss(top_y, rear_y)
+def hull_iou_per_sample(pred_views, gt_views):
+    """(B, 4, 3, H, W) in [0, 1] each -> (B,) occupancy IoU of the carved visual hulls."""
+    a, b = visual_hull(pred_views), visual_hull(gt_views)
+    inter = (a & b).flatten(1).sum(1).float()
+    union = (a | b).flatten(1).sum(1).float().clamp(min=1)
+    return (inter / union).tolist()
 
-    # Shared Z axis: Side row profile vs Rear row profile
-    side_z = side.mean(dim=3)  # (B, 3, H)
-    rear_z = rear.mean(dim=3)  # (B, 3, H)
-    err_side_rear = F.mse_loss(side_z, rear_z)
-
-    return float(((err_top_side + err_top_rear + err_side_rear) / 3.0).item())
-
-
-def compute_occlusion_error(pred_target: torch.Tensor, gt_target: torch.Tensor,
-                            other_views_gt: List[torch.Tensor], bg_thresh: float = 0.08) -> float:
-    """
-    Measures MSE specifically in occluded regions (pixels that are prominent in
-    the target view but occluded or invisible in the other views).
-    pred_target: (3, H, W) in [0, 1]
-    gt_target:   (3, H, W) in [0, 1]
-    other_views_gt: list of (3, H, W) tensors
-    """
-    # Foreground presence in target view (regions with color variance)
-    std_target = gt_target.std(dim=0, keepdim=True)  # (1, H, W)
-    fg_target = (std_target > bg_thresh).float()
-
-    if other_views_gt:
-        other_stds = [v.std(dim=0, keepdim=True) for v in other_views_gt]
-        avg_other_fg = sum((s > bg_thresh).float() for s in other_stds) / float(len(other_stds))
-        # Occluded: visible in target view, but masked/occluded in other perspectives
-        occ_mask = fg_target * (1.0 - avg_other_fg)
-        if occ_mask.sum() < 1.0:
-            occ_mask = fg_target
-    else:
-        occ_mask = fg_target
-
-    err = F.mse_loss(pred_target * occ_mask, gt_target * occ_mask)
-    return float(err.item())
+def drift_onset(psnr_curve, thresh=DRIFT_DB):
+    """First 1-indexed step with PSNR below `thresh`, or None if it never drifts."""
+    return next((s + 1 for s, v in enumerate(psnr_curve) if v < thresh), None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HEAD-TO-HEAD COMPARISON EVALUATION
+# MODELS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def model_specs(multi_paths, single_paths):
+    """Checkpoint folders -> [(name, kind, path)], each model named after its folder."""
+    specs = [(os.path.basename(os.path.normpath(p)), "multi", p) for p in multi_paths]
+    specs += [(os.path.basename(os.path.normpath(p)), "single", p) for p in single_paths]
+    names = [n for n, _, _ in specs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"Checkpoint folders must have distinct names, got {names}")
+    return specs
+
+def load_models(base_transformer, specs):
+    """Loads every LoRA as a named adapter on one shared base DiT. Returns (peft_model, [(name, kind, adapter)])."""
+    from peft import PeftModel
+
+    model, models = None, []
+    for i, (name, kind, path) in enumerate(specs):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint for '{name}' not found: {path}")
+        adapter = f"m{i}_" + re.sub(r"[^0-9a-zA-Z]+", "_", name)
+        if model is None:
+            model = PeftModel.from_pretrained(base_transformer, path, adapter_name=adapter)
+        else:
+            model.load_adapter(path, adapter_name=adapter)
+        print(f"  [LOADED] {name} ({kind}) <- {path}")
+        models.append((name, kind, adapter))
+    model.eval()
+    return model, models
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENVIRONMENTS & DATA
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_eval_envs(which, num_envs):
+    """Returns [(label, env_name, factory, split)]; held-out envs appear with and without obstacles."""
+    entries = []
+    if which in ("train", "all"):
+        for name, factory in _build_registry()[:num_envs]:
+            entries.append((name, name, factory, "train"))
+    if which in ("heldout", "all"):
+        for obstacles in (True, False):
+            for name, factory in _build_heldout_registry(obstacles=obstacles):
+                label = name if obstacles else f"{name} (no obstacles)"
+                entries.append((label, name, factory, "heldout"))
+    if which not in ("train", "heldout", "all"):
+        wanted = [w.strip() for w in which.split(",")]
+        all_entries = build_eval_envs("all", num_envs=10**6)
+        entries = [e for e in all_entries if e[0] in wanted]
+        missing = set(wanted) - {e[0] for e in entries}
+        if missing:
+            raise ValueError(f"Unknown environments: {sorted(missing)}")
+    return entries
+
+def make_agent(env_name, env):
+    """Same policies as data collection in train_voxel_wan.collect_all_envs_rollouts."""
+    if env_name in ("Lunar Lander", "MultiCar Racing"):
+        from stable_baselines3 import PPO
+        from huggingface_sb3 import load_from_hub
+        repo, fname = (("Adilbai/ppo-LunarLander-v2", "ppo-LunarLander-v2.zip") if env_name == "Lunar Lander"
+                       else ("igpaub/ppo-CarRacing-v2", "ppo-CarRacing-v2.zip"))
+        return PPO.load(load_from_hub(repo_id=repo, filename=fname))
+
+    obs, _ = env.reset()
+    state_dim = int(np.prod(obs.shape if hasattr(obs, "shape") else env.observation_space.shape))
+    clean = "".join(c for c in env_name if c.isalnum() or c in ("_", "-")).lower()
+    # NOTE: ActorCritic has no .predict(), so collect_rollouts samples random actions for these envs,
+    # exactly as during training-data collection.
+    return load_agent(os.path.join("checkpoints", f"ppo_{clean}.pt"), state_dim, env.action_space, device)
+
+def collect_eval_buffer(env_name, factory, n_steps, seed):
+    env = factory()
+    agent = make_agent(env_name, env)
+    buffer = OrthoTransitionBuffer(capacity=n_steps + 16, img_h=96, img_w=96, max_action_len=8)
+    collect_rollouts(env, agent, buffer, n_steps=n_steps, seed=seed, env_name=env_name)   # closes env
+    return buffer
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROLLOUT EVALUATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def compare_multi_vs_single_rollouts(
-    multi_transformer,
-    single_transformer,
-    vae,
-    text_encoder,
-    tokenizer,
-    buffer: OrthoTransitionBuffer,
-    target_view: str = "3D_FPV",
-    rollout_steps: int = 32,
-    n_rollouts: int = 50,
-    eval_steps: int = 20,
-    env_name: str = None,
-):
-    """
-    Executes identical action sequences on both Multi-View and Single-View models
-    starting from the exact same initial frames. Evaluates:
-      - Target view PSNR for Multi-View vs Single-View
-      - Multi-View 4-view mean PSNR
-      - Cross-Projection Consistency Error (CPCE)
-      - Occlusion Error on target view
-      - Video clips for FVD
-    """
-    target_idx = resolve_view_index(target_view)
-    target_name = VIEW_NAMES[target_idx]
-
-    # Model helper to support PEFT adapter switching if sharing same base model
-    is_adapter_mode = (single_transformer == "adapter:single_view")
-    model_for_single = multi_transformer if is_adapter_mode else single_transformer
-
-    if hasattr(multi_transformer, "eval"):
-        multi_transformer.eval()
-    if hasattr(model_for_single, "eval"):
-        model_for_single.eval()
-
-    def _pred_multi(latents, embeds):
-        if is_adapter_mode and hasattr(multi_transformer, "set_adapter"):
-            multi_transformer.set_adapter("default")
-        return predict_next_view_latents(multi_transformer, latents, embeds, steps=eval_steps)
-
-    def _pred_single(latents, embeds):
-        if is_adapter_mode and hasattr(multi_transformer, "set_adapter"):
-            multi_transformer.set_adapter("single_view")
-        return predict_next_view_latents(model_for_single, latents, embeds, steps=eval_steps)
-
-    # Accumulators
-    mv_target_psnr_acc = defaultdict(list)
-    sv_target_psnr_acc = defaultdict(list)
-    mv_all_psnr_acc    = defaultdict(list)
-    cpce_acc           = defaultdict(list)
-    mv_occ_err_acc     = defaultdict(list)
-    sv_occ_err_acc     = defaultdict(list)
-
-    mv_target_clips, sv_target_clips, gt_target_clips = [], [], []
-    best_vis_frames = None
-
-    print("\n" + "=" * 80)
-    print(f"  HEAD-TO-HEAD ROLLOUT EVALUATION: Multi-View vs Single-View ({target_name})")
-    print(f"  Horizon: {rollout_steps} steps | Rollouts: {n_rollouts} | Euler steps: {eval_steps}")
-    print("=" * 80)
-
-    for r_idx in range(n_rollouts):
-        vt_seq, vn_seq, act_seq, env_seq = buffer.sample_sequence(
-            seq_len=rollout_steps, env_filter=env_name
-        )
-        if len(act_seq) < rollout_steps:
-            continue
-
-        # Initial frames at t=0
-        init_all = torch.from_numpy(vt_seq[0:1]).float().to(device) / 127.5 - 1.0  # (1, 4, 3, H, W)
-        init_single = init_all[:, target_idx : target_idx + 1]                    # (1, 1, 3, H, W)
-
-        curr_latents_mv = encode_views_to_latents(vae, init_all, out_dtype=multi_transformer.dtype)
-        curr_latents_sv = encode_views_to_latents(vae, init_single, out_dtype=model_for_single.dtype)
-
-        rollout_gt_target = []
-        rollout_mv_target = []
-        rollout_sv_target = []
-
-        for step_i in range(rollout_steps):
-            sample_env = env_seq[step_i] or env_name or "Bipedal Walker"
-            act = act_seq[step_i]
-
-            prompt = compose_player_prompts([act], env_name=sample_env)
-            text_inputs = tokenizer(
-                prompt, padding="max_length", max_length=64, truncation=True, return_tensors="pt"
-            ).to(device)
-            prompt_embeds = text_encoder(**text_inputs).last_hidden_state
-
-            # Ground truth targets at step_i: (4, 3, H, W) in [0, 1]
-            gt_4views = torch.from_numpy(vn_seq[step_i]).float() / 255.0
-            gt_target_frame = gt_4views[target_idx]
-            other_gt_frames = [gt_4views[i] for i in range(4) if i != target_idx]
-
-            # ── 1. Multi-View Forward Step (predicts all 4 views jointly) ──
-            next_latents_mv = _pred_multi(curr_latents_mv, prompt_embeds.to(dtype=multi_transformer.dtype))
-            decoded_mv = decode_latents_to_views(vae, next_latents_mv)  # (1, 4, 3, H, W) in [0, 1]
-            pred_mv_target = decoded_mv[0, target_idx].cpu()
-
-            mv_target_psnr = psnr(pred_mv_target, gt_target_frame)
-            mv_target_psnr_acc[step_i].append(mv_target_psnr)
-
-            # Multi-View 4-view mean PSNR
-            all_psnrs = [psnr(decoded_mv[0, v].cpu(), gt_4views[v]) for v in range(4)]
-            mv_all_psnr_acc[step_i].append(float(np.mean(all_psnrs)))
-
-            # CPCE across Top, Side, Rear
-            cpce_val = compute_cross_projection_consistency(decoded_mv)
-            cpce_acc[step_i].append(cpce_val)
-
-            # Occlusion error for multi-view
-            occ_mv = compute_occlusion_error(pred_mv_target, gt_target_frame, other_gt_frames)
-            mv_occ_err_acc[step_i].append(occ_mv)
-
-            # Autoregressive feedback for next step
-            curr_latents_mv = encode_views_to_latents(vae, decoded_mv * 2.0 - 1.0, out_dtype=multi_transformer.dtype)
-
-            # ── 2. Single-View Forward Step (predicts only target view) ──
-            next_latents_sv = _pred_single(curr_latents_sv, prompt_embeds.to(dtype=model_for_single.dtype))
-            decoded_sv = decode_latents_to_views(vae, next_latents_sv)  # (1, 1, 3, H, W) in [0, 1]
-            pred_sv_target = decoded_sv[0, 0].cpu()
-
-            sv_target_psnr = psnr(pred_sv_target, gt_target_frame)
-            sv_target_psnr_acc[step_i].append(sv_target_psnr)
-
-            # Occlusion error for single-view
-            occ_sv = compute_occlusion_error(pred_sv_target, gt_target_frame, other_gt_frames)
-            sv_occ_err_acc[step_i].append(occ_sv)
-
-            # Autoregressive feedback for next step
-            curr_latents_sv = encode_views_to_latents(vae, decoded_sv * 2.0 - 1.0, out_dtype=model_for_single.dtype)
-
-            # Storage for FVD & side-by-side
-            rollout_gt_target.append(gt_target_frame)
-            rollout_mv_target.append(pred_mv_target)
-            rollout_sv_target.append(pred_sv_target)
-
-        mv_target_clips.append(torch.stack(rollout_mv_target, dim=0))
-        sv_target_clips.append(torch.stack(rollout_sv_target, dim=0))
-        gt_target_clips.append(torch.stack(rollout_gt_target, dim=0))
-
-        if best_vis_frames is None and len(rollout_gt_target) == rollout_steps:
-            best_vis_frames = (rollout_gt_target, rollout_mv_target, rollout_sv_target)
-
-        if (r_idx + 1) % 10 == 0 or (r_idx + 1) == n_rollouts:
-            mv_p = np.mean(mv_target_psnr_acc[step_i])
-            sv_p = np.mean(sv_target_psnr_acc[step_i])
-            print(f"  Rollout {r_idx+1:02d}/{n_rollouts} | Step-{rollout_steps} PSNR -> "
-                  f"Multi-View: {mv_p:.2f} dB | Single-View: {sv_p:.2f} dB (Advantage: {mv_p - sv_p:+.2f} dB)")
-
-    # Aggregated step-by-step metrics
-    mv_mean_psnr = [float(np.mean(mv_target_psnr_acc[s])) for s in range(rollout_steps)]
-    sv_mean_psnr = [float(np.mean(sv_target_psnr_acc[s])) for s in range(rollout_steps)]
-    mv_4v_psnr   = [float(np.mean(mv_all_psnr_acc[s])) for s in range(rollout_steps)]
-    mean_cpce    = [float(np.mean(cpce_acc[s])) for s in range(rollout_steps)]
-    mean_mv_occ  = [float(np.mean(mv_occ_err_acc[s])) for s in range(rollout_steps)]
-    mean_sv_occ  = [float(np.mean(sv_occ_err_acc[s])) for s in range(rollout_steps)]
-
-    mv_clips_t = torch.stack(mv_target_clips, dim=0)  # (N, T, 3, H, W)
-    sv_clips_t = torch.stack(sv_target_clips, dim=0)
-    gt_clips_t = torch.stack(gt_target_clips, dim=0)
-
-    # Reset adapters
-    if is_adapter_mode and hasattr(multi_transformer, "set_adapter"):
-        multi_transformer.set_adapter("default")
-
-    results = {
-        "Multi-View (OWM)": {
-            "target_psnr": mv_mean_psnr,
-            "mean_4view_psnr": mv_4v_psnr,
-            "cpce": mean_cpce,
-            "occlusion_err": mean_mv_occ,
-        },
-        "Single-View Baseline": {
-            "target_psnr": sv_mean_psnr,
-            "occlusion_err": mean_sv_occ,
-        },
-    }
-    return results, mv_clips_t, sv_clips_t, gt_clips_t, best_vis_frames
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STANDALONE SINGLE-MODEL EVALUATION (BACKWARD COMPATIBLE)
-# ─────────────────────────────────────────────────────────────────────────────
+def encode_prompts(text_encoder, tokenizer, acts, env_names, cams, dtype):
+    """Same prompt format as training: action + env + camera state, 128 tokens."""
+    prompts = compose_player_prompts(acts, env_name=env_names, camera_pose=cams)
+    tokens = tokenizer(prompts, padding="max_length", max_length=128, truncation=True, return_tensors="pt").to(device)
+    return text_encoder(**tokens).last_hidden_state.to(dtype=dtype)
 
 @torch.no_grad()
-def evaluate_rollout_degradation(
-    transformer,
-    vae,
-    text_encoder,
-    tokenizer,
-    buffer: OrthoTransitionBuffer,
-    rollout_steps: int = 32,
-    n_rollouts: int = 50,
-    eval_steps: int = 20,
-    env_name: str = None,
-):
+def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
+                 rollout_steps, n_rollouts, eval_steps, batch_size, strip_steps):
     """
-    Evaluates a single model standalone over `n_rollouts` x `rollout_steps`.
-    Retained for backward compatibility with eval_ablations.py.
+    Rolls out every model from the same GT start frames with the same logged actions / camera commands.
+    Returns:
+      curves[model][metric] -> list over steps of per-step means; curves["GT"]["pe"] is the GT floor
+      clips[model] -> (N, T, 3, H, W) FPV clips in [0, 1]; clips["GT"] likewise
+      strip -> {"GT": [frames], model: [frames]} FPV frames of the first rollout at `strip_steps`
     """
-    transformer.eval()
-    step_psnr_acc = defaultdict(list)
-    gen_clips_all = []
-    gt_clips_all  = []
+    acc = defaultdict(lambda: defaultdict(lambda: [[] for _ in range(rollout_steps)]))
+    clips = defaultdict(list)
+    strip = None
 
-    for rollout_idx in range(n_rollouts):
-        vt_seq, vn_seq, act_seq, env_seq = buffer.sample_sequence(
-            seq_len=rollout_steps, env_filter=env_name
-        )
-        if len(act_seq) < rollout_steps:
-            continue
+    # Sample rollout windows that do not cross episode boundaries
+    seqs = []
+    for _ in range(n_rollouts * 4):
+        if len(seqs) == n_rollouts:
+            break
+        s = buffer.sample_sequence(seq_len=rollout_steps, env_filter=env_name, return_camera_states=True)
+        if len(s[2]) == rollout_steps:
+            seqs.append(s)
+    if len(seqs) < n_rollouts:
+        print(f"  [WARN] {env_name}: only {len(seqs)}/{n_rollouts} full-length rollout windows available")
+    if not seqs:
+        return None, None, None
 
-        init_views = torch.from_numpy(vt_seq[0:1]).float().to(device) / 127.5 - 1.0
-        curr_latents = encode_views_to_latents(vae, init_views, out_dtype=transformer.dtype)
+    for b0 in range(0, len(seqs), batch_size):
+        chunk = seqs[b0:b0 + batch_size]
+        B = len(chunk)
+        vt0 = torch.from_numpy(np.stack([c[0][0] for c in chunk])).float().to(device) / 127.5 - 1.0  # (B, 4, 3, H, W)
 
-        gen_frames = []
-        gt_frames  = []
+        state = {}
+        for name, kind, adapter in models:
+            init = vt0 if kind == "multi" else vt0[:, FPV_IDX:FPV_IDX + 1]
+            state[name] = encode_views_to_latents(vae, init, out_dtype=model.dtype)
 
-        for step_i in range(rollout_steps):
-            sample_env = env_seq[step_i] or env_name or "Bipedal Walker"
-            act = act_seq[step_i]
+        frames = defaultdict(list)
+        for step in range(rollout_steps):
+            acts = [c[2][step] for c in chunk]
+            envs = [c[3][step] or env_name for c in chunk]
+            cams = [c[4][step] for c in chunk]
+            embeds = encode_prompts(text_encoder, tokenizer, acts, envs, cams, model.dtype)
 
-            prompt = compose_player_prompts([act], env_name=sample_env)
-            text_inputs = tokenizer(
-                prompt, padding="max_length", max_length=64, truncation=True, return_tensors="pt"
-            ).to(device)
-            prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
+            gt = torch.from_numpy(np.stack([c[1][step] for c in chunk])).float().to(device) / 255.0  # (B, 4, 3, H, W)
+            gt_fpv = gt[:, FPV_IDX]
+            for v in pe_per_sample(gt):
+                acc["GT"]["pe"][step].append(v)
+            frames["GT"].append(gt_fpv.cpu())
 
-            next_latents = predict_next_view_latents(
-                transformer=transformer,
-                latents_t=curr_latents,
-                prompt_embeds=prompt_embeds,
-                steps=eval_steps,
-            )
-            decoded = decode_latents_to_views(vae, next_latents)  # (1, 4, 3, H, W) [0,1]
-            gt_np = torch.from_numpy(vn_seq[step_i]).float() / 255.0
+            for name, kind, adapter in models:
+                model.set_adapter(adapter)
+                next_lat = predict_next_view_latents(model, state[name], embeds, steps=eval_steps)
+                dec = decode_latents_to_views(vae, next_lat)                     # (B, V, 3, H, W) in [0, 1]
+                state[name] = encode_views_to_latents(vae, dec * 2.0 - 1.0, out_dtype=model.dtype)
 
-            # Per-step metrics (mean over all 4 views)
-            step_psnr_views = [psnr(decoded[0, v].cpu(), gt_np[v]) for v in range(4)]
-            step_psnr_acc[step_i].append(np.mean(step_psnr_views))
+                fpv = dec[:, -1]
+                for metric, vals in (("psnr", psnr_per_sample(fpv, gt_fpv)),
+                                     ("ssim", ssim_per_sample(fpv, gt_fpv)),
+                                     ("lpips", lpips_per_sample(fpv, gt_fpv))):
+                    acc[name][metric][step].extend(vals)
+                if kind == "multi":
+                    acc[name]["pe"][step].extend(pe_per_sample(dec))
+                    acc[name]["hull_iou"][step].extend(hull_iou_per_sample(dec, gt))
+                frames[name].append(fpv.cpu())
 
-            gen_frames.append(decoded[0, 0].cpu())
-            gt_frames.append(gt_np[0])
+        for key, fr in frames.items():
+            clips[key].append(torch.stack(fr, dim=1))                           # (B, T, 3, H, W)
+        if strip is None:
+            strip = {key: [fr[s - 1][0] for s in strip_steps if s <= rollout_steps] for key, fr in frames.items()}
 
-            next_norm = decoded * 2.0 - 1.0
-            curr_latents = encode_views_to_latents(vae, next_norm, out_dtype=transformer.dtype)
-
-        gen_clips_all.append(torch.stack(gen_frames, dim=0))
-        gt_clips_all.append(torch.stack(gt_frames, dim=0))
-
-    mean_psnr = [float(np.mean(step_psnr_acc[s])) for s in range(rollout_steps)]
-    gen_clips = torch.stack(gen_clips_all, dim=0)
-    gt_clips  = torch.stack(gt_clips_all, dim=0)
-
-    transformer.train()
-    return mean_psnr, gen_clips, gt_clips
+    curves = {key: {metric: [float(np.mean(v)) for v in per_step] for metric, per_step in metrics.items()}
+              for key, metrics in acc.items()}
+    clips = {key: torch.cat(c, dim=0) for key, c in clips.items()}
+    return curves, clips, strip
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLOTTING & VISUALIZATIONS
+# SUMMARY, TABLES & PLOTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_degradation_curves(results: dict, out_path: str, rollout_steps: int, target_view: str = "3D_FPV"):
-    """
-    Plots PSNR degradation curves for Multi-View vs Single-View world models.
-    Supports both comparison dict structure and simple ablation dict.
-    """
-    steps = list(range(1, rollout_steps + 1))
-    colors = {
-        "Multi-View (OWM)": "#0284c7",       # Sky blue
-        "Single-View Baseline": "#ea580c",  # Vivid orange
-        "OWM (Ours)": "#0284c7",
-    }
-    fallback_colors = ["#38bdf8", "#fb923c", "#818cf8", "#4ade80"]
+def summarize(curves, model_names, rollout_steps, fvd):
+    """One summary dict per model from its per-step curves."""
+    mid = min(16, rollout_steps) - 1
+    gt_pe = curves["GT"]["pe"]
+    rows = {}
+    for name in model_names:
+        c = curves[name]
+        row = {
+            "psnr@1": c["psnr"][0], "ssim@1": c["ssim"][0], "lpips@1": c["lpips"][0],
+            f"psnr@{mid + 1}": c["psnr"][mid], f"psnr@{rollout_steps}": c["psnr"][-1],
+            "auc_psnr": float(np.mean(c["psnr"])),
+            "drift": drift_onset(c["psnr"]),
+            "fvd": fvd.get(name, float("nan")),
+            "gt_pe": float(np.mean(gt_pe)),
+        }
+        if "pe" in c:
+            row.update({"pe@1": c["pe"][0], f"pe@{mid + 1}": c["pe"][mid], "pe_mean": float(np.mean(c["pe"])),
+                        "hull_iou@1": c["hull_iou"][0], "hull_iou_mean": float(np.mean(c["hull_iou"]))})
+        rows[name] = row
+    return rows
 
-    fig, ax = plt.subplots(1, 1, figsize=(7.5, 4.8), dpi=200)
-    plt.rcParams.update({"font.family": "DejaVu Sans", "axes.spines.top": False, "axes.spines.right": False})
+def aggregate(summaries, rollout_steps):
+    """Mean over environments. A rollout that never drifts counts as drifting at step T+1."""
+    out = {}
+    names = {n for s in summaries for n in s}
+    for name in names:
+        rows = [s[name] for s in summaries if name in s]
+        keys = {k for r in rows for k in r}
+        agg = {}
+        for k in keys:
+            vals = [r[k] for r in rows if k in r]
+            if k == "drift":
+                vals = [rollout_steps + 1 if v is None else v for v in vals]
+            vals = [v for v in vals if v is not None and not (isinstance(v, float) and np.isnan(v))]
+            agg[k] = float(np.mean(vals)) if vals else float("nan")
+        out[name] = agg
+    return out
 
-    for i, (name, data) in enumerate(results.items()):
-        color = colors.get(name, fallback_colors[i % len(fallback_colors)])
-        psnr_vals = data.get("target_psnr", data.get("psnr", []))
-        if not psnr_vals:
+def fmt(v, d=2):
+    if v is None:
+        return "--"
+    if isinstance(v, float) and np.isnan(v):
+        return "--"
+    return f"{v:.{d}f}" if isinstance(v, float) else str(v)
+
+def write_summary_csv(path, table):
+    keys = sorted({k for rows in table.values() for r in rows.values() for k in r})
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["env", "model"] + keys)
+        for env, rows in table.items():
+            for name, r in rows.items():
+                w.writerow([env, name] + [fmt(r.get(k), 4) for k in keys])
+
+def write_per_step_csv(path, all_curves):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["env", "model", "metric", "step", "value"])
+        for env, curves in all_curves.items():
+            for name, metrics in curves.items():
+                for metric, vals in metrics.items():
+                    for s, v in enumerate(vals):
+                        w.writerow([env, name, metric, s + 1, f"{v:.6f}"])
+
+def write_main_tex(path, agg, model_names, rollout_steps):
+    """Rows for the main table: FPV fidelity (single step), rollout stability, supporting-view consistency."""
+    lines = ["% Model & PSNR@1 & SSIM@1 & LPIPS@1 & AUC-PSNR & Drift & FVD & PE & Hull IoU \\\\"]
+    for name in model_names:
+        r = agg.get(name, {})
+        lines.append(" & ".join([
+            name, fmt(r.get("psnr@1")), fmt(r.get("ssim@1"), 3), fmt(r.get("lpips@1"), 3),
+            fmt(r.get("auc_psnr")), fmt(r.get("drift"), 1), fmt(r.get("fvd"), 1),
+            fmt(r.get("pe_mean"), 3), fmt(r.get("hull_iou_mean"), 3),
+        ]) + " \\\\")
+    lines.append(f"% GT PE floor: {fmt(next(iter(agg.values()), {}).get('gt_pe'), 3)}; drift counts T+1={rollout_steps + 1} if none")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+def write_per_env_tex(path, table, model_names, multi_names, rollout_steps):
+    mid = min(16, rollout_steps)
+    head = ["Environment"] + [f"PSNR@{mid} {n}" for n in model_names] + [f"PE@{mid} {n}" for n in multi_names] + ["GT PE"]
+    lines = ["% " + " & ".join(head) + " \\\\"]
+    for env, rows in table.items():
+        if not rows:
             continue
-        auc = float(np.mean(psnr_vals[:rollout_steps]))
-        ax.plot(
-            steps[:len(psnr_vals)],
-            psnr_vals[:rollout_steps],
-            label=f"{name} (AUC={auc:.1f} dB)",
-            color=color,
-            linewidth=2.4,
-            marker="o",
-            markersize=3.5,
-            zorder=3,
-        )
+        any_row = next(iter(rows.values()))
+        cells = [env] + [fmt(rows.get(n, {}).get(f"psnr@{mid}")) for n in model_names]
+        cells += [fmt(rows.get(n, {}).get(f"pe@{mid}"), 3) for n in multi_names]
+        cells += [fmt(any_row.get("gt_pe"), 3)]
+        lines.append(" & ".join(cells) + " \\\\")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
-    # 20 dB drift threshold
-    ax.axhline(20.0, color="#ef4444", linestyle=":", linewidth=1.2, label="Drift Threshold (20 dB)")
-
-    for i, (name, data) in enumerate(results.items()):
-        color = colors.get(name, fallback_colors[i % len(fallback_colors)])
-        psnr_vals = data.get("target_psnr", data.get("psnr", []))
-        drift = next((s + 1 for s, v in enumerate(psnr_vals) if v < 20.0), None)
-        if drift is not None:
-            ax.axvline(drift, color=color, linestyle="--", alpha=0.6, linewidth=1.2)
-            ax.text(drift + 0.3, 20.5, f"drift@{drift}", fontsize=8, color=color, fontweight="bold")
-
-    ax.set_xlabel("Rollout Step $t$", fontsize=12)
-    ax.set_ylabel(f"PSNR (dB) ↑ [{target_view} View]", fontsize=12)
-    ax.set_title(f"Autoregressive Rollout Degradation: Multi-View vs. Single-View ({target_view})",
-                 fontsize=11, fontweight="bold")
-    ax.legend(fontsize=9.5, framealpha=0.85, loc="upper right")
-    ax.grid(alpha=0.25, linestyle="--")
-    ax.xaxis.set_major_locator(ticker.MultipleLocator(4 if rollout_steps <= 32 else 8))
-
+def plot_curves(curves, model_names, out_path, title):
+    """FPV PSNR (left) and supporting-view PE (right) versus rollout step."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4), dpi=200)
+    for name in model_names:
+        c = curves[name]
+        steps = range(1, len(c["psnr"]) + 1)
+        ax1.plot(steps, c["psnr"], marker="o", markersize=3, linewidth=2, label=name)
+        if "pe" in c:
+            ax2.plot(steps, c["pe"], marker="o", markersize=3, linewidth=2, label=name)
+    ax1.axhline(DRIFT_DB, color="#ef4444", linestyle=":", linewidth=1.2, label=f"Drift threshold ({DRIFT_DB:.0f} dB)")
+    gt = curves["GT"]["pe"]
+    ax2.plot(range(1, len(gt) + 1), gt, color="black", linestyle="--", linewidth=1.2, label="Ground truth")
+    ax1.set(xlabel="Rollout step", ylabel="FPV PSNR (dB)", title=f"{title}: FPV fidelity")
+    ax2.set(xlabel="Rollout step", ylabel="Projection error", title=f"{title}: supporting-view consistency")
+    for ax in (ax1, ax2):
+        ax.grid(alpha=0.25, linestyle="--")
+        ax.legend(fontsize=8)
     plt.tight_layout()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path, bbox_inches="tight")
-    print(f"  [SAVED] Degradation comparison plot -> {out_path}")
     plt.close()
 
-
-def save_csv(results: dict, out_path: str, rollout_steps: int, fvd_multi: float = None, fvd_single: float = None):
-    """
-    Saves comprehensive step-by-step metrics & comparison summary table to CSV.
-    """
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    is_comparison = ("Multi-View (OWM)" in results and "Single-View Baseline" in results)
-
-    with open(out_path, "w", newline="") as f:
-        writer = csv.writer(f)
-
-        if is_comparison:
-            mv_data = results["Multi-View (OWM)"]
-            sv_data = results["Single-View Baseline"]
-
-            mv_p = mv_data.get("target_psnr", [])
-            sv_p = sv_data.get("target_psnr", [])
-            mv_4v = mv_data.get("mean_4view_psnr", [0.0] * rollout_steps)
-            cpce = mv_data.get("cpce", [0.0] * rollout_steps)
-            mv_occ = mv_data.get("occlusion_err", [0.0] * rollout_steps)
-            sv_occ = sv_data.get("occlusion_err", [0.0] * rollout_steps)
-
-            writer.writerow([
-                "step",
-                "multiview_psnr",
-                "singleview_psnr",
-                "advantage_db",
-                "multiview_4view_psnr",
-                "cpce_consistency",
-                "multiview_occ_err",
-                "singleview_occ_err",
-            ])
-
-            for s in range(min(rollout_steps, len(mv_p), len(sv_p))):
-                adv = mv_p[s] - sv_p[s]
-                writer.writerow([
-                    s + 1,
-                    f"{mv_p[s]:.4f}",
-                    f"{sv_p[s]:.4f}",
-                    f"{adv:+.4f}",
-                    f"{mv_4v[s]:.4f}" if s < len(mv_4v) else "",
-                    f"{cpce[s]:.6f}" if s < len(cpce) else "",
-                    f"{mv_occ[s]:.6f}" if s < len(mv_occ) else "",
-                    f"{sv_occ[s]:.6f}" if s < len(sv_occ) else "",
-                ])
-
-            # Summary Rows
-            writer.writerow([])
-            auc_m = float(np.mean(mv_p)) if mv_p else 0.0
-            auc_s = float(np.mean(sv_p)) if sv_p else 0.0
-            writer.writerow(["AUC_PSNR", f"{auc_m:.4f}", f"{auc_s:.4f}", f"{auc_m - auc_s:+.4f}"])
-
-            drift_m = next((s + 1 for s, v in enumerate(mv_p) if v < 20.0), f">{rollout_steps}")
-            drift_s = next((s + 1 for s, v in enumerate(sv_p) if v < 20.0), f">{rollout_steps}")
-            writer.writerow(["Drift_Onset_Step", str(drift_m), str(drift_s), ""])
-
-            writer.writerow(["Final_Step_PSNR", f"{mv_p[-1]:.4f}", f"{sv_p[-1]:.4f}", f"{mv_p[-1] - sv_p[-1]:+.4f}"])
-
-            if fvd_multi is not None and fvd_single is not None:
-                writer.writerow(["FVD_Score", f"{fvd_multi:.2f}", f"{fvd_single:.2f}", f"{fvd_single - fvd_multi:+.2f}"])
-
-            mean_cpce = float(np.mean(cpce)) if cpce else 0.0
-            writer.writerow(["Mean_CPCE_Consistency", f"{mean_cpce:.6f}", "N/A", ""])
-
-            auc_occ_m = float(np.mean(mv_occ)) if mv_occ else 0.0
-            auc_occ_s = float(np.mean(sv_occ)) if sv_occ else 0.0
-            writer.writerow(["Mean_Occlusion_Error", f"{auc_occ_m:.6f}", f"{auc_occ_s:.6f}", f"{auc_occ_m - auc_occ_s:+.6f}"])
-
-        else:
-            header = ["step"] + [f"{m}_{k}" for m in results for k in ["psnr"]]
-            writer.writerow(header)
-            for s in range(rollout_steps):
-                row = [s + 1]
-                for data in results.values():
-                    psnr_vals = data.get("target_psnr", data.get("psnr", []))
-                    row += [f"{psnr_vals[s]:.4f}" if s < len(psnr_vals) else ""]
-                writer.writerow(row)
-
-    print(f"  [SAVED] Metrics CSV -> {out_path}")
-
-
-def create_comparison_visualizations(gt_frames, multi_frames, single_frames, out_dir, target_view="3D_FPV", fps=15):
-    """
-    Creates stitched side-by-side video and image strips:
-    [ Ground Truth | Multi-View (OWM) | Single-View Baseline ]
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    T = len(gt_frames)
-    if T == 0:
-        return
-
-    H, W = gt_frames[0].shape[1], gt_frames[0].shape[2]
-    header_h = 28
-    composite_h = H + header_h
-    composite_w = W * 3
-
-    frames_bgr = []
-    frames_rgb = []
-
-    for t in range(T):
-        gt_np = (gt_frames[t].permute(1, 2, 0).float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        mv_np = (multi_frames[t].permute(1, 2, 0).float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        sv_np = (single_frames[t].permute(1, 2, 0).float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-
-        canvas = np.zeros((composite_h, composite_w, 3), dtype=np.uint8)
-        canvas[:header_h, :] = (30, 30, 30)
-
-        canvas[header_h:, 0:W] = cv2.cvtColor(gt_np, cv2.COLOR_RGB2BGR)
-        canvas[header_h:, W:2*W] = cv2.cvtColor(mv_np, cv2.COLOR_RGB2BGR)
-        canvas[header_h:, 2*W:3*W] = cv2.cvtColor(sv_np, cv2.COLOR_RGB2BGR)
-
-        cv2.line(canvas, (W, 0), (W, composite_h), (80, 80, 80), 1)
-        cv2.line(canvas, (2 * W, 0), (2 * W, composite_h), (80, 80, 80), 1)
-        cv2.line(canvas, (0, header_h), (composite_w, header_h), (100, 100, 100), 1)
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.38
-        cv2.putText(canvas, "Ground Truth", (8, 18), font, font_scale, (240, 240, 240), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "Multi-View (Ours)", (W + 8, 18), font, font_scale, (255, 200, 50), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "Single-View", (2 * W + 8, 18), font, font_scale, (100, 180, 255), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"t={t+1}", (W - 32, composite_h - 6), font, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
-
-        frames_bgr.append(canvas)
-        frames_rgb.append(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
-
-    # Save MP4
-    video_path = os.path.join(out_dir, f"comparison_rollout_{target_view.lower()}.mp4")
-    try:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        vwriter = cv2.VideoWriter(video_path, fourcc, fps, (composite_w, composite_h))
-        for f in frames_bgr:
-            vwriter.write(f)
-        vwriter.release()
-        print(f"  [SAVED] Comparison video -> {video_path}")
-    except Exception as e:
-        print(f"  [WARN] Could not save MP4 video: {e}")
-
-    # Save GIF
-    gif_path = os.path.join(out_dir, f"comparison_rollout_{target_view.lower()}.gif")
-    try:
-        pil_images = [Image.fromarray(f) for f in frames_rgb]
-        pil_images[0].save(
-            gif_path,
-            save_all=True,
-            append_images=pil_images[1:],
-            duration=int(1000 / fps),
-            loop=0,
-        )
-        print(f"  [SAVED] Comparison GIF -> {gif_path}")
-    except Exception as e:
-        print(f"  [WARN] Could not save GIF: {e}")
-
-    # Save static milestone strip
-    strip_path = os.path.join(out_dir, f"comparison_strip_{target_view.lower()}.png")
-    try:
-        sample_indices = sorted(list(set([0, min(3, T - 1), min(7, T - 1), min(15, T - 1), min(23, T - 1), T - 1])))
-        strip_frames = [frames_bgr[i] for i in sample_indices]
-        full_strip = np.vstack(strip_frames)
-        cv2.imwrite(strip_path, full_strip)
-        print(f"  [SAVED] Comparison static strip -> {strip_path}")
-    except Exception as e:
-        print(f"  [WARN] Could not save strip: {e}")
+def save_strip(strip, steps, out_path, scale=2):
+    """Rows: GT then each model; columns: FPV frames at `steps`."""
+    rows = []
+    for name, frames in strip.items():
+        tiles = [(f.permute(1, 2, 0).float().numpy() * 255).clip(0, 255).astype(np.uint8) for f in frames]
+        row = np.concatenate(tiles, axis=1)
+        row = cv2.resize(row, (row.shape[1] * scale, row.shape[0] * scale), interpolation=cv2.INTER_NEAREST)
+        label = np.full((24, row.shape[1], 3), 30, dtype=np.uint8)
+        cv2.putText(label, name, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        rows.append(np.concatenate([label, row], axis=0))
+    header = np.full((20, rows[0].shape[1], 3), 30, dtype=np.uint8)
+    tile_w = rows[0].shape[1] // max(1, len(steps))
+    for i, s in enumerate(steps):
+        cv2.putText(header, f"t={s}", (i * tile_w + 6, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    img = np.concatenate([header] + rows, axis=0)
+    cv2.imwrite(out_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -641,145 +416,103 @@ def create_comparison_visualizations(gt_frames, multi_frames, single_frames, out
 
 def main(args):
     set_seed(args.seed)
-    os.makedirs("results/exp3_1", exist_ok=True)
+    tag = args.tag or datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(args.out_root, tag)
+    os.makedirs(out_dir, exist_ok=True)
 
-    from peft import PeftModel
+    specs = model_specs(args.multi, args.single)
     base_transformer, vae, text_encoder, tokenizer = load_base_model(model_id=args.model_id)
+    model, models = load_models(base_transformer, specs)
+    model_names = [n for n, _, _ in models]
+    multi_names = [n for n, k, _ in models if k == "multi"]
+    strip_steps = [int(s) for s in args.strip_steps.split(",")]
 
-    # 1. Load Multi-View Model
-    multi_transformer = None
-    if os.path.exists(args.ckpt_dir):
-        print(f"Loading Multi-View LoRA from: {args.ckpt_dir}")
-        multi_transformer = PeftModel.from_pretrained(base_transformer, args.ckpt_dir)
-        multi_transformer.eval()
+    env_entries = build_eval_envs(args.envs, args.num_envs)
+    print(f"\nEvaluating {len(models)} models on {len(env_entries)} environments "
+          f"({args.n_rollouts} rollouts x {args.rollout_steps} steps, seed {args.seed})")
 
-    # 2. Load Single-View Model (supports PEFT adapter sharing or separate model)
-    single_view_transformer = None
-    print(f"Loading Single-View LoRA from: {args.single_ckpt_dir}")
-    if multi_transformer is not None:
-        multi_transformer.load_adapter(args.single_ckpt_dir, adapter_name="single_view")
-        single_view_transformer = "adapter:single_view"
-        print("  [INFO] Loaded Single-View adapter onto shared base DiT (memory-efficient).")
+    table, all_curves, split_of = {}, {}, {}
+    pooled_clips = {"train": defaultdict(list), "heldout": defaultdict(list)}
 
-
-    # 3. Populate buffer with gym environment rollouts
-    registry = _build_registry()
-    reg_dict = dict(registry)
-    buffer = OrthoTransitionBuffer(capacity=8000, img_h=96, img_w=96, max_action_len=8)
-
-    env_name = args.env_name or registry[0][0]
-    env = reg_dict[env_name]()
-    obs, _ = env.reset(seed=args.seed)
-    state_dim = int(np.prod(obs.shape if hasattr(obs, "shape") else env.observation_space.shape))
-    clean_name = "".join(c for c in env_name if c.isalnum() or c in ("_", "-")).lower()
-    agent = load_agent(f"checkpoints/ppo_{clean_name}.pt", state_dim, env.action_space, device)
-    collect_rollouts(env, agent, buffer, n_steps=args.buffer_steps, seed=args.seed, env_name=env_name)
-    env.close()
-    
-    view_names = ["Top", "Side", "Rear", "3D_FPV"]
-
-    # 4. Evaluation Execution
-    if multi_transformer is not None and single_view_transformer is not None:
-
-        for target_view in view_names:
-
-            # ── HEAD-TO-HEAD COMPARISON ──
-            results, mv_clips, sv_clips, gt_clips, best_vis = compare_multi_vs_single_rollouts(
-                multi_transformer=multi_transformer,
-                single_transformer=single_view_transformer,
-                vae=vae,
-                text_encoder=text_encoder,
-                tokenizer=tokenizer,
-                buffer=buffer,
-                target_view=target_view,
-                rollout_steps=args.rollout_steps,
-                n_rollouts=args.n_rollouts,
-                eval_steps=args.eval_steps,
-                env_name=env_name,
-            )
-
-            print("\nComputing FVD scores for video rollouts...")
-            fvd_mv = compute_fvd(gt_clips.float(), mv_clips.float())
-            fvd_sv = compute_fvd(gt_clips.float(), sv_clips.float())
-
-            mv_p = results["Multi-View (OWM)"]["target_psnr"]
-            sv_p = results["Single-View Baseline"]["target_psnr"]
-            auc_m = float(np.mean(mv_p))
-            auc_s = float(np.mean(sv_p))
-            dm = next((s + 1 for s, v in enumerate(mv_p) if v < 20.0), f">{args.rollout_steps}")
-            ds = next((s + 1 for s, v in enumerate(sv_p) if v < 20.0), f">{args.rollout_steps}")
-
-            print("\n" + "=" * 80)
-            print("  COMPARISON SUMMARY: MULTI-VIEW vs SINGLE-VIEW")
-            print("=" * 80)
-            print(f"  {'Metric':<30} | {'Multi-View (OWM)':<18} | {'Single-View':<18} | {'Advantage':<14}")
-            print("  " + "-" * 76)
-            print(f"  {'AUC-PSNR ↑':<30} | {auc_m:<15.2f} dB | {auc_s:<15.2f} dB | {auc_m - auc_s:+11.2f} dB")
-            print(f"  {'Drift Onset (PSNR < 20dB)':<30} | {str(dm):<18} | {str(ds):<18} | {'-'}")
-            print(f"  {'Final Step PSNR ↑':<30} | {mv_p[-1]:<15.2f} dB | {sv_p[-1]:<15.2f} dB | {mv_p[-1] - sv_p[-1]:+11.2f} dB")
-            print(f"  {'FVD (lower is better) ↓':<30} | {fvd_mv:<18.2f} | {fvd_sv:<18.2f} | {fvd_sv - fvd_mv:+11.2f}")
-            mean_cpce = float(np.mean(results["Multi-View (OWM)"]["cpce"]))
-            print(f"  {'Cross-Proj. Consistency (CPCE)':<30} | {mean_cpce:<18.6f} | {'N/A':<18} | {'-'}")
-            auc_occ_m = float(np.mean(results["Multi-View (OWM)"]["occlusion_err"]))
-            auc_occ_s = float(np.mean(results["Single-View Baseline"]["occlusion_err"]))
-            print(f"  {'Occlusion Error ↓':<30} | {auc_occ_m:<18.6f} | {auc_occ_s:<18.6f} | {auc_occ_m - auc_occ_s:+11.6f}")
-            print("=" * 80 + "\n")
-
-            plot_degradation_curves(results, f"results/exp3_1/{target_view}_degradation.png", args.rollout_steps, target_view=target_view)
-            save_csv(results, f"results/exp3_1/{target_view}_metrics.csv", args.rollout_steps, fvd_multi=fvd_mv, fvd_single=fvd_sv)
-
-            if best_vis is not None and args.save_video:
-                create_comparison_visualizations(
-                    gt_frames=best_vis[0],
-                    multi_frames=best_vis[1],
-                    single_frames=best_vis[2],
-                    out_dir="results/exp3_1",
-                    target_view=target_view,
-                    fps=15,
-                )
-
-    else:
-        # ── SINGLE MODEL EVALUATION (FALLBACK) ──
-        active_model = multi_transformer if multi_transformer is not None else single_view_transformer
-        if active_model is None:
-            print("[ERROR] No valid checkpoint found to evaluate.")
-            return
-
-        label = "OWM (Ours)" if multi_transformer is not None else "Single-View Baseline"
-        print(f"\nRunning standalone evaluation for: {label}")
-        psnr_vals, gen_clips, gt_clips = evaluate_rollout_degradation(
-            transformer=active_model, vae=vae,
-            text_encoder=text_encoder, tokenizer=tokenizer,
-            buffer=buffer, rollout_steps=args.rollout_steps,
-            n_rollouts=args.n_rollouts, eval_steps=args.eval_steps,
-            env_name=env_name,
+    for label, env_name, factory, split in env_entries:
+        print(f"\n=== {label} [{split}] ===")
+        buffer = collect_eval_buffer(env_name, factory, args.buffer_steps, args.seed)
+        curves, clips, strip = evaluate_env(
+            model, models, vae, text_encoder, tokenizer, buffer, env_name,
+            rollout_steps=args.rollout_steps, n_rollouts=args.n_rollouts, eval_steps=args.eval_steps,
+            batch_size=args.batch_size, strip_steps=strip_steps,
         )
+        if curves is None:
+            continue
 
-        print("Computing FVD ...")
-        fvd_val = compute_fvd(gt_clips.float(), gen_clips.float())
-        drift_step = next((s + 1 for s, v in enumerate(psnr_vals) if v < 20.0), None)
-        print(f"\n  AUC-PSNR:        {np.mean(psnr_vals):.2f} dB")
-        print(f"  Drift onset:     step {drift_step}")
-        print(f"  Final PSNR:      {psnr_vals[-1]:.2f} dB")
-        print(f"  FVD:             {fvd_val:.2f}")
+        fvd = {}
+        if not args.no_fvd and clips["GT"].shape[0] >= 2:
+            for name in model_names:
+                fvd[name] = compute_fvd(clips["GT"].float(), clips[name].float())
+        for key, c in clips.items():
+            pooled_clips[split][key].append(c)
 
-        results = {label: {"psnr": psnr_vals}}
-        plot_degradation_curves(results, f"results/exp3_1/degradation.png", args.rollout_steps)
-        save_csv(results, "results/exp3_1/metrics.csv", args.rollout_steps)
+        table[label] = summarize(curves, model_names, args.rollout_steps, fvd)
+        all_curves[label] = curves
+        split_of[label] = split
 
+        clean = re.sub(r"[^0-9a-zA-Z]+", "_", label).strip("_").lower()
+        plot_curves(curves, model_names, os.path.join(out_dir, f"{clean}_curves.png"), label)
+        save_strip(strip, [s for s in strip_steps if s <= args.rollout_steps], os.path.join(out_dir, f"{clean}_strip.png"))
+
+        for name in model_names:
+            r = table[label][name]
+            pe = f" | PE {fmt(r.get('pe_mean'), 3)} (GT {fmt(r['gt_pe'], 3)})" if "pe_mean" in r else ""
+            print(f"  {name:<20} FPV PSNR@1 {fmt(r['psnr@1'])} | AUC {fmt(r['auc_psnr'])} | "
+                  f"drift {r['drift'] or '>' + str(args.rollout_steps)} | FVD {fmt(r['fvd'], 1)}{pe}")
+
+    # Aggregate rows over training / held-out environments (FVD pooled over all clips of the split)
+    for split, title in (("train", "Train (mean)"), ("heldout", "Held-out (mean)")):
+        envs = [e for e, s in split_of.items() if s == split]
+        if not envs:
+            continue
+        agg = aggregate([table[e] for e in envs], args.rollout_steps)
+        if not args.no_fvd:
+            gt = torch.cat(pooled_clips[split]["GT"], dim=0)
+            for name in model_names:
+                agg[name]["fvd"] = compute_fvd(gt.float(), torch.cat(pooled_clips[split][name], dim=0).float())
+        table[title] = agg
+        all_curves[title] = {key: {m: list(np.mean([all_curves[e][key][m] for e in envs], axis=0))
+                                   for m in all_curves[envs[0]][key]}
+                             for key in all_curves[envs[0]]}
+        clean = re.sub(r"[^0-9a-zA-Z]+", "_", title).strip("_").lower()
+        plot_curves(all_curves[title], model_names, os.path.join(out_dir, f"{clean}_curves.png"), title)
+
+    write_summary_csv(os.path.join(out_dir, "summary.csv"), table)
+    write_per_step_csv(os.path.join(out_dir, "per_step.csv"), all_curves)
+    if "Train (mean)" in table:
+        write_main_tex(os.path.join(out_dir, "summary_main.tex"), table["Train (mean)"], model_names, args.rollout_steps)
+    write_per_env_tex(os.path.join(out_dir, "summary_per_env.tex"),
+                      {e: r for e, r in table.items() if e in split_of}, model_names, multi_names, args.rollout_steps)
+    print(f"\n[SAVED] Results -> {out_dir}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="FPV-centred long-horizon rollout evaluation of multi-view and single-view world models")
+    p.add_argument("--multi", nargs="*", default=["./checkpoints/wan_ortho_voxel_cam_3_lora_final"],
+                   help="Checkpoint folders of multi-view models (FPV + supporting views)")
+    p.add_argument("--single", nargs="*", default=["./checkpoints/wan_single_cam_3_lora_final"],
+                   help="Checkpoint folders of FPV-only models")
+    p.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+    p.add_argument("--envs", type=str, default="all",
+                   help="'train', 'heldout', 'all', or a comma-separated list of env labels")
+    p.add_argument("--num_envs", type=int, default=12, help="Number of training envs (registry order) to evaluate")
+    p.add_argument("--rollout_steps", type=int, default=32)
+    p.add_argument("--n_rollouts", type=int, default=20, help="Rollouts per environment")
+    p.add_argument("--batch_size", type=int, default=4, help="Rollouts evaluated in parallel")
+    p.add_argument("--eval_steps", type=int, default=20, help="Euler steps per predicted frame")
+    p.add_argument("--buffer_steps", type=int, default=1000, help="Evaluation transitions collected per environment")
+    p.add_argument("--seed", type=int, default=69, help="Evaluation seed (training data uses 42)")
+    p.add_argument("--strip_steps", type=str, default="1,8,16,24,32", help="Rollout steps shown in the frame strips")
+    p.add_argument("--no_fvd", action="store_true", help="Skip FVD")
+    p.add_argument("--out_root", type=str, default="results/eval")
+    p.add_argument("--tag", type=str, default=None, help="Output sub-directory (default: timestamp)")
+    return p.parse_args()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Exp 3.1: Long-Horizon Rollout Degradation & Multi-View vs Single-View Comparison")
-    parser.add_argument("--ckpt_dir",        type=str, default="./checkpoints/wan_ortho_cam_3_lora_final", help="Path to Multi-View LoRA checkpoint")
-    parser.add_argument("--single_ckpt_dir", type=str, default="./checkpoints/wan_single_cam_3_lora_final", help="Path to Single-View LoRA checkpoint")
-    parser.add_argument("--target_view",     type=str, default="3D_FPV", help="Target camera view to compare (3D_FPV, Top, Side, Rear)")
-    parser.add_argument("--model_id",        type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
-    parser.add_argument("--env_name",        type=str, default=None)
-    parser.add_argument("--rollout_steps",   type=int, default=32)
-    parser.add_argument("--n_rollouts",      type=int, default=50)
-    parser.add_argument("--eval_steps",      type=int, default=20)
-    parser.add_argument("--buffer_steps",    type=int, default=2000)
-    parser.add_argument("--save_video",      action="store_true", default=True, help="Save comparison video, gif, and strip")
-    parser.add_argument("--seed",            type=int, default=69)
-    args = parser.parse_args()
-    main(args)
+    main(parse_args())

@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orthographic World Models</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<style>
+/* Static mirror of ortho/app.py (Gradio). Same dark theme, cards and 3x2 environment grid. */
+:root {
+  color-scheme: dark;
+  --bg: #0b0f19;
+  --panel: #151b28;
+  --panel-2: #1e2638;
+  --border: #2d3748;
+  --text: #ffffff;
+  --text-subdued: #cbd5e1;
+  --accent: #38bdf8;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: "Source Sans Pro", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.6;
+}
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+/* Tabs */
+.tab-nav {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+.tab-nav button {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text);
+  font-size: 1rem;
+  padding: 10px 16px;
+  cursor: pointer;
+}
+.tab-nav button.active {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+.tabitem { display: none; }
+.tabitem.active { display: block; }
+
+/* Cards */
+.hero-card {
+  background: linear-gradient(135deg, #1e2638 0%, #0d121d 100%);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 16px;
+  padding: 36px;
+  margin-bottom: 28px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  text-align: center;
+}
+.hero-title {
+  font-size: 2.6rem;
+  font-weight: 800;
+  background: linear-gradient(90deg, #38bdf8 0%, #818cf8 50%, #c084fc 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin-bottom: 12px;
+  line-height: 1.2;
+}
+.hero-subtitle {
+  font-size: 1.2rem;
+  color: var(--text-subdued);
+  margin-bottom: 22px;
+  line-height: 1.6;
+}
+.badge-container {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.badge {
+  display: inline-block;
+  padding: 6px 16px;
+  border-radius: 20px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  background: rgba(56, 189, 248, 0.2);
+  color: var(--accent);
+  border: 1px solid rgba(56, 189, 248, 0.4);
+}
+.section-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 30px;
+  margin-bottom: 28px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  overflow-wrap: anywhere;
+}
+.section-card h1 { font-size: 1.8rem; margin-top: 0; }
+.section-card hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+.section-card a { color: var(--accent); }
+
+/* 3x2 environment grid (mirrors #env-radio) */
+.env-radio-label { font-size: 0.9rem; margin-bottom: 8px; }
+#env-radio {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+#env-radio button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 16px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: center;
+  font-weight: 600;
+  font-size: 1.05rem;
+  color: var(--text);
+}
+#env-radio button.selected {
+  background: rgba(56, 189, 248, 0.25);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+@media (max-width: 640px) {
+  #env-radio { grid-template-columns: repeat(2, 1fr); }
+  .hero-title { font-size: 2rem; }
+  .hero-card, .section-card { padding: 20px; }
+}
+
+/* Media blocks (mirror gr.Image with a label) */
+.media {
+  margin-top: 16px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.media .media-label {
+  font-size: 0.85rem;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.media img { display: block; width: 100%; height: auto; }
+.media .missing {
+  padding: 40px 16px;
+  text-align: center;
+  color: var(--text-subdued);
+}
+
+/* Roadmap checkboxes */
+.roadmap label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 16px;
+  margin-bottom: 8px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.roadmap input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+code {
+  background: var(--panel-2);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <nav class="tab-nav" role="tablist">
+    <button class="active" data-tab="main">🏠 Main</button>
+    <button data-tab="zoo">📚 Environment Zoo &amp; Benchmark Taxonomy</button>
+    <button data-tab="roadmap">🗺️ Project Roadmap</button>
+  </nav>
+
+  <!-- ============================== TAB 1: MAIN ============================== -->
+  <section class="tabitem active" id="tab-main">
+
+    <!-- 1. HERO HEADER -->
+    <div class="hero-card">
+      <div class="hero-title">Orthographic World Models</div>
+      <div class="hero-subtitle">Diffusion Generative Neural Game Engines with Multi-player, Multi-View &amp; Orthographic Representations</div>
+      <div class="badge-container">
+        <span class="badge">Diffusion Generative World Models</span>
+        <span class="badge">Multi-View Physics Simulator</span>
+        <span class="badge">Reinforcement Learning</span>
+      </div>
+    </div>
+
+    <!-- 2. INTRODUCTION & MOTIVATION -->
+    <div class="section-card">
+      <h1>📖 Introduction &amp; Motivation</h1>
+
+      <h3>🌐 What is an Orthographic World Model?</h3>
+      <p><strong>Orthographic World Models (OWMs)</strong> are generative neural game engines and world models trained on synchronized <strong>multi-perspective and orthographic representations</strong> of physical game environments.</p>
+      <p>Unlike conventional single-perspective world models (e.g. FPV-only or static camera models), OWMs decompose complex 3D environments into synchronized orthogonal projections (<strong>Top-Down Plan View, Orthographic Front View, Orthographic Side View</strong>) alongside first-person perspective (<strong>FPV</strong>) streams.</p>
+
+      <hr>
+
+      <h3>💡 Motivation: Why Are Multi-Views Needed?</h3>
+
+      <h4>1. 🙈 Disambiguating Visual Occlusions &amp; Frustum Loss</h4>
+      <p>In single-perspective first-person or third-person views, critical game state objects frequently drift out-of-frame or become occluded by obstacles.</p>
+      <ul>
+        <li><strong>Top-Down Plan View</strong> ($X-Y$) maintains an unclipped global topological map of the entire arena.</li>
+        <li><strong>Orthographic Elevation Views</strong> ($X-Z$ &amp; $Y-Z$) preserve height distributions, jumping arcs, and vertical hazards.</li>
+      </ul>
+
+      <h4>2. 📐 Metric Scale &amp; Linear Spatial Kinematics</h4>
+      <p>Perspective projection applies non-linear perspective division ($x' = f \cdot X / Z$), distorting object sizes, velocities, and distance perception as objects move relative to the camera focal length.</p>
+      <ul>
+        <li>Orthographic projections preserve <strong>exact linear scale everywhere in the frame</strong>.</li>
+        <li>Physical velocities ($\Delta x / \Delta t$) and bounding box collision volumes remain <strong>invariant to distance</strong>, providing far cleaner spatial gradients for neural policy networks and latent generative diffusion models.</li>
+      </ul>
+
+      <h4>3. 🤝 Multi-Agent &amp; Cross-View Consistency</h4>
+      <p>In multi-agent environments (e.g., <em>Drone Dogfight</em>, <em>MultiCar Racing</em>), individual agents operate with local egocentric FPV views. Orthographic multi-views provide a canonical global coordinate space that allows world models to maintain unified cross-view physics consistency and prevent hallucinations during long-rollout neural simulation.</p>
+    </div>
+
+    <!-- 3. SYNCHRONIZED 4-VIEW ROLLOUT SHOWCASE -->
+    <div class="section-card">
+      <h1>🎥 Synchronized 4-View Environment Rollouts</h1>
+      <p>Select an environment below to view its synchronized <strong>Multi-View Rollout Animation</strong> (Top-Down Plan | 3D FPV | Orthographic Rear | Orthographic Right Side).</p>
+
+      <div class="env-radio-label">Select Environment</div>
+      <div id="env-radio" role="radiogroup"></div>
+
+      <hr>
+
+      <div class="media">
+        <div class="media-label">Orthographic Multi-View Environments</div>
+        <img id="gif-player" alt="Multi-view rollout">
+        <div class="missing" id="gif-missing" hidden>GIF not found</div>
+      </div>
+    </div>
+
+    <!-- 4. MULTI-AGENT & MULTI-VIEW NEURAL SIMULATION -->
+    <div class="section-card">
+      <h1>🏎️ Multi-Agent &amp; Multi-View Game Engine</h1>
+      <p>Orthographic World Models naturally scale to <strong>multi-agent competitive and cooperative scenarios</strong>, where multiple autonomous entities interact simultaneously in shared 3D space.</p>
+
+      <h3>Key Multi-Agent Capabilities:</h3>
+      <p>✅ <strong>Joint Egocentric &amp; Allocentric Perception</strong>: Combines egocentric FPV perspectives with global allocentric orthographic channels so agents can reason about opponent positions both locally and globally.</p>
+      <p>✅ <strong>Cross-Agent Spatial Physics Grounding</strong>: Maintains accurate collision boundaries, overtaking trajectories, and slipstream physics across multi-car racing and aerial drone combat.</p>
+      <p>✅ <strong>Synchronized Generative Rollouts</strong>: Enables diffusion world models to roll out multi-agent state predictions across all camera channels concurrently without inter-view divergence.</p>
+      <p>✅ <strong>Minimap &amp; Localisation Support</strong>: Provides real-time top-down plan views that serve as active in-game minimaps for tactical planning, localisation &amp; multi-agent navigation.</p>
+
+      <div class="media optional">
+        <div class="media-label">MultiCarRacing — Multi-View Rollout (CarRacing Re-imagined)</div>
+        <img src="assets/multicar_dual_agent_run.gif" alt="MultiCarRacing multi-view rollout">
+      </div>
+    </div>
+
+    <!-- 5. DIFFUSION GAME ENGINES & MULTI-VIEW WORLD MODELS -->
+    <div class="section-card">
+      <h1>🌍 Diffusion Game Engines &amp; Multi-View World Models</h1>
+      <p>Traditional generative world models typically rely on a single viewpoint, which often leads to issues with occlusion, poor spatial reasoning, and "hallucinated" physics. <strong>Orthographic Multi-View World Models</strong> are proposed to overcome these limitations by forcing the underlying AI to learn and maintain the true 3D geometry of its environment.</p>
+      <p>By leveraging <strong>Latent Diffusion Models (LDMs)</strong> to function as interactive Generative Game Engines, this architecture performs <strong>joint multi-view diffusion</strong> across four distinct perspectives.</p>
+
+      <h3>Key Benefits &amp; Objectives:</h3>
+      <ol>
+        <li><p><strong>Enforcing 3D Geometric Consistency</strong>: Utilizing cross-view spatial attention mechanisms ensures the different camera angles never contradict each other. This forces the diffusion model to learn robust, real-world physics and accurate 3D structures, rather than superficial 2D pixel approximations.</p></li>
+        <li><p><strong>Stable Long-Horizon Simulation</strong>: Conditioned on historical action sequences ($a_{t-k:t}$) and previous frame memories ($x_{t-1}$), the multi-view geometric constraints act as an anchor. This drastically reduces the autoregressive drift and visual degradation usually seen in generative engines over time.</p></li>
+        <li><p><strong>A Unified Neural Physics Engine</strong>: The ultimate purpose is to bypass traditional rendering and physics pipelines entirely. This approach directly synthesizes complex spatial collisions, terrain modifications, and dynamic interactions purely from learned neural representations, requiring absolutely no hardcoded rules.</p></li>
+      </ol>
+
+      <div class="media optional">
+        <img src="assets/diffusion_training_progression.gif" alt="Diffusion training progression">
+      </div>
+    </div>
+
+    <!-- 6. SCALING LAWS & ENVIRONMENT DIVERSITY -->
+    <div class="section-card">
+      <h1>📈 Scaling Law Experiments &amp; Game Environment Diversity [TBD]</h1>
+      <p>A fundamental question in generative world modeling is how multi-view neural game engines scale as the diversity of training environments increases.</p>
+
+      <h3>Key Empirical Observations:</h3>
+      <ul>
+        <li><strong>Log-Linear Fidelity Gains</strong>: Visual reconstruction quality (PSNR in dB) improves steadily as the model is trained across a wider spectrum of environment mechanics, approaching a diminishing returns frontier around 50 games.</li>
+        <li><strong>Emergent Zero-Shot Generalization</strong>: Zero-shot transfer to unseen physics tasks exhibits an emergent S-curve—scaling from 12.5% on single-environment baseline training to &gt;90% when trained on multi-environment benchmarks.</li>
+        <li><strong>Task-Agnostic 3D Spatial Priors</strong>: Broad multi-view exposure forces the latent diffusion backbone to encode fundamental 3D geometric constraints rather than overfitting to environment-specific visual artifacts.</li>
+      </ul>
+
+      <div class="media optional">
+        <img src="assets/scaling_law_envs.png" alt="Scaling with number of environments">
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== TAB 2: ENVIRONMENT ZOO ============================== -->
+  <section class="tabitem" id="tab-zoo">
+    <div class="section-card">
+      <h1>📚 Environment Zoo &amp; Benchmark Taxonomy</h1>
+      <p>Below is the full catalog of continuous and discrete benchmark environments designed for multi-view evaluation.</p>
+      <div id="zoo-content">Loading…</div>
+    </div>
+  </section>
+
+  <!-- ============================== TAB 3: ROADMAP ============================== -->
+  <section class="tabitem" id="tab-roadmap">
+    <div class="section-card roadmap">
+      <h1>🗺️ Orthographic World Models — Development Roadmap</h1>
+      <p>Interactive progress tracking across core milestones from Box2D environment creation to PPO agent training and Latent Diffusion World Models.</p>
+      <div id="roadmap-checks"></div>
+      <div id="roadmap-summary"></div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+// Environment -> GIF (mirrors GIF_MAP in app.py)
+const GIF_MAP = {
+  "CarRacing 🏎️": "assets/CarRacing_grid.gif",
+  "Mario Escape 🍄": "assets/Mario_Escape_grid.gif",
+  "Wrecking Ball 🏗️": "assets/Wrecking_Ball_grid.gif",
+  "Drone Dogfight 🚁": "assets/Drone_Dogfight_grid.gif",
+  "Bipedal Walker 🤖": "assets/Bipedal_Walker_grid.gif",
+  "Lunar Lander 🚀": "assets/Lunar_Lander_grid.gif",
+};
+const DEFAULT_ENV = "CarRacing 🏎️";
+
+const ROADMAP = [
+  "Create Box2D Game Environments (Extruded 3D Projections)",
+  "Check: Game State Space, Action Space & Reward Function Engineering",
+  "Train PPO Expert Policy Reinforcement Learning Agents",
+  "Collect Multi-View Dataset Rollouts with Trained PPO Agents",
+  "Train Diffusion World Models (Joint Denoising Engine)",
+];
+
+// --- Tabs ---
+document.querySelectorAll(".tab-nav button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-nav button").forEach(b => b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".tabitem").forEach(t => t.classList.toggle("active", t.id === "tab-" + btn.dataset.tab));
+  });
+});
+
+// --- Environment picker (mirrors env_select.change -> load_gif) ---
+const player = document.getElementById("gif-player");
+const missing = document.getElementById("gif-missing");
+player.addEventListener("load", () => { player.hidden = false; missing.hidden = true; });
+player.addEventListener("error", () => { player.hidden = true; missing.hidden = false; });
+
+function loadGif(env) {
+  player.src = GIF_MAP[env] || GIF_MAP[DEFAULT_ENV];
+  document.querySelectorAll("#env-radio button").forEach(b => {
+    const on = b.dataset.env === env;
+    b.classList.toggle("selected", on);
+    b.setAttribute("aria-checked", on);
+  });
+}
+const radio = document.getElementById("env-radio");
+Object.keys(GIF_MAP).forEach(env => {
+  const b = document.createElement("button");
+  b.textContent = env;
+  b.dataset.env = env;
+  b.setAttribute("role", "radio");
+  b.addEventListener("click", () => loadGif(env));
+  radio.appendChild(b);
+});
+loadGif(DEFAULT_ENV);
+
+// Optional media: hide the whole block when the file is absent (as app.py does with os.path.exists)
+document.querySelectorAll(".media.optional img").forEach(img => {
+  img.addEventListener("error", () => { img.closest(".media").hidden = true; });
+});
+
+// --- Roadmap (mirrors update_roadmap) ---
+const checks = document.getElementById("roadmap-checks");
+const summary = document.getElementById("roadmap-summary");
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function updateRoadmap() {
+  const states = [...checks.querySelectorAll("input")].map(c => c.checked);
+  const done = states.filter(Boolean).length;
+  const pct = Math.floor((done / states.length) * 100);
+  let html = `<h3>📊 Project Progress: <code>${done}/${states.length} Milestones Completed (${pct}%)</code></h3><ul>`;
+  ROADMAP.forEach((title, i) => {
+    const icon = states[i] ? "✅" : "⏳";
+    const status = states[i] ? "<strong>Completed</strong>" : "<em>In Progress / Pending</em>";
+    html += `<li>${icon} <strong>Step ${i + 1}: ${escapeHtml(title)}</strong> — ${status}</li>`;
+  });
+  summary.innerHTML = html + "</ul>";
+}
+ROADMAP.forEach((title, i) => {
+  const label = document.createElement("label");
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = true;
+  cb.addEventListener("change", updateRoadmap);
+  label.append(cb, `${i + 1}. ${title}`);
+  checks.appendChild(label);
+});
+updateRoadmap();
+
+// --- Math + Environment Zoo markdown (mirrors load_description_text) ---
+function renderMath(el) {
+  renderMathInElement(el, {
+    delimiters: [{ left: "$$", right: "$$", display: true }, { left: "$", right: "$", display: false }],
+    throwOnError: false,
+  });
+}
+window.addEventListener("DOMContentLoaded", () => {
+  renderMath(document.getElementById("tab-main"));
+
+  const zoo = document.getElementById("zoo-content");
+  fetch("assets/game_envs_descriptions.md")
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
+    .then(md => { zoo.innerHTML = marked.parse(md); renderMath(zoo); })
+    .catch(() => { zoo.textContent = "Environment description file not found."; });
+});
+</script>
+</body>
+</html>
