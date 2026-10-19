@@ -92,19 +92,34 @@ def decode_latents_to_views(vae, latents):
 # ORTHO -> FPV PROJECTOR (camera-pose conditioned)
 # ==========================================
 POSE_COMMANDS = ["Center", "Up", "Down", "Left", "Right"]
-POSE_DIM = len(POSE_COMMANDS) + 6  # command one-hot + sin/cos of (yaw, pitch, roll)
+# Fixed env list (same names as `_build_registry`), so env indices don't shift when an env fails to register
+ENV_NAMES = [
+    "Bipedal Walker", "Lunar Lander", "MultiCar Racing", "Mario Escape", "Drone Dogfight",
+    "Excavator", "Tank Duel", "Catapult War", "Robot Sumo", "Mountain Goat",
+    "Wrecking Ball", "Toxic Gas Escape", "Rescue Ambulance", "Parkour Runner", "Snowball Fight",
+]
+# command one-hot + sin/cos of (yaw, pitch, roll) + signed-log (x, y, z) + env one-hot
+POSE_DIM = len(POSE_COMMANDS) + 6 + 3 + len(ENV_NAMES)
 
-def encode_camera_poses(camera_poses, target_device=device):
+def encode_camera_poses(camera_poses, env_names=None, target_device=device):
     """
-    List of B camera-state dicts (from the buffer) -> (B, POSE_DIM) float tensor.
+    List of B camera-state dicts (from the buffer) [+ B env names] -> (B, POSE_DIM) float tensor.
     Angles are radians and yaw accumulates without bound, so they are encoded as sin/cos.
+    Camera x/y/z are unbounded world coordinates, so they are squashed with sign(p) * log(1 + |p|).
+    The env one-hot goes through the projector's pose MLP, i.e. it acts as a learned env embedding
+    (each env has its own FPV fov / orbit pivot / ortho scale); unknown or missing envs are all-zero.
     """
+    if env_names is None:
+        env_names = [None] * len(camera_poses)
     feats = []
-    for cam in camera_poses:
+    for cam, env_name in zip(camera_poses, env_names):
         cam = cam or {}
         one_hot = [1.0 if cam.get("command", "Center") == c else 0.0 for c in POSE_COMMANDS]
         angles = [float(cam.get(k, 0.0)) for k in ("yaw", "pitch", "roll")]
-        feats.append(one_hot + [math.sin(a) for a in angles] + [math.cos(a) for a in angles])
+        position = [float(cam.get(k, 0.0)) for k in ("x", "y", "z")]
+        position = [math.copysign(math.log1p(abs(p)), p) for p in position]
+        env_one_hot = [1.0 if env_name == e else 0.0 for e in ENV_NAMES]
+        feats.append(one_hot + [math.sin(a) for a in angles] + [math.cos(a) for a in angles] + position + env_one_hot)
     return torch.tensor(feats, dtype=torch.float32, device=target_device)
 
 class OrthoProjector(nn.Module):
@@ -249,6 +264,7 @@ def train_ortho_trajectory_step(
     latents_next_seq,
     prompt_embeds_seq,
     camera_poses_seq,
+    env_names_seq=None,
     shift=3.0,
     teacher_forcing_prob=0.5,
     ctx_noise_max=0.15,
@@ -262,7 +278,7 @@ def train_ortho_trajectory_step(
     - Backpropagates `(loss_s / seq_len)` at each step so peak VRAM remains constant.
     - Jointly trains the 4 per-view projectors to match inference, where they see the DiT's predicted
       `next_latents`: inputs are the DiT's own x0 estimate `pred_x0` at t+1, targets are the GT views
-      at t+1, conditioned on the FPV camera pose at t+1. `pred_x0` is detached, so no gradient reaches the DiT.
+      at t+1, conditioned on the FPV camera pose + env at t+1. `pred_x0` is detached, so no gradient reaches the DiT.
     """
     seq_len = len(latents_next_seq)
     num_views = latents_t0.shape[2]
@@ -304,7 +320,8 @@ def train_ortho_trajectory_step(
         # Projectors: DiT's predicted views at t+1 (like `next_latents` at inference) + FPV pose at t+1 -> GT views at t+1
         gt_next = target_latents.detach().float()
         gt_top_next, gt_side_next, gt_rear_next, gt_fpv_next = gt_next[:, :, 0], gt_next[:, :, 1], gt_next[:, :, 2], gt_next[:, :, 3]
-        pose_next = encode_camera_poses(camera_poses_seq[s], target_device=gt_next.device)
+        env_names_next = env_names_seq[s] if env_names_seq is not None else None
+        pose_next = encode_camera_poses(camera_poses_seq[s], env_names=env_names_next, target_device=gt_next.device)
 
         pred_next = pred_x0.detach().float()
         pred_top, pred_side, pred_rear, pred_fpv = pred_next[:, :, 0], pred_next[:, :, 1], pred_next[:, :, 2], pred_next[:, :, 3]
@@ -484,10 +501,13 @@ def autoregressive_rollout(
         # collection); read before a possible reset so it belongs to the rendered GT frame
         pose_next = encode_camera_poses([{
             "command": sample_cam["command"],
+            "x": getattr(env, "cam_x", 0.0),
+            "y": getattr(env, "cam_y", 0.0),
+            "z": getattr(env, "cam_z", 0.0),
             "yaw": getattr(env, "cam_yaw", 0.0),
             "pitch": getattr(env, "cam_pitch", 0.0),
             "roll": getattr(env, "cam_roll", 0.0),
-        }])
+        }], env_names=[sample_env])
 
         if terminated or truncated:
             env.reset()
@@ -788,7 +808,7 @@ def main(args):
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     # Ortho (top, side, rear) -> FPV projector
-    top_projector = OrthoProjector(hidden=args.proj_hidden, hw=96 // 8).to(device)
+    top_projector = OrthoProjectorAttn(hidden=args.proj_hidden, hw=96 // 8).to(device)  # pose-dependent inverse-perspective mapping from the FPV
     side_projector = OrthoProjector(hidden=args.proj_hidden, hw=96 // 8).to(device)
     rear_projector = OrthoProjector(hidden=args.proj_hidden, hw=96 // 8).to(device)
     fpv_projector = OrthoProjectorAttn(hidden=args.proj_hidden, hw=96 // 8).to(device)  # pose-dependent spatial mapping for the orbiting FPV
@@ -880,6 +900,7 @@ def main(args):
                 latents_next_seq=latents_next_seq,
                 prompt_embeds_seq=prompt_embeds_seq,
                 camera_poses_seq=camera_poses_seq,
+                env_names_seq=env_names_seq,
                 teacher_forcing_prob=curr_teacher_forcing_prob,
                 ctx_noise_max=args.ctx_noise_max,
             )

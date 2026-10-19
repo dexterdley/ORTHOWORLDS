@@ -1,8 +1,8 @@
 """
 Pretraining the 4 per-view Ortho projectors on ground-truth Wan2.1 VAE latents.
 
-Each projector predicts one view from the other 3 views + the FPV camera pose (same timestep):
-  top_projector(fpv,  side, rear) -> top
+Each projector predicts one view from the other 3 views + the FPV camera pose and env (same timestep):
+  top_projector(fpv,  side, rear) -> top   (OrthoProjectorAttn: pose-dependent cross-attention)
   side_projector(top, rear, fpv)  -> side
   rear_projector(top, side, fpv)  -> rear
   fpv_projector(top,  side, rear) -> fpv   (OrthoProjectorAttn: pose-dependent cross-attention)
@@ -49,19 +49,21 @@ def train_projectors_step(
     side_projector,
     latents_next,
     camera_poses,
+    env_names=None,
     noise_std=0.1,
 ):
     """
     One supervised step for the 4 projectors on GT latents at a single timestep.
     latents_next: (B, C, 4, h, w) GT view latents (0: Top, 1: Side, 2: Rear, 3: FPV)
     camera_poses: list of B camera-state dicts (FPV pose of the same frames)
+    env_names: list of B env names (env embedding in the pose vector)
     Inputs get independent Gaussian noise per view (robustness to imperfect predicted views);
     targets stay clean.
     Returns: loss, per_view_losses [top, side, rear, fpv], zero_baseline, proj_latents (B, C, 4, h, w)
     """
     gt_next = latents_next.float()
     gt_top_next, gt_side_next, gt_rear_next, gt_fpv_next = gt_next[:, :, 0], gt_next[:, :, 1], gt_next[:, :, 2], gt_next[:, :, 3]
-    pose_next = encode_camera_poses(camera_poses, target_device=gt_next.device)
+    pose_next = encode_camera_poses(camera_poses, env_names=env_names, target_device=gt_next.device)
 
     noisy_next = gt_next + torch.randn_like(gt_next) * noise_std
     noisy_top, noisy_side, noisy_rear, noisy_fpv = noisy_next[:, :, 0], noisy_next[:, :, 1], noisy_next[:, :, 2], noisy_next[:, :, 3]
@@ -128,7 +130,7 @@ def main(args):
     vae.eval()
 
     # 3. Projectors & Optimizer
-    top_projector = OrthoProjector(hidden=args.proj_hidden, hw=96 // 8).to(device)  # 96x96 views -> 12x12 Wan latents
+    top_projector = OrthoProjectorAttn(hidden=args.proj_hidden, hw=96 // 8).to(device)  # 96x96 views -> 12x12 Wan latents; pose-dependent inverse-perspective mapping from the FPV
     side_projector = OrthoProjector(hidden=args.proj_hidden, hw=96 // 8).to(device)
     rear_projector = OrthoProjector(hidden=args.proj_hidden, hw=96 // 8).to(device)
     fpv_projector = OrthoProjectorAttn(hidden=args.proj_hidden, hw=96 // 8).to(device)  # pose-dependent spatial mapping for the orbiting FPV
@@ -162,8 +164,8 @@ def main(args):
         pbar = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch+1}/{args.epochs}")
 
         for _ in pbar:
-            # Single-step batch: views at t+1 and the FPV camera pose they were rendered with
-            _, views_next_seq, _, _, camera_poses_seq = buffer.sample_trajectory_batch(
+            # Single-step batch: views at t+1, their env and the FPV camera pose they were rendered with
+            _, views_next_seq, _, env_names_seq, camera_poses_seq = buffer.sample_trajectory_batch(
                 batch_size=args.batch_size,
                 seq_len=1,
             )
@@ -180,6 +182,7 @@ def main(args):
                 side_projector=side_projector,
                 latents_next=latents_next,
                 camera_poses=camera_poses_seq[0],
+                env_names=env_names_seq[0],
                 noise_std=args.noise_std,
             )
             loss.backward()
