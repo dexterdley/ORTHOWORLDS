@@ -1,11 +1,6 @@
 """
 Fine-tuning Wan2.1-1.3B with LoRA for Orthographic Multi-View World Modeling.
-
-Learns conditional cross-view distributions:
-  P(top_{t+1}  | rear_{t+1}, side_{t+1}, 3D_{t+1}, views_t)
-  P(rear_{t+1} | top_{t+1},  side_{t+1}, 3D_{t+1}, views_t)
-  P(side_{t+1} | top_{t+1},  rear_{t+1}, 3D_{t+1}, views_t)
-  P(3D_{t+1}   | top_{t+1},  rear_{t+1}, side_{t+1}, views_t)
+This code serves as a single view baseline.
 
 Uses:
   - Wan2.1-T2V-1.3B-Diffusers pipeline
@@ -28,7 +23,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 # HuggingFace & Diffusers imports
-from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose
+from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose, _psnr
 from buffer import OrthoTransitionBuffer
 
 from stable_baselines3 import PPO
@@ -67,7 +62,6 @@ def encode_views_to_latents(vae, views_tensor, out_dtype=None):
         latents = latents.to(dtype=out_dtype)
     return latents
 
-
 def decode_latents_to_views(vae, latents):
     """
     Unnormalizes and decodes 4 orthographic views latents back into image tensors.
@@ -87,7 +81,6 @@ def decode_latents_to_views(vae, latents):
     views = decoded.view(b, num_views, 3, decoded.shape[-2], decoded.shape[-1])
     views = torch.clamp((views + 1.0) / 2.0, 0.0, 1.0)
     return views
-
 
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
@@ -265,7 +258,7 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
 @torch.no_grad()
 def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, buffer, env_name=None, env=None, rollout_steps=16, steps=20):
     """
-    Autoregressive video rollout for all 4 orthographic views.
+    Autoregressive video rollout for single FPV view.
     The model is trained on FPV only (1 context frame -> 1 target frame), so each view is
     rolled out independently as its own batch item with the same 2-frame layout. Top/Side/Rear
     rollouts therefore test how an FPV-only model generalizes to unseen views.
@@ -408,7 +401,7 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
     unique_envs = ['Bipedal Walker', 'Lunar Lander', 'MultiCar Racing']
     reg_dict = dict(_build_registry())
     
-    print(f"\n[VALIDATION] Running autoregressive video rollouts for epoch {epoch} across envs: {', '.join(unique_envs)}...")
+    print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch} across envs: {', '.join(unique_envs)}...")
 
     for env_idx, env_name in enumerate(unique_envs):
         env = reg_dict[env_name]()
@@ -428,10 +421,6 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
         )
 
         clean_tag = env_name.replace(" ", "_").lower()
-
-        def _psnr(pred, gt):
-            mse = F.mse_loss(pred, gt).item()
-            return 20.0 * math.log10(1.0) - 10.0 * math.log10(max(mse, 1e-8))
 
         psnr_top_down = _psnr(vid_top_down, vid_gt_top_down)
         psnr_rear     = _psnr(vid_rear, vid_gt_rear)

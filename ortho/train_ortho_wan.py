@@ -28,7 +28,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 # HuggingFace & Diffusers imports
-from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent,  _annotate_frame_pose
+from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent,  _annotate_frame_pose, _psnr
 from buffer import OrthoTransitionBuffer
 
 from stable_baselines3 import PPO
@@ -67,7 +67,6 @@ def encode_views_to_latents(vae, views_tensor, out_dtype=None):
         latents = latents.to(dtype=out_dtype)
     return latents
 
-
 def decode_latents_to_views(vae, latents):
     """
     Unnormalizes and decodes 4 orthographic views latents back into image tensors.
@@ -87,7 +86,6 @@ def decode_latents_to_views(vae, latents):
     views = decoded.view(b, num_views, 3, decoded.shape[-2], decoded.shape[-1])
     views = torch.clamp((views + 1.0) / 2.0, 0.0, 1.0)
     return views
-
 
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
@@ -152,7 +150,6 @@ def train_ortho_flow_step(
     # Reconstruct 1-step denoised prediction: x_0_hat = x_tau - tau * v_pred
     with torch.no_grad():
         pred_x0 = (noisy_latents_next_fp32 - tau_exp * pred_velocity.detach()).clamp(-6.0, 6.0)
-        # Weight confidence by (1 - tau) so highly noisy steps blend smoothly with GT
         confidence = (1.0 - tau_exp).clamp(0.2, 1.0)
         rollout_latent = (confidence * pred_x0 + (1.0 - confidence) * latents_next_fp32).to(dtype=transformer.dtype)
     return loss, [l.item() for l in per_view_losses], rollout_latent
@@ -259,7 +256,6 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
             timestep=t_tensor,
             encoder_hidden_states=prompt_embeds,
         ).sample[:, :, num_views : 2 * num_views].float()
-
         x_tau = x_tau - dt * pred_velocity
 
     return x_tau.to(dtype=transformer.dtype)
@@ -405,7 +401,7 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
     unique_envs = ['Bipedal Walker', 'Lunar Lander', 'MultiCar Racing']
     reg_dict = dict(_build_registry())
     
-    print(f"\n[VALIDATION] Running autoregressive video rollouts for epoch {epoch} across envs: {', '.join(unique_envs)}...")
+    print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch} across envs: {', '.join(unique_envs)}...")
 
     for env_idx, env_name in enumerate(unique_envs):
         env = reg_dict[env_name]()
@@ -425,10 +421,6 @@ def evaluate_and_log_videos(transformer, vae, buffer, text_encoder, tokenizer, w
         )
 
         clean_tag = env_name.replace(" ", "_").lower()
-
-        def _psnr(pred, gt):
-            mse = F.mse_loss(pred, gt).item()
-            return 20.0 * math.log10(1.0) - 10.0 * math.log10(max(mse, 1e-8))
 
         psnr_top_down = _psnr(vid_top_down, vid_gt_top_down)
         psnr_rear     = _psnr(vid_rear, vid_gt_rear)

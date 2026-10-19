@@ -1,4 +1,5 @@
 import os
+import math
 import cv2
 import random
 import numpy as np
@@ -6,6 +7,7 @@ import torch
 import torch.nn as nn
 from diffusers import WanPipeline
 from peft import LoraConfig, get_peft_model
+import torch.nn.functional as F
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
@@ -20,6 +22,10 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+def _psnr(pred, gt):
+    mse = F.mse_loss(pred, gt).item()
+    return -10.0 * math.log10(max(mse, 1e-8))
 
 # ==========================================
 # 1. ENVIRONMENT REGISTRY
