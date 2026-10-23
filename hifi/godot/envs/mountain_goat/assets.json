@@ -1,0 +1,10 @@
+{
+  "_comment": "Extra CC0 Poly Haven assets for the Mountain Goat hi-fi world (fetched by hifi/tools/fetch_assets.py).",
+  "hdris": {},
+  "textures": {
+    "cliff_side": "1k",
+    "aerial_rocks_02": "1k",
+    "rock_boulder_dry": "1k"
+  },
+  "models": {}
+}

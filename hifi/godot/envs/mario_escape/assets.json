@@ -1,0 +1,8 @@
+{
+  "_comment": "Extra CC0 Poly Haven assets for the Mario Escape hi-fi world (fetched by hifi/tools/fetch_assets.py).",
+  "hdris": {},
+  "textures": {
+    "bark_brown_02": "1k"
+  },
+  "models": {}
+}

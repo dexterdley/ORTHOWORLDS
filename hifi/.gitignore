@@ -1,0 +1,9 @@
+# Godot caches
+godot/.godot/
+multicar_racing/.godot/
+# Downloaded CC0 assets (hifi/tools/fetch_assets.py) and local Godot binaries (hifi/tools/get_godot.py)
+godot/assets/polyhaven/
+tools/bin/
+# Test outputs
+test_out/
+__pycache__/
