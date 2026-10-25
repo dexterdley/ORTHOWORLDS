@@ -589,7 +589,8 @@ def load_model(model_id="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", lora_rank=16):
     lora_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_rank * 2,
-        target_modules=["to_q", "to_k", "to_v", "to_out.0", "q_proj", "k_proj", "v_proj"],
+        # Self- and cross-attention plus the feed-forward layers of every block
+        target_modules=["to_q", "to_k", "to_v", "to_out.0", "ffn.net.0.proj", "ffn.net.2"],
         bias="none",
     )
     transformer = get_peft_model(transformer, lora_config)

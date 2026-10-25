@@ -106,8 +106,7 @@ With `aov=("rgb", "mask")` each view also has a flat-colour mask:
 
 The id and class tables come from the world, available as `renderer.mask_table`. `render_masks(target)`
 accepts ids, classes, exporter `mask_groups`, or int obstacle indices, matching the GymBox
-`render_masks()` targets for Parkour, Snowball and Rescue. The masks can replace the luminance
-threshold in voxel carving.
+`render_masks()` targets for Parkour, Snowball and Rescue.
 
 ## Determinism
 

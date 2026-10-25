@@ -1,0 +1,768 @@
+"""
+Fine-tuning Wan2.1-1.3B with LoRA for Orthographic Multi-View World Modeling.
+
+Learns conditional cross-view distributions:
+  P(top_{t+1}  | rear_{t+1}, side_{t+1}, 3D_{t+1}, views_t)
+  P(rear_{t+1} | top_{t+1},  side_{t+1}, 3D_{t+1}, views_t)
+  P(side_{t+1} | top_{t+1},  rear_{t+1}, 3D_{t+1}, views_t)
+  P(3D_{t+1}   | top_{t+1},  rear_{t+1}, side_{t+1}, views_t)
+
+`--views fpv` trains the FPV-only baseline with the same code, data and settings (same training as
+train_single_wan.py), so the two arms of the FPV-only vs multi-view comparison differ only in the views modelled.
+
+Uses:
+  - Wan2.1-T2V-1.3B-Diffusers pipeline
+  - Frozen UMT5 text encoder
+  - Trainable PEFT LoRA on WanTransformer3DModel
+"""
+
+import os
+import math
+import random
+import argparse
+import json
+from datetime import datetime
+from tqdm import tqdm
+
+import numpy as np
+import cv2
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+
+# HuggingFace & Diffusers imports
+from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent,  _annotate_frame_pose, _psnr
+from buffer import OrthoTransitionBuffer
+
+from stable_baselines3 import PPO
+from huggingface_sb3 import load_from_hub
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
+
+"""
+Ideas to try
+Train FPV conditioned on the other views. The script's docstring says it learns P(3D_{t+1} | top_{t+1}, side_{t+1}, rear_{t+1}, views_t), but the code doesn't do that: all four targets are noised together and denoised jointly. Instead, during training, randomly give some target views to the model clean, and compute the loss only on the noisy ones. At inference, generate top/side/rear first and then FPV with those as conditioning. The simple orthographic views then act as a layout guide for the next FPV frame, which is the clearest way for them to help.
+"""
+
+# View order everywhere (buffer, renders, latents): 0 Top, 1 Side, 2 Rear, 3 FPV. FPV is always the last modelled view.
+VIEW_NAMES = ["Top", "Side", "Rear", "3D_FPV"]
+VIEW_IDX = {"all": (0, 1, 2, 3), "fpv": (3,)}
+FPV_IDX = 3
+# TensorBoard names per view (scalar tag, video tag), unchanged from the earlier scripts so old and new runs line up
+VIEW_TAGS = {"Top": ("Top Down", "Top-Down"), "Side": ("Side", "Side"), "Rear": ("Rear", "Rear"), "3D_FPV": ("FPV", "FPV")}
+
+# ==========================================
+# WAN 2.1 HELPERS
+# ==========================================
+def _get_wan_latent_stats(vae, target_device, target_dtype):
+    """Retrieves per-channel mean and std from AutoencoderKLWan config."""
+    if hasattr(vae.config, "latents_mean") and vae.config.latents_mean is not None:
+        mean = torch.tensor(vae.config.latents_mean, device=target_device, dtype=target_dtype).view(1, -1, 1, 1, 1)
+        std = torch.tensor(vae.config.latents_std, device=target_device, dtype=target_dtype).view(1, -1, 1, 1, 1)
+    return mean, std
+
+def encode_views_to_latents(vae, views_tensor, out_dtype=None):
+    """
+    Encodes 4 orthographic views into normalized Wan 3D VAE latents ~ N(0, I).
+    views_tensor: (B, 4, 3, H, W) in [-1, 1] -> Latents: (B, 16, 4, h, w)
+    """
+    b, num_views, c, h, w = views_tensor.shape
+    flat_views = views_tensor.view(b * num_views, c, 1, h, w)
+
+    with torch.no_grad():
+        latent_dist = vae.encode(flat_views.to(dtype=vae.dtype)).latent_dist
+        latents = latent_dist.mode() if hasattr(latent_dist, "mode") else latent_dist.sample()
+        mean, std = _get_wan_latent_stats(vae, latents.device, latents.dtype)
+        latents = (latents - mean) / std
+
+    _, c_lat, _, h_lat, w_lat = latents.shape
+    latents = latents.view(b, num_views, c_lat, h_lat, w_lat).permute(0, 2, 1, 3, 4)
+    if out_dtype is not None:
+        latents = latents.to(dtype=out_dtype)
+    return latents
+
+def decode_latents_to_views(vae, latents):
+    """
+    Unnormalizes and decodes 4 orthographic views latents back into image tensors.
+    latents: (B, C_lat, 4, h_lat, w_lat) -> (B, 4, 3, H, W) in [0, 1]
+    """
+    b, c_lat, num_views, h_lat, w_lat = latents.shape
+    flat_latents = latents.permute(0, 2, 1, 3, 4).reshape(b * num_views, c_lat, 1, h_lat, w_lat)
+    flat_latents = flat_latents.to(dtype=vae.dtype)
+
+    mean, std = _get_wan_latent_stats(vae, flat_latents.device, flat_latents.dtype)
+    flat_latents = flat_latents * std + mean
+
+    with torch.no_grad():
+        decoded = vae.decode(flat_latents).sample  # (B * num_views, 3, 1, H, W)
+
+    decoded = decoded.squeeze(2)  # (B * num_views, 3, H, W)
+    views = decoded.view(b, num_views, 3, decoded.shape[-2], decoded.shape[-1])
+    views = torch.clamp((views + 1.0) / 2.0, 0.0, 1.0)
+    return views
+
+# ==========================================
+# MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
+# ==========================================
+def _order_targets(latents, target_order):
+    """
+    Orders the target block along the frame axis. 'mirror' reverses it so the FPV target (last view) sits right
+    after the FPV context frame, the adjacent-frame layout Wan was pretrained on. Self-inverse; no-op for 1 view.
+    """
+    return latents.flip(2) if target_order == "mirror" else latents
+
+def train_ortho_flow_step(
+    transformer,
+    latents_t,
+    latents_next,
+    prompt_embeds,
+    shift=3.0,
+    ctx_noise_max=0.15,
+    target_order="same",
+):
+    """
+    Single transition Flow-Matching step (used inside multi-step trajectory rollout).
+    Applies mild context noise to `latents_t` to prevent autoregressive drift,
+    and optionally returns the model's reconstructed clean latent `pred_x0` at t+1.
+    """
+    b, c, num_views, h, w = latents_next.shape
+
+    # 1. Sample shifted logit-normal flow-matching timestep tau in (0, 1)
+    u = torch.randn(b, device=latents_next.device, dtype=torch.float32)
+    tau = torch.sigmoid(u)
+    tau = (shift * tau) / (1.0 + (shift - 1.0) * tau)
+    tau = tau.clamp(1e-4, 1.0 - 1e-4)
+    tau_exp = tau.view(b, 1, 1, 1, 1)
+
+    # 2. Context noise augmentation on conditioning views `latents_t`
+    latents_t_fp32 = latents_t.float()
+    tau_ctx = torch.rand((b, 1, 1, 1, 1), device=latents_t.device, dtype=torch.float32) * ctx_noise_max
+    ctx_noise = torch.randn_like(latents_t_fp32)
+    cond_latents_t = ((1.0 - tau_ctx) * latents_t_fp32 + tau_ctx * ctx_noise).to(dtype=transformer.dtype)
+
+    # 3. Noise all 4 target views at t+1 simultaneously
+    latents_next_fp32 = latents_next.float()
+    noise = torch.randn_like(latents_next_fp32)
+    noisy_latents_next_fp32 = (1.0 - tau_exp) * latents_next_fp32 + tau_exp * noise
+    noisy_latents_next = noisy_latents_next_fp32.to(dtype=transformer.dtype)
+
+    # 4. Concatenate conditioning views (frames 0:V) and noisy target views (frames V:2V)
+    combined_latents = torch.cat([cond_latents_t, _order_targets(noisy_latents_next, target_order)], dim=2)
+
+    # 5. Ground truth velocity: v_target = noise - x_0
+    target_velocity = noise - latents_next_fp32
+
+    # 6. DiT Forward pass
+    timesteps = (tau * 1000.0).to(dtype=transformer.dtype)
+    model_pred = transformer(
+        hidden_states=combined_latents,
+        timestep=timesteps,
+        encoder_hidden_states=prompt_embeds,
+    ).sample
+
+    # 7. Supervise target views at t+1 (indices num_views:2*num_views), back in view order
+    pred_velocity = _order_targets(model_pred[:, :, num_views : 2 * num_views], target_order).float()
+
+    per_view_losses = [
+        F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
+        for idx in range(num_views)
+    ]
+    # Every view's loss has weight 1, so the FPV term is the same as in an FPV-only run
+    loss = sum(per_view_losses)
+
+    # Reconstruct 1-step denoised prediction: x_0_hat = x_tau - tau * v_pred
+    with torch.no_grad():
+        pred_x0 = (noisy_latents_next_fp32 - tau_exp * pred_velocity.detach()).clamp(-6.0, 6.0)
+        confidence = (1.0 - tau_exp).clamp(0.2, 1.0)
+        rollout_latent = (confidence * pred_x0 + (1.0 - confidence) * latents_next_fp32).to(dtype=transformer.dtype)
+    return loss, [l.item() for l in per_view_losses], rollout_latent
+
+def train_ortho_trajectory_step(
+    transformer,
+    latents_t0,
+    latents_next_seq,
+    prompt_embeds_seq,
+    shift=3.0,
+    teacher_forcing_prob=0.5,
+    ctx_noise_max=0.15,
+    target_order="same",
+):
+    """
+    Unrolls a multi-step trajectory of length `seq_len` during training.
+    - At step s=0, conditions on ground-truth `latents_t0`.
+    - At step s>0, with probability `teacher_forcing_prob`, conditions on the model's own predicted
+      latent from step s-1 (student forcing) so the model learns to recover from its
+      own rollout errors over multi-step horizons.
+    - Backpropagates `(loss_s / seq_len)` at each step so peak VRAM remains constant.
+    """
+    seq_len = len(latents_next_seq)
+    num_views = latents_t0.shape[2]
+
+    curr_latents = latents_t0
+    total_loss = 0.0
+    avg_per_view = [0.0] * num_views
+
+    for s in range(seq_len):
+        target_latents = latents_next_seq[s]
+        prompt_embeds = prompt_embeds_seq[s]
+        is_last_step = (s == seq_len - 1)
+
+        if not is_last_step:
+            step_loss, step_view_losses, pred_next_latents = train_ortho_flow_step(
+                transformer=transformer,
+                latents_t=curr_latents,
+                latents_next=target_latents,
+                prompt_embeds=prompt_embeds,
+                shift=shift,
+                ctx_noise_max=ctx_noise_max,
+                target_order=target_order,
+            )
+        else:
+            step_loss, step_view_losses, _ = train_ortho_flow_step(
+                transformer=transformer,
+                latents_t=curr_latents,
+                latents_next=target_latents,
+                prompt_embeds=prompt_embeds,
+                shift=shift,
+                ctx_noise_max=ctx_noise_max,
+                target_order=target_order,
+            )
+
+        # Normalize loss across trajectory length and backpropagate immediately to save VRAM
+        scaled_loss = step_loss / float(seq_len)
+        scaled_loss.backward()
+
+        total_loss += step_loss.item() / float(seq_len)
+        for v_idx in range(num_views):
+            avg_per_view[v_idx] += step_view_losses[v_idx] / float(seq_len)
+
+        # Prepare context for step s + 1 (Student Forcing vs. Teacher Forcing per sample)
+        if not is_last_step:
+            if teacher_forcing_prob > 0.0:
+                b = curr_latents.shape[0]
+                use_ar_mask = (torch.rand((b, 1, 1, 1, 1), device=curr_latents.device) < teacher_forcing_prob).to(dtype=transformer.dtype)
+                curr_latents = use_ar_mask * pred_next_latents + (1.0 - use_ar_mask) * target_latents
+            else:
+                curr_latents = target_latents
+
+    return total_loss, avg_per_view
+
+# ==========================================
+# AUTOREGRESSIVE VIDEO ROLLOUT & SAMPLING
+# ==========================================
+@torch.no_grad()
+def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, shift=3.0, target_order="same"):
+    """
+    Jointly denoises the V modelled views at t+1 via reverse Euler Flow Matching.
+    `target_order` must match the one the checkpoint was trained with.
+    Input:
+      latents_t: (B, C, V, h, w) - clean past views at time t
+    Output:
+      latents_next: (B, C, V, h, w) - predicted views at time t+1
+    """
+    b, c, num_views, h, w = latents_t.shape
+    latents_t = latents_t.to(dtype=transformer.dtype)
+
+    # Keep Euler state in float32 to prevent bfloat16 rounding stagnation
+    x_tau = torch.randn((b, c, num_views, h, w), device=latents_t.device, dtype=torch.float32)
+
+    # Shifted timestep schedule from 1.0 -> 0.0
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=latents_t.device, dtype=torch.float32)
+    sigmas = (shift * sigmas) / (1.0 + (shift - 1.0) * sigmas)
+
+    for step_i in range(steps):
+        sigma_curr = sigmas[step_i]
+        sigma_next = sigmas[step_i + 1]
+        dt = sigma_curr - sigma_next
+
+        t_tensor = torch.full((b,), sigma_curr * 1000.0, device=latents_t.device, dtype=transformer.dtype)
+        combined = torch.cat([latents_t, _order_targets(x_tau.to(dtype=transformer.dtype), target_order)], dim=2)  # (B, C, 2V, h, w)
+
+        pred_velocity = _order_targets(transformer(
+            hidden_states=combined,
+            timestep=t_tensor,
+            encoder_hidden_states=prompt_embeds,
+        ).sample[:, :, num_views : 2 * num_views], target_order).float()
+        x_tau = x_tau - dt * pred_velocity
+
+    return x_tau.to(dtype=transformer.dtype)
+
+@torch.no_grad()
+def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, env_name, env, agent=None,
+                           rollout_steps=16, steps=20, camera_command="Right", seed=42,
+                           view_idx=VIEW_IDX["all"], target_order="same"):
+    """
+    Autoregressive video rollout of the views in `view_idx` (predicted jointly), holding `camera_command`
+    every step (e.g. a Right pan). The env is driven exactly like `collect_rollouts` (same policy, same render
+    order), so every prompt carries the env's real camera state for its target frame, as in training.
+    Returns:
+      gen: {view name: (1, T, 3, H, W) in [0, 1]} for each rolled-out view
+      gt:  {view name: (1, T, 3, H, W) in [0, 1]} ground truth for the same views
+      vis: (gen_fpv_vis, gt_fpv_vis) pose-annotated FPV videos for logging
+    """
+    transformer.eval()
+
+    obs, _ = env.reset(seed=seed)
+    obs = _skip_intro(env, env_name, obs)
+    env.action_space.seed(seed)  # random-action envs: every run validates on the same actions
+
+    # Same first render as collect_rollouts: "Center" is a no-op right after reset (yaw = pitch = 0)
+    img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
+
+    # Modelled views jointly as one sample: (1, V, 3, H, W) -> latents (1, C, V, h, w)
+    vt = [cv2.resize(x, (96, 96), interpolation=cv2.INTER_AREA) for x in [img_top, im_side, im_rear, im_fpv]]
+    vt = np.stack([np.transpose(vt[i], (2, 0, 1)) for i in view_idx])
+    vt = np.expand_dims(vt, axis=0)
+
+    curr_views = torch.from_numpy(vt).float().to(device) / 127.5 - 1.0
+    curr_latents = encode_views_to_latents(vae, curr_views, out_dtype=transformer.dtype)
+
+    gen = {VIEW_NAMES[i]: [] for i in view_idx}
+    gt = {VIEW_NAMES[i]: [] for i in view_idx}
+    gen_fpv_vis, gt_fpv_vis = [], []  # pose-annotated copies, for logged videos only
+
+    print(f"Starting {rollout_steps}-step Autoregressive Rollout for [{env_name}] (camera {camera_command})...")
+
+    for step_i in range(rollout_steps):
+        if hasattr(agent, "predict"):
+            action, _ = agent.predict(obs, deterministic=True)
+        else:
+            action = env.action_space.sample()
+        obs, _, terminated, truncated, _ = env.step(action)
+
+        # Render the GT target before predicting: training prompts use the camera state read right after this render
+        next_top, next_rear, next_side, next_fpv = env.render(camera_pose=camera_command)
+        cam_state = _camera_state(env, camera_command)
+
+        # Same float32 action vector the buffer stores (a scalar discrete action becomes length 1)
+        act = np.atleast_1d(np.asarray(action, dtype=np.float32))
+        prompt = compose_player_prompts(
+            [act],
+            env_name=env_name,
+            camera_pose=cam_state,
+        )
+
+        text_inputs = tokenizer(
+            prompt, padding="max_length", max_length=128, truncation=True, return_tensors="pt"
+        ).to(device)
+        
+        prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
+
+        next_latents = predict_next_view_latents(
+            transformer=transformer,
+            latents_t=curr_latents,
+            prompt_embeds=prompt_embeds,
+            steps=steps,
+            target_order=target_order,
+        )
+
+        decoded_views = decode_latents_to_views(vae, next_latents)  # (1, V, 3, H, W) in [0, 1]
+
+        vn = [cv2.resize(x, (96, 96), interpolation=cv2.INTER_AREA) for x in [next_top, next_side, next_rear, next_fpv]]
+        gt_vn = torch.from_numpy(np.stack([np.transpose(v, (2, 0, 1)) for v in vn])).float() / 255.0  # (4, 3, H, W)
+
+        # Raw frames are used for PSNR; the pose overlay only goes on the logged FPV videos (FPV is the last view)
+        for k, i in enumerate(view_idx):
+            gen[VIEW_NAMES[i]].append(decoded_views[0, k].cpu())
+            gt[VIEW_NAMES[i]].append(gt_vn[i])
+        gen_fpv_vis.append(_annotate_frame_pose(decoded_views[0, -1].cpu(), camera_command))
+        gt_fpv_vis.append(_annotate_frame_pose(gt_vn[FPV_IDX], camera_command))
+
+        # Re-encode decoded RGB frame back through VAE to stay on the clean VAE manifold
+        next_views_norm = decoded_views * 2.0 - 1.0
+        curr_latents = encode_views_to_latents(vae, next_views_norm, out_dtype=transformer.dtype)
+
+        # Training windows never cross an episode reset, so stop instead of jumping to a new episode
+        if terminated or truncated:
+            break
+
+    transformer.train()
+    env.close()
+    gen = {name: torch.stack(frames, dim=0).unsqueeze(0) for name, frames in gen.items()}
+    gt = {name: torch.stack(frames, dim=0).unsqueeze(0) for name, frames in gt.items()}
+    vis = (torch.stack(gen_fpv_vis, dim=0).unsqueeze(0), torch.stack(gt_fpv_vis, dim=0).unsqueeze(0))
+    return gen, gt, vis
+
+
+@torch.no_grad()
+def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, epoch, agents=None, rollout_steps=16, steps=20,
+                            fps=15, seed=42, view_idx=VIEW_IDX["all"], target_order="same"):
+    """
+    Performs autoregressive video rollouts and writes per-view PSNR and videos to TensorBoard.
+    Validation/<env>/PSNR/FPV is the number to compare between --views fpv and --views all.
+    `agents` maps env_name -> the policy used during data collection (random actions if missing).
+    """
+    agents = agents or {}
+    transformer.eval()
+    unique_envs = ['Bipedal Walker', 'Lunar Lander', 'MultiCar Racing']
+    reg_dict = dict(_build_registry())
+
+    print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch} across envs: {', '.join(unique_envs)}...")
+
+    for env_name in unique_envs:
+        env = reg_dict[env_name]()
+
+        gen, gt, (vid_fpv_vis, vid_gt_fpv_vis) = autoregressive_rollout(
+            transformer=transformer,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            env_name=env_name,
+            env=env,
+            agent=agents.get(env_name),
+            rollout_steps=rollout_steps,
+            steps=steps,
+            seed=seed,
+            view_idx=view_idx,
+            target_order=target_order,
+        )
+
+        clean_tag = env_name.replace(" ", "_").lower()
+
+        psnrs = {name: _psnr(gen[name], gt[name]) for name in gen}
+        for name, value in psnrs.items():
+            writer.add_scalar(f"Validation/{clean_tag}/PSNR/{VIEW_TAGS[name][0]}", value, epoch)
+        if len(psnrs) > 1:
+            writer.add_scalar(f"Validation/{clean_tag}/PSNR/Mean", sum(psnrs.values()) / len(psnrs), epoch)
+
+        print(f"  [Epoch {epoch}] [{env_name}] Autoregressive Video PSNR: "
+              + ", ".join(f"{VIEW_TAGS[name][0]}: {value:.2f}dB" for name, value in psnrs.items()))
+
+        for name in gen:
+            is_fpv = name == VIEW_NAMES[FPV_IDX]
+            writer.add_video(f"Test/{clean_tag}/{VIEW_TAGS[name][1]}", vid_fpv_vis if is_fpv else gen[name], epoch, fps=fps)
+            writer.add_video(f"GT/{clean_tag}/{VIEW_TAGS[name][1]}", vid_gt_fpv_vis if is_fpv else gt[name], epoch, fps=fps)
+
+    transformer.train()
+
+def _skip_intro(env, env_name, obs):
+    """Steps CarRacing past its zoom-in intro with no-op actions so those frames never reach the buffer."""
+    if env_name == "MultiCar Racing":
+        for _ in range(50):
+            obs, _, _, _, _ = env.step(np.zeros(3))
+    return obs
+
+def _camera_state(env, command):
+    """Camera state stored with each transition and fed to the prompt; read right after env.render(command)."""
+    return {
+        "command": command,
+        "x": getattr(env, "cam_x", 0.0),
+        "y": getattr(env, "cam_y", 0.0),
+        "z": getattr(env, "cam_z", 0.0),
+        "roll": getattr(env, "cam_roll", 0.0),
+        "yaw": getattr(env, "cam_yaw", 0.0),
+        "pitch": getattr(env, "cam_pitch", 0.0),
+    }
+
+def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker"):
+    """Collects camera rollouts storing stateful camera poses."""
+    obs, _ = env.reset(seed=seed)
+    obs = _skip_intro(env, env_name, obs)
+    env.action_space.seed(seed)  # random-action envs: every run (and both --views arms) gets the same data
+    state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
+
+    pose_hold = 0
+
+    # Render once per env step (each render advances the camera), so views_next[k] == views_t[k+1]
+    # and every transition is one camera increment, matching the validation rollout.
+    # "Center" is a no-op right after reset (yaw = pitch = 0).
+    img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
+
+    for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
+        if pose_hold <= 0:
+          current_pose = random.choice(["Center", "Up", "Down", "Left", "Right"])
+          pose_hold = random.randint(8, 16)
+        else:
+          pose_hold -= 1
+
+        with torch.inference_mode():
+          if hasattr(agent, "predict"):
+            action, _ = agent.predict(obs, deterministic=True)
+          else:
+            action = env.action_space.sample()
+
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+
+        next_top, next_rear, next_side, next_fpv = env.render(
+            camera_pose=current_pose
+        )
+
+        # Extract wrapper's stateful angles if available
+        cam_state = _camera_state(env, current_pose)
+
+        buffer.push(
+            top_t=img_top,
+            side_t=im_side,
+            rear_t=im_rear,
+            fpv_t=im_fpv,
+            top_next=next_top,
+            side_next=next_side,
+            rear_next=next_rear,
+            fpv_next=next_fpv,
+            action=action,
+            done=done,
+            env_name=env_name,
+            camera_state=cam_state,
+        )
+
+        if done:
+          obs, _ = env.reset()
+          obs = _skip_intro(env, env_name, obs)
+          pose_hold = 0
+          img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
+        else:
+          obs = next_obs
+          img_top, im_rear, im_side, im_fpv = next_top, next_rear, next_side, next_fpv
+        state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
+    env.close()
+
+def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
+    """Loops through all registered environments and populates the multi-env buffer.
+    Returns (active_envs, agents) where agents maps env_name -> the collection policy (reused by validation)."""
+    print("=" * 60)
+    print(f"Collecting rollouts across all {min(num_envs, len(registry))} environments...")
+    print("=" * 60)
+
+    active_envs = []
+    agents = {}
+    for idx, (env_name, factory) in enumerate(registry[:num_envs]):
+        print(f"\n[{idx + 1}/{len(registry)}] Initializing environment: {env_name}")
+        env = factory()
+
+        obs, info = env.reset()
+        state_dim = int(np.prod(obs.shape if hasattr(obs, 'shape') else env.observation_space.shape))
+        clean_env_name = "".join(c for c in env_name if c.isalnum() or c in ('_', '-')).lower()
+        ckpt_path = os.path.join("checkpoints", f"ppo_{clean_env_name}.pt")
+        
+        if env_name == "Lunar Lander":
+            checkpoint = load_from_hub(
+                repo_id="Adilbai/ppo-LunarLander-v2",
+                filename="ppo-LunarLander-v2.zip"
+            )
+            agent = PPO.load(checkpoint)
+
+        elif env_name == "MultiCar Racing":
+            checkpoint = load_from_hub(
+                repo_id="igpaub/ppo-CarRacing-v2",
+                filename="ppo-CarRacing-v2.zip"
+            )
+            agent = PPO.load(checkpoint)
+
+        else:
+            print(f"Loading PPO agent from: {ckpt_path}")
+            agent = load_agent(ckpt_path, state_dim, env.action_space, device)
+        
+        collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=env_name)
+        active_envs.append((env_name, env))
+        agents[env_name] = agent
+
+    unique_recorded = list(dict.fromkeys([e for e in buffer.env_names[:buffer.size] if e is not None]))
+    print(f"\n[INFO] Buffer populated with {buffer.size} transitions across {len(unique_recorded)} environments: {', '.join(unique_recorded)}")
+    return active_envs, agents
+
+def save_checkpoint(model, ckpt_dir, args):
+    """Saves the LoRA plus the training flags; eval_longrollout reads --views / --target_order from train_args.json."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    model.save_pretrained(ckpt_dir)
+    with open(os.path.join(ckpt_dir, "train_args.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+    print(f"  [SAVED] LoRA checkpoint to {ckpt_dir}")
+
+
+# ==========================================
+# MAIN TRAINING SCRIPT
+# ==========================================
+def main(args):
+    set_seed(args.seed)
+    view_idx = VIEW_IDX[args.views]
+    view_names = [VIEW_NAMES[i] for i in view_idx]
+    run_tag = "ortho" if args.views == "all" else "single"
+    print("=" * 60)
+    print("  Orthographic Multi-View World Model (LoRA)")
+    print(f"  Views: {', '.join(view_names)} (target_order={args.target_order})")
+    print(f"  Multi-Step Trajectory Training (seq_len={args.train_seq_len}, teacher_forcing_prob={args.teacher_forcing_prob})")
+    print("=" * 60)
+
+    # 1. Environments & Replay Buffer
+    registry = _build_registry()
+    reg_dict = dict(registry)
+    buffer = OrthoTransitionBuffer(
+        capacity=args.buffer_capacity, img_h=96, img_w=96, max_action_len=8
+    )
+
+    active_envs, agents = collect_all_envs_rollouts(
+        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs
+    )
+
+    # 2. Model & LoRA Setup
+    model, vae, text_encoder, tokenizer = load_model(
+        model_id=args.model_id, lora_rank=args.lora_rank
+    )
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(
+        trainable_params,
+        lr=args.lr,
+        betas=(0.9, 0.999),
+        weight_decay=1e-5,
+    )
+
+    total_steps = args.epochs * args.steps_per_epoch
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
+
+    log_dir = f"./runs/wan_{run_tag}_multienv_cam_{args.num_envs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"TensorBoard logging to: {log_dir}")
+
+    # 3. Multi-Step Trajectory Training Loop
+    print("\nStarting Multi-Step Trajectory LoRA Fine-Tuning ...")
+    global_step = 0
+
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_loss = 0.0
+        # Ramp up autoregressive student-forcing probability across epochs
+        progress = epoch / max(1, args.epochs - 1)
+        curr_teacher_forcing_prob = args.teacher_forcing_prob * min(1.0, progress * 1.5)
+
+        pbar = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch+1}/{args.epochs} (Teacher Prob.={curr_teacher_forcing_prob:.2f})")
+
+        for _ in pbar:
+            # Sample batch of contiguous trajectories of length `args.train_seq_len`
+            # views_t:       (B, 4, 3, H, W) — anchor frame at t=0
+            # views_next_seq: list[T] of (B, 4, 3, H, W) — target frames t=1..T
+            views_t, views_next_seq, actions_seq, env_names_seq, camera_poses_seq = buffer.sample_trajectory_batch(
+                batch_size=args.batch_size,
+                seq_len=args.train_seq_len,
+            )
+            # Keep only the modelled views (FPV last); --views fpv is exactly the FPV-only baseline
+            views_t = views_t[:, list(view_idx)]
+            views_next_seq = [v[:, list(view_idx)] for v in views_next_seq]
+
+            with torch.no_grad():
+                # Encode views at t=0
+                latents_t = encode_views_to_latents(vae, views_t, out_dtype=model.dtype)
+
+                # Encode target views and text prompts for each step along the trajectory
+                latents_next_seq = []
+                prompt_embeds_seq = []
+
+                for s in range(args.train_seq_len):
+                    latents_s = encode_views_to_latents(vae, views_next_seq[s], out_dtype=model.dtype)
+                    latents_next_seq.append(latents_s)
+
+                    prompts_s = compose_player_prompts(
+                        actions_seq[s],
+                        env_name=env_names_seq[s],
+                        camera_pose=camera_poses_seq[s],
+                    )
+
+                    text_inputs = tokenizer(
+                        prompts_s, padding="max_length", max_length=128, truncation=True, return_tensors="pt"
+                    ).to(device)
+                    embeds_s = text_encoder(**text_inputs).last_hidden_state.to(dtype=model.dtype)
+                    prompt_embeds_seq.append(embeds_s)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            # Unroll multi-step trajectory with student forcing & context noise
+            loss, per_view_losses = train_ortho_trajectory_step(
+                transformer=model,
+                latents_t0=latents_t,
+                latents_next_seq=latents_next_seq,
+                prompt_embeds_seq=prompt_embeds_seq,
+                teacher_forcing_prob=curr_teacher_forcing_prob,
+                ctx_noise_max=args.ctx_noise_max,
+                target_order=args.target_order,
+            )
+
+            # Pre-clip norm; values above 1.0 mean clipping is shrinking the update
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss
+            global_step += 1
+
+            writer.add_scalar("Train/Loss", loss, global_step)
+            writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
+            writer.add_scalar("Train/Teacher_Student_Prob", curr_teacher_forcing_prob, global_step)
+            writer.add_scalar("Train/GradNorm", grad_norm.item(), global_step)
+            for v_idx, v_name in enumerate(view_names):
+                writer.add_scalar(f"Train/Loss_{v_name}", per_view_losses[v_idx], global_step)
+
+            env_summary = "+".join(list(dict.fromkeys(env_names_seq[0]))[:2])
+            pbar.set_postfix({
+                "Loss": f"{loss:.4f}",
+                "FPV": f"{per_view_losses[-1]:.3f}",
+                "Envs": env_summary,
+            })
+
+        avg_loss = epoch_loss / args.steps_per_epoch
+        print(f"  [Epoch {epoch+1}] Average Trajectory Flow Loss ({args.train_seq_len} steps): {avg_loss:.4f}")
+
+        # --- VALIDATION: AUTOREGRESSIVE VIDEO ROLLOUTS TO TENSORBOARD ---
+        if (epoch + 1) % args.eval_every == 0:
+            evaluate_and_log_videos(
+                transformer=model,
+                vae=vae,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer,
+                writer=writer,
+                epoch=epoch + 1,
+                agents=agents,
+                rollout_steps=args.rollout_video_steps,
+                steps=args.eval_steps,
+                fps=args.video_fps,
+                seed=args.seed,
+                view_idx=view_idx,
+                target_order=args.target_order,
+            )
+
+        # Checkpointing
+        if (epoch + 1) % args.save_every == 0:
+            save_checkpoint(model, f"./checkpoints/wan_{run_tag}_lora_epoch_{epoch+1}", args)
+
+    print("\nTraining Complete! Saving final LoRA weights...")
+    save_checkpoint(model, f"./checkpoints/wan_{run_tag}_cam_{args.num_envs}_lora_final", args)
+    writer.close()
+
+    for _, env in active_envs:
+        try:
+            env.close()
+        except Exception:
+            pass
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Orthographic Game Views")
+    parser.add_argument("--rollout_steps", type=int, default=2048, help="Rollout steps when training on a single environment")
+    parser.add_argument("--buffer_capacity", type=int, default=40000, help="Capacity of multi-environment transition buffer")
+    parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", help="HuggingFace model ID")
+    parser.add_argument("--lora_rank", type=int, default=64, help="LoRA rank dimension")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size per gradient step")
+    parser.add_argument("--train_seq_len", type=int, default=16, help="Contiguous trajectory steps unrolled per training update")
+    parser.add_argument("--teacher_forcing_prob", type=float, default=1.0, help="Max prob of using self-predicted latents onto next trajectory step")
+    parser.add_argument("--ctx_noise_max", type=float, default=0.15, help="Max Gaussian noise added to conditioning context latents to prevent drift")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
+    parser.add_argument("--steps_per_epoch", type=int, default=200, help="Training steps per epoch")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for LoRA parameters")
+    parser.add_argument("--save_every", type=int, default=2, help="Save checkpoint every N epochs")
+    parser.add_argument("--eval_every", type=int, default=1, help="Generate and evaluate views every N epochs")
+    parser.add_argument("--eval_steps", type=int, default=20, help="Number of Euler flow matching sampling steps per frame")
+    parser.add_argument("--rollout_video_steps", type=int, default=16, help="Autoregressive rollout steps for validation videos")
+    parser.add_argument("--video_fps", type=int, default=15, help="FPS for TensorBoard video logging")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--num_envs", type=int, default=12, help="Number of training envs")
+    parser.add_argument("--views", type=str, default="all", choices=["all", "fpv"],
+                        help="'all': top/side/rear/FPV predicted jointly; 'fpv': FPV-only baseline (same training as train_single_wan.py)")
+    parser.add_argument("--target_order", type=str, default="same", choices=["same", "mirror"],
+                        help="'mirror' reverses the target views so the FPV target directly follows the FPV context frame")
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)

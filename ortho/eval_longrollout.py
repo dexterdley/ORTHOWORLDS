@@ -6,17 +6,14 @@ are supporting views. Any number of models are rolled out from the same ground-t
 with the same logged actions and camera commands, and compared on the FPV view:
   - Per-step PSNR / SSIM / LPIPS (step 1 = single-step prediction), AUC-PSNR, drift onset (PSNR < 20 dB)
   - FVD on FPV clips (R3D-18 features, see train_ortho_diffusion.compute_fvd)
-Multi-view models additionally report the consistency of their supporting views:
-  - Projection Error (PE) of the decoded top/side/rear silhouettes, next to the ground-truth PE floor
-  - Hull IoU between the visual hulls carved from generated and ground-truth silhouettes
 
 Models are LoRA checkpoint folders, named after the folder:
-  --multi   predicts all 4 views jointly (train_voxel_wan.py / train_ortho_wan.py); FPV is view 3
+  --multi   predicts all 4 views jointly (new_train_ortho_wan.py / train_ortho_wan.py); FPV is view 3
   --single  predicts the FPV view only (train_single_wan.py)
 
 Usage:
   python eval_longrollout.py \\
-      --multi ./checkpoints/runs/ours ./checkpoints/runs/ours_lambda0 \\
+      --multi ./checkpoints/runs/ortho \\
       --single ./checkpoints/runs/fpv_only \\
       --envs all --rollout_steps 32 --n_rollouts 20
 
@@ -25,13 +22,14 @@ Saves to results/eval/<tag>/:
   summary.csv         <- one row per (env, model); "Train (mean)" / "Held-out (mean)" aggregate rows
   summary_main.tex    <- main-results table rows (training environments)
   summary_per_env.tex <- per-environment table rows
-  <env>_curves.png    <- FPV PSNR and PE versus rollout step
+  <env>_curves.png    <- FPV PSNR versus rollout step
   <env>_strip.png     <- GT and every model's FPV frames at selected steps
 """
 
 import os
 import re
 import csv
+import json
 import argparse
 from collections import defaultdict
 from datetime import datetime
@@ -45,13 +43,11 @@ from tqdm import tqdm
 
 from utils import _build_registry, _build_heldout_registry, load_base_model, load_agent, compose_player_prompts, set_seed
 from buffer import OrthoTransitionBuffer
-from train_voxel_wan import (
+from new_train_ortho_wan import (
     collect_rollouts,
     encode_views_to_latents,
     decode_latents_to_views,
     predict_next_view_latents,
-    silhouettes_from_views,
-    projection_error,
 )
 from train_ortho_diffusion import compute_fvd, _get_lpips_fn
 
@@ -82,25 +78,6 @@ def lpips_per_sample(pred, gt):
     fn = _get_lpips_fn()
     return fn(pred.float().to(device) * 2.0 - 1.0, gt.float().to(device) * 2.0 - 1.0).flatten().tolist()
 
-def pe_per_sample(views):
-    """views: (B, 4, 3, H, W) in [0, 1] -> (B,) projection error of the top/side/rear silhouettes."""
-    return projection_error(silhouettes_from_views(views.float() * 2.0 - 1.0)).tolist()
-
-def visual_hull(views):
-    """views: (B, 4, 3, H, W) in [0, 1] -> (B, N, N, N) bool hull indexed [x, y, z] (axes as build_voxel_batch)."""
-    m = silhouettes_from_views(views.float() * 2.0 - 1.0) > 0.5   # (B, 3, N, N) top, side, rear
-    T = m[:, 0].transpose(1, 2)                 # T[x, y]
-    S = m[:, 1].flip(1).transpose(1, 2)         # S[x, z]
-    R = m[:, 2].flip(1).transpose(1, 2)         # R[y, z]
-    return T[:, :, :, None] & S[:, :, None, :] & R[:, None, :, :]
-
-def hull_iou_per_sample(pred_views, gt_views):
-    """(B, 4, 3, H, W) in [0, 1] each -> (B,) occupancy IoU of the carved visual hulls."""
-    a, b = visual_hull(pred_views), visual_hull(gt_views)
-    inter = (a & b).flatten(1).sum(1).float()
-    union = (a | b).flatten(1).sum(1).float().clamp(min=1)
-    return (inter / union).tolist()
-
 def drift_onset(psnr_curve, thresh=DRIFT_DB):
     """First 1-indexed step with PSNR below `thresh`, or None if it never drifts."""
     return next((s + 1 for s, v in enumerate(psnr_curve) if v < thresh), None)
@@ -118,6 +95,14 @@ def model_specs(multi_paths, single_paths):
     if len(set(names)) != len(names):
         raise ValueError(f"Checkpoint folders must have distinct names, got {names}")
     return specs
+
+def train_arg(path, key, default):
+    """One training flag from the train_args.json that new_train_ortho_wan.py saves next to each LoRA (older ones have none)."""
+    try:
+        with open(os.path.join(path, "train_args.json")) as f:
+            return json.load(f).get(key, default)
+    except FileNotFoundError:
+        return default
 
 def load_models(base_transformer, specs):
     """Loads every LoRA as a named adapter on one shared base DiT. Returns (peft_model, [(name, kind, adapter)])."""
@@ -163,7 +148,7 @@ def build_eval_envs(which, num_envs):
     return entries
 
 def make_agent(env_name, env):
-    """Same policies as data collection in train_voxel_wan.collect_all_envs_rollouts."""
+    """Same policies as data collection in new_train_ortho_wan.collect_all_envs_rollouts."""
     if env_name in ("Lunar Lander", "MultiCar Racing"):
         from stable_baselines3 import PPO
         from huggingface_sb3 import load_from_hub
@@ -199,14 +184,16 @@ def encode_prompts(text_encoder, tokenizer, acts, env_names, cams, dtype):
 
 @torch.no_grad()
 def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
-                 rollout_steps, n_rollouts, eval_steps, batch_size, strip_steps):
+                 rollout_steps, n_rollouts, eval_steps, batch_size, strip_steps, orders=None):
     """
     Rolls out every model from the same GT start frames with the same logged actions / camera commands.
+    `orders` maps model name -> the --target_order it was trained with (default "same").
     Returns:
-      curves[model][metric] -> list over steps of per-step means; curves["GT"]["pe"] is the GT floor
+      curves[model][metric] -> list over steps of per-step means
       clips[model] -> (N, T, 3, H, W) FPV clips in [0, 1]; clips["GT"] likewise
       strip -> {"GT": [frames], model: [frames]} FPV frames of the first rollout at `strip_steps`
     """
+    orders = orders or {}
     acc = defaultdict(lambda: defaultdict(lambda: [[] for _ in range(rollout_steps)]))
     clips = defaultdict(list)
     strip = None
@@ -243,13 +230,12 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
 
             gt = torch.from_numpy(np.stack([c[1][step] for c in chunk])).float().to(device) / 255.0  # (B, 4, 3, H, W)
             gt_fpv = gt[:, FPV_IDX]
-            for v in pe_per_sample(gt):
-                acc["GT"]["pe"][step].append(v)
             frames["GT"].append(gt_fpv.cpu())
 
             for name, kind, adapter in models:
                 model.set_adapter(adapter)
-                next_lat = predict_next_view_latents(model, state[name], embeds, steps=eval_steps)
+                next_lat = predict_next_view_latents(model, state[name], embeds, steps=eval_steps,
+                                                     target_order=orders.get(name, "same"))
                 dec = decode_latents_to_views(vae, next_lat)                     # (B, V, 3, H, W) in [0, 1]
                 state[name] = encode_views_to_latents(vae, dec * 2.0 - 1.0, out_dtype=model.dtype)
 
@@ -258,9 +244,6 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
                                      ("ssim", ssim_per_sample(fpv, gt_fpv)),
                                      ("lpips", lpips_per_sample(fpv, gt_fpv))):
                     acc[name][metric][step].extend(vals)
-                if kind == "multi":
-                    acc[name]["pe"][step].extend(pe_per_sample(dec))
-                    acc[name]["hull_iou"][step].extend(hull_iou_per_sample(dec, gt))
                 frames[name].append(fpv.cpu())
 
         for key, fr in frames.items():
@@ -281,7 +264,6 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
 def summarize(curves, model_names, rollout_steps, fvd):
     """One summary dict per model from its per-step curves."""
     mid = min(16, rollout_steps) - 1
-    gt_pe = curves["GT"]["pe"]
     rows = {}
     for name in model_names:
         c = curves[name]
@@ -291,11 +273,7 @@ def summarize(curves, model_names, rollout_steps, fvd):
             "auc_psnr": float(np.mean(c["psnr"])),
             "drift": drift_onset(c["psnr"]),
             "fvd": fvd.get(name, float("nan")),
-            "gt_pe": float(np.mean(gt_pe)),
         }
-        if "pe" in c:
-            row.update({"pe@1": c["pe"][0], f"pe@{mid + 1}": c["pe"][mid], "pe_mean": float(np.mean(c["pe"])),
-                        "hull_iou@1": c["hull_iou"][0], "hull_iou_mean": float(np.mean(c["hull_iou"]))})
         rows[name] = row
     return rows
 
@@ -343,51 +321,40 @@ def write_per_step_csv(path, all_curves):
                         w.writerow([env, name, metric, s + 1, f"{v:.6f}"])
 
 def write_main_tex(path, agg, model_names, rollout_steps):
-    """Rows for the main table: FPV fidelity (single step), rollout stability, supporting-view consistency."""
-    lines = ["% Model & PSNR@1 & SSIM@1 & LPIPS@1 & AUC-PSNR & Drift & FVD & PE & Hull IoU \\\\"]
+    """Rows for the main table: FPV fidelity (single step) and rollout stability."""
+    lines = ["% Model & PSNR@1 & SSIM@1 & LPIPS@1 & AUC-PSNR & Drift & FVD \\\\"]
     for name in model_names:
         r = agg.get(name, {})
         lines.append(" & ".join([
             name, fmt(r.get("psnr@1")), fmt(r.get("ssim@1"), 3), fmt(r.get("lpips@1"), 3),
             fmt(r.get("auc_psnr")), fmt(r.get("drift"), 1), fmt(r.get("fvd"), 1),
-            fmt(r.get("pe_mean"), 3), fmt(r.get("hull_iou_mean"), 3),
         ]) + " \\\\")
-    lines.append(f"% GT PE floor: {fmt(next(iter(agg.values()), {}).get('gt_pe'), 3)}; drift counts T+1={rollout_steps + 1} if none")
+    lines.append(f"% Drift counts T+1={rollout_steps + 1} if none")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
-def write_per_env_tex(path, table, model_names, multi_names, rollout_steps):
+def write_per_env_tex(path, table, model_names, rollout_steps):
     mid = min(16, rollout_steps)
-    head = ["Environment"] + [f"PSNR@{mid} {n}" for n in model_names] + [f"PE@{mid} {n}" for n in multi_names] + ["GT PE"]
+    head = ["Environment"] + [f"PSNR@{mid} {n}" for n in model_names]
     lines = ["% " + " & ".join(head) + " \\\\"]
     for env, rows in table.items():
         if not rows:
             continue
-        any_row = next(iter(rows.values()))
         cells = [env] + [fmt(rows.get(n, {}).get(f"psnr@{mid}")) for n in model_names]
-        cells += [fmt(rows.get(n, {}).get(f"pe@{mid}"), 3) for n in multi_names]
-        cells += [fmt(any_row.get("gt_pe"), 3)]
         lines.append(" & ".join(cells) + " \\\\")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
 def plot_curves(curves, model_names, out_path, title):
-    """FPV PSNR (left) and supporting-view PE (right) versus rollout step."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4), dpi=200)
+    """FPV PSNR versus rollout step."""
+    fig, ax = plt.subplots(figsize=(5.5, 4), dpi=200)
     for name in model_names:
         c = curves[name]
-        steps = range(1, len(c["psnr"]) + 1)
-        ax1.plot(steps, c["psnr"], marker="o", markersize=3, linewidth=2, label=name)
-        if "pe" in c:
-            ax2.plot(steps, c["pe"], marker="o", markersize=3, linewidth=2, label=name)
-    ax1.axhline(DRIFT_DB, color="#ef4444", linestyle=":", linewidth=1.2, label=f"Drift threshold ({DRIFT_DB:.0f} dB)")
-    gt = curves["GT"]["pe"]
-    ax2.plot(range(1, len(gt) + 1), gt, color="black", linestyle="--", linewidth=1.2, label="Ground truth")
-    ax1.set(xlabel="Rollout step", ylabel="FPV PSNR (dB)", title=f"{title}: FPV fidelity")
-    ax2.set(xlabel="Rollout step", ylabel="Projection error", title=f"{title}: supporting-view consistency")
-    for ax in (ax1, ax2):
-        ax.grid(alpha=0.25, linestyle="--")
-        ax.legend(fontsize=8)
+        ax.plot(range(1, len(c["psnr"]) + 1), c["psnr"], marker="o", markersize=3, linewidth=2, label=name)
+    ax.axhline(DRIFT_DB, color="#ef4444", linestyle=":", linewidth=1.2, label=f"Drift threshold ({DRIFT_DB:.0f} dB)")
+    ax.set(xlabel="Rollout step", ylabel="FPV PSNR (dB)", title=f"{title}: FPV fidelity")
+    ax.grid(alpha=0.25, linestyle="--")
+    ax.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(out_path, bbox_inches="tight")
     plt.close()
@@ -421,10 +388,14 @@ def main(args):
     os.makedirs(out_dir, exist_ok=True)
 
     specs = model_specs(args.multi, args.single)
+    for name, kind, path in specs:
+        views = train_arg(path, "views", None)
+        if views is not None and (views == "all") != (kind == "multi"):
+            raise ValueError(f"'{name}' was trained with --views {views} but passed via --{kind}")
+    orders = {name: train_arg(path, "target_order", "same") for name, _, path in specs}
     base_transformer, vae, text_encoder, tokenizer = load_base_model(model_id=args.model_id)
     model, models = load_models(base_transformer, specs)
     model_names = [n for n, _, _ in models]
-    multi_names = [n for n, k, _ in models if k == "multi"]
     strip_steps = [int(s) for s in args.strip_steps.split(",")]
 
     env_entries = build_eval_envs(args.envs, args.num_envs)
@@ -440,7 +411,7 @@ def main(args):
         curves, clips, strip = evaluate_env(
             model, models, vae, text_encoder, tokenizer, buffer, env_name,
             rollout_steps=args.rollout_steps, n_rollouts=args.n_rollouts, eval_steps=args.eval_steps,
-            batch_size=args.batch_size, strip_steps=strip_steps,
+            batch_size=args.batch_size, strip_steps=strip_steps, orders=orders,
         )
         if curves is None:
             continue
@@ -462,9 +433,8 @@ def main(args):
 
         for name in model_names:
             r = table[label][name]
-            pe = f" | PE {fmt(r.get('pe_mean'), 3)} (GT {fmt(r['gt_pe'], 3)})" if "pe_mean" in r else ""
             print(f"  {name:<20} FPV PSNR@1 {fmt(r['psnr@1'])} | AUC {fmt(r['auc_psnr'])} | "
-                  f"drift {r['drift'] or '>' + str(args.rollout_steps)} | FVD {fmt(r['fvd'], 1)}{pe}")
+                  f"drift {r['drift'] or '>' + str(args.rollout_steps)} | FVD {fmt(r['fvd'], 1)}")
 
     # Aggregate rows over training / held-out environments (FVD pooled over all clips of the split)
     for split, title in (("train", "Train (mean)"), ("heldout", "Held-out (mean)")):
@@ -488,13 +458,13 @@ def main(args):
     if "Train (mean)" in table:
         write_main_tex(os.path.join(out_dir, "summary_main.tex"), table["Train (mean)"], model_names, args.rollout_steps)
     write_per_env_tex(os.path.join(out_dir, "summary_per_env.tex"),
-                      {e: r for e, r in table.items() if e in split_of}, model_names, multi_names, args.rollout_steps)
+                      {e: r for e, r in table.items() if e in split_of}, model_names, args.rollout_steps)
     print(f"\n[SAVED] Results -> {out_dir}")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="FPV-centred long-horizon rollout evaluation of multi-view and single-view world models")
-    p.add_argument("--multi", nargs="*", default=["./checkpoints/wan_ortho_voxel_cam_3_lora_final"],
+    p.add_argument("--multi", nargs="*", default=["./checkpoints/wan_ortho_cam_3_lora_final"],
                    help="Checkpoint folders of multi-view models (FPV + supporting views)")
     p.add_argument("--single", nargs="*", default=["./checkpoints/wan_single_cam_3_lora_final"],
                    help="Checkpoint folders of FPV-only models")
