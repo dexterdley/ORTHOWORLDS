@@ -45,12 +45,49 @@ dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_suppo
 """
 Ideas to try
 Train FPV conditioned on the other views. The script's docstring says it learns P(3D_{t+1} | top_{t+1}, side_{t+1}, rear_{t+1}, views_t), but the code doesn't do that: all four targets are noised together and denoised jointly. Instead, during training, randomly give some target views to the model clean, and compute the loss only on the noisy ones. At inference, generate top/side/rear first and then FPV with those as conditioning. The simple orthographic views then act as a layout guide for the next FPV frame, which is the clearest way for them to help.
+
+Show that orthographic views (Top, Side, Rear) make a first-person (FPV) world model better. Supporting clean frames are context; noisy frames are what the model denoises and is scored on.
+Usage the model has to become a Game Engine, so we cant keep feeding it real frames during inference, only x_0 
+
+Naming Convention
+
+A branch's name is what it sees plus how it's trained:
+- Sees: FPV (only FPV at $t$) or Ortho (all four views at $t$)
+
+Frame numbers follow a full 8-frame layout, so a view always has the same number.
+
+FPV-MonoSingle: the Baseline (Typical in Diffusion World models)
+frame:     3   |   7
+          FPV  |  FPV
+        views_t| views_{t+1} (noisy at tau)
+loss:          |  yes
+
+FPV-BaseSingle: also predicts the ortho views (In train_single_wan.py, very shaky but obvious becuase the other views arent given and only FPV is decent)
+frame:     3   |   4      5      6      7
+          FPV  |  Top    Side   Rear   FPV
+        views_t| ---- views_{t+1} (noisy at tau) ----
+loss:          |   yes    yes    yes    yes
+
+Ortho-Base: the current code (The most obvious, during rollouts, we feed 4 real multiview frames)
+frame:     0     1     2     3   |   4      5      6      7
+         Top   Side  Rear  FPV   |  Top    Side   Rear   FPV
+         ---- views_t (clean) -- | ---- views_{t+1} (noisy at tau) ----
+loss:                            |   yes    yes    yes    yes
+
+My idea:
+frame:     0     1     2      |      7
+         Top   Side  Rear     |     FPV
+         ---- views_t (clean) -- | ---- views_{t+1} (noisy at tau) ----
+loss:                            |     yes
+
+
+
 """
 
 # View order everywhere (buffer, renders, latents): 0 Top, 1 Side, 2 Rear, 3 FPV. FPV is always the last modelled view.
 VIEW_NAMES = ["Top", "Side", "Rear", "3D_FPV"]
-VIEW_IDX = {"all": (0, 1, 2, 3), "fpv": (3,)}
 FPV_IDX = 3
+ALL_VIEWS = (0, 1, 2, 3)
 # TensorBoard names per view (scalar tag, video tag), unchanged from the earlier scripts so old and new runs line up
 VIEW_TAGS = {"Top": ("Top Down", "Top-Down"), "Side": ("Side", "Side"), "Rear": ("Rear", "Rear"), "3D_FPV": ("FPV", "FPV")}
 
@@ -107,13 +144,6 @@ def decode_latents_to_views(vae, latents):
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
 # ==========================================
-def _order_targets(latents, target_order):
-    """
-    Orders the target block along the frame axis. 'mirror' reverses it so the FPV target (last view) sits right
-    after the FPV context frame, the adjacent-frame layout Wan was pretrained on. Self-inverse; no-op for 1 view.
-    """
-    return latents.flip(2) if target_order == "mirror" else latents
-
 def train_ortho_flow_step(
     transformer,
     latents_t,
@@ -121,7 +151,6 @@ def train_ortho_flow_step(
     prompt_embeds,
     shift=3.0,
     ctx_noise_max=0.15,
-    target_order="same",
 ):
     """
     Single transition Flow-Matching step (used inside multi-step trajectory rollout).
@@ -150,7 +179,7 @@ def train_ortho_flow_step(
     noisy_latents_next = noisy_latents_next_fp32.to(dtype=transformer.dtype)
 
     # 4. Concatenate conditioning views (frames 0:V) and noisy target views (frames V:2V)
-    combined_latents = torch.cat([cond_latents_t, _order_targets(noisy_latents_next, target_order)], dim=2)
+    combined_latents = torch.cat([cond_latents_t, noisy_latents_next], dim=2)
 
     # 5. Ground truth velocity: v_target = noise - x_0
     target_velocity = noise - latents_next_fp32
@@ -163,8 +192,8 @@ def train_ortho_flow_step(
         encoder_hidden_states=prompt_embeds,
     ).sample
 
-    # 7. Supervise target views at t+1 (indices num_views:2*num_views), back in view order
-    pred_velocity = _order_targets(model_pred[:, :, num_views : 2 * num_views], target_order).float()
+    # 7. Supervise target views at t+1 (indices num_views:2*num_views)
+    pred_velocity = model_pred[:, :, num_views : 2 * num_views].float()
 
     per_view_losses = [
         F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
@@ -188,7 +217,6 @@ def train_ortho_trajectory_step(
     shift=3.0,
     teacher_forcing_prob=0.5,
     ctx_noise_max=0.15,
-    target_order="same",
 ):
     """
     Unrolls a multi-step trajectory of length `seq_len` during training.
@@ -210,26 +238,14 @@ def train_ortho_trajectory_step(
         prompt_embeds = prompt_embeds_seq[s]
         is_last_step = (s == seq_len - 1)
 
-        if not is_last_step:
-            step_loss, step_view_losses, pred_next_latents = train_ortho_flow_step(
-                transformer=transformer,
-                latents_t=curr_latents,
-                latents_next=target_latents,
-                prompt_embeds=prompt_embeds,
-                shift=shift,
-                ctx_noise_max=ctx_noise_max,
-                target_order=target_order,
-            )
-        else:
-            step_loss, step_view_losses, _ = train_ortho_flow_step(
-                transformer=transformer,
-                latents_t=curr_latents,
-                latents_next=target_latents,
-                prompt_embeds=prompt_embeds,
-                shift=shift,
-                ctx_noise_max=ctx_noise_max,
-                target_order=target_order,
-            )
+        step_loss, step_view_losses, pred_next_latents = train_ortho_flow_step(
+            transformer=transformer,
+            latents_t=curr_latents,
+            latents_next=target_latents,
+            prompt_embeds=prompt_embeds,
+            shift=shift,
+            ctx_noise_max=ctx_noise_max,
+        )
 
         # Normalize loss across trajectory length and backpropagate immediately to save VRAM
         scaled_loss = step_loss / float(seq_len)
@@ -254,10 +270,9 @@ def train_ortho_trajectory_step(
 # AUTOREGRESSIVE VIDEO ROLLOUT & SAMPLING
 # ==========================================
 @torch.no_grad()
-def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, shift=3.0, target_order="same"):
+def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, shift=3.0):
     """
     Jointly denoises the V modelled views at t+1 via reverse Euler Flow Matching.
-    `target_order` must match the one the checkpoint was trained with.
     Input:
       latents_t: (B, C, V, h, w) - clean past views at time t
     Output:
@@ -279,13 +294,13 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
         dt = sigma_curr - sigma_next
 
         t_tensor = torch.full((b,), sigma_curr * 1000.0, device=latents_t.device, dtype=transformer.dtype)
-        combined = torch.cat([latents_t, _order_targets(x_tau.to(dtype=transformer.dtype), target_order)], dim=2)  # (B, C, 2V, h, w)
+        combined = torch.cat([latents_t, x_tau.to(dtype=transformer.dtype)], dim=2)  # (B, C, 2V, h, w)
 
-        pred_velocity = _order_targets(transformer(
+        pred_velocity = transformer(
             hidden_states=combined,
             timestep=t_tensor,
             encoder_hidden_states=prompt_embeds,
-        ).sample[:, :, num_views : 2 * num_views], target_order).float()
+        ).sample[:, :, num_views : 2 * num_views].float()
         x_tau = x_tau - dt * pred_velocity
 
     return x_tau.to(dtype=transformer.dtype)
@@ -293,7 +308,7 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
 @torch.no_grad()
 def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, env_name, env, agent=None,
                            rollout_steps=16, steps=20, camera_command="Right", seed=42,
-                           view_idx=VIEW_IDX["all"], target_order="same"):
+                           view_idx=ALL_VIEWS):
     """
     Autoregressive video rollout of the views in `view_idx` (predicted jointly), holding `camera_command`
     every step (e.g. a Right pan). The env is driven exactly like `collect_rollouts` (same policy, same render
@@ -356,7 +371,6 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, env_name, 
             latents_t=curr_latents,
             prompt_embeds=prompt_embeds,
             steps=steps,
-            target_order=target_order,
         )
 
         decoded_views = decode_latents_to_views(vae, next_latents)  # (1, V, 3, H, W) in [0, 1]
@@ -389,7 +403,7 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, env_name, 
 
 @torch.no_grad()
 def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, epoch, agents=None, rollout_steps=16, steps=20,
-                            fps=15, seed=42, view_idx=VIEW_IDX["all"], target_order="same"):
+                            fps=15, seed=42, view_idx=ALL_VIEWS):
     """
     Performs autoregressive video rollouts and writes per-view PSNR and videos to TensorBoard.
     Validation/<env>/PSNR/FPV is the number to compare between --views fpv and --views all.
@@ -417,7 +431,6 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
             steps=steps,
             seed=seed,
             view_idx=view_idx,
-            target_order=target_order,
         )
 
         clean_tag = env_name.replace(" ", "_").lower()
@@ -565,7 +578,7 @@ def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
     return active_envs, agents
 
 def save_checkpoint(model, ckpt_dir, args):
-    """Saves the LoRA plus the training flags; eval_longrollout reads --views / --target_order from train_args.json."""
+    """Saves the LoRA plus the training flags; eval_longrollout reads --views from train_args.json."""
     os.makedirs(ckpt_dir, exist_ok=True)
     model.save_pretrained(ckpt_dir)
     with open(os.path.join(ckpt_dir, "train_args.json"), "w") as f:
@@ -578,12 +591,18 @@ def save_checkpoint(model, ckpt_dir, args):
 # ==========================================
 def main(args):
     set_seed(args.seed)
-    view_idx = VIEW_IDX[args.views]
+    if args.views == "all":
+        # Multi-view: top/side/rear/FPV predicted jointly
+        view_idx = ALL_VIEWS
+        run_tag = "ortho"
+    else:
+        # Single view: FPV-only baseline
+        view_idx = (FPV_IDX,)
+        run_tag = "single"
     view_names = [VIEW_NAMES[i] for i in view_idx]
-    run_tag = "ortho" if args.views == "all" else "single"
     print("=" * 60)
     print("  Orthographic Multi-View World Model (LoRA)")
-    print(f"  Views: {', '.join(view_names)} (target_order={args.target_order})")
+    print(f"  Views: {', '.join(view_names)}")
     print(f"  Multi-Step Trajectory Training (seq_len={args.train_seq_len}, teacher_forcing_prob={args.teacher_forcing_prob})")
     print("=" * 60)
 
@@ -677,7 +696,6 @@ def main(args):
                 prompt_embeds_seq=prompt_embeds_seq,
                 teacher_forcing_prob=curr_teacher_forcing_prob,
                 ctx_noise_max=args.ctx_noise_max,
-                target_order=args.target_order,
             )
 
             # Pre-clip norm; values above 1.0 mean clipping is shrinking the update
@@ -720,7 +738,6 @@ def main(args):
                 fps=args.video_fps,
                 seed=args.seed,
                 view_idx=view_idx,
-                target_order=args.target_order,
             )
 
         # Checkpointing
@@ -759,8 +776,6 @@ def parse_args():
     parser.add_argument("--num_envs", type=int, default=12, help="Number of training envs")
     parser.add_argument("--views", type=str, default="all", choices=["all", "fpv"],
                         help="'all': top/side/rear/FPV predicted jointly; 'fpv': FPV-only baseline (same training as train_single_wan.py)")
-    parser.add_argument("--target_order", type=str, default="same", choices=["same", "mirror"],
-                        help="'mirror' reverses the target views so the FPV target directly follows the FPV context frame")
     return parser.parse_args()
 
 if __name__ == "__main__":

@@ -184,17 +184,15 @@ def encode_prompts(text_encoder, tokenizer, acts, env_names, cams, dtype):
 
 @torch.no_grad()
 def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
-                 rollout_steps, n_rollouts, eval_steps, batch_size, strip_steps, orders=None):
+                 rollout_steps, n_rollouts, eval_steps, batch_size, strip_steps):
     """
     Rolls out every model from the same GT start frames with the same logged actions / camera commands.
-    `orders` maps model name -> the --target_order it was trained with (default "same").
     Returns:
       curves[model][metric] -> list over steps of per-step means
       clips[model] -> (N, T, 3, H, W) FPV clips in [0, 1]; clips["GT"] likewise
       strip -> {"GT": [frames], model: [frames]} FPV frames of the first rollout at `strip_steps`
     """
-    orders = orders or {}
-    acc = defaultdict(lambda: defaultdict(lambda: [[] for _ in range(rollout_steps)]))
+    acc =defaultdict(lambda: defaultdict(lambda: [[] for _ in range(rollout_steps)]))
     clips = defaultdict(list)
     strip = None
 
@@ -234,8 +232,7 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
 
             for name, kind, adapter in models:
                 model.set_adapter(adapter)
-                next_lat = predict_next_view_latents(model, state[name], embeds, steps=eval_steps,
-                                                     target_order=orders.get(name, "same"))
+                next_lat = predict_next_view_latents(model, state[name], embeds, steps=eval_steps)
                 dec = decode_latents_to_views(vae, next_lat)                     # (B, V, 3, H, W) in [0, 1]
                 state[name] = encode_views_to_latents(vae, dec * 2.0 - 1.0, out_dtype=model.dtype)
 
@@ -392,7 +389,9 @@ def main(args):
         views = train_arg(path, "views", None)
         if views is not None and (views == "all") != (kind == "multi"):
             raise ValueError(f"'{name}' was trained with --views {views} but passed via --{kind}")
-    orders = {name: train_arg(path, "target_order", "same") for name, _, path in specs}
+        # Mirrored target layout was removed from training/sampling; such checkpoints would sample wrongly
+        if train_arg(path, "target_order", "same") != "same":
+            raise ValueError(f"'{name}' was trained with --target_order mirror, which is no longer supported")
     base_transformer, vae, text_encoder, tokenizer = load_base_model(model_id=args.model_id)
     model, models = load_models(base_transformer, specs)
     model_names = [n for n, _, _ in models]
@@ -411,7 +410,7 @@ def main(args):
         curves, clips, strip = evaluate_env(
             model, models, vae, text_encoder, tokenizer, buffer, env_name,
             rollout_steps=args.rollout_steps, n_rollouts=args.n_rollouts, eval_steps=args.eval_steps,
-            batch_size=args.batch_size, strip_steps=strip_steps, orders=orders,
+            batch_size=args.batch_size, strip_steps=strip_steps,
         )
         if curves is None:
             continue

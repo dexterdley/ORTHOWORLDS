@@ -3,20 +3,17 @@
 # Each training run saves to the same checkpoint folder, so move it right after the run finishes.
 mkdir -p checkpoints/runs
 
-# Every training run uses COMMON, so the FPV-only and multi-view arms differ only in --views
-# (plus ORTHO_FLAGS, which only affect the multi-view arm).
+# Every training run uses COMMON, so the FPV-only and multi-view arms differ only in --views.
 COMMON="--rollout_steps=2048 --epochs=20 --batch_size=16 --teacher_forcing_prob=1.0 --steps_per_epoch=200 --lr=3e-4"
-ORTHO_FLAGS="--target_order=same"   # set from the diagnostics in section 0
 
 # =============================================================================
-# 0. DIAGNOSTICS — short runs to choose ORTHO_FLAGS before the main comparison
+# 0. DIAGNOSTICS — short runs before the main comparison
 # =============================================================================
 # Compare Train/Loss_3D_FPV at equal steps and Validation/*/PSNR/FPV in TensorBoard (runs/). Choose from these,
 # never from the held-out eval in section 1. --teacher_forcing_prob=0 keeps self-predicted contexts out of it.
 DIAG="--rollout_steps=2048 --epochs=4 --batch_size=16 --teacher_forcing_prob=0 --steps_per_epoch=200 --lr=3e-4 --num_envs=12 --seed=0 --save_every=1000"
 CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $DIAG --views=fpv                        # reference
-CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $DIAG --views=all                        # current layout
-CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $DIAG --views=all --target_order=mirror  # FPV target next to FPV context
+CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $DIAG --views=all
 
 # =============================================================================
 # 1. MAIN: FPV-only vs multi-view (Tab. 1, Tab. 3, rollout figure)
@@ -26,7 +23,7 @@ CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $DIAG --views=all -
 for S in 0 1 2; do
     CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $COMMON --num_envs=12 --seed=$S --views=fpv
     mv checkpoints/wan_single_cam_12_lora_final checkpoints/runs/fpv_s$S
-    CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $COMMON --num_envs=12 --seed=$S --views=all $ORTHO_FLAGS
+    CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $COMMON --num_envs=12 --seed=$S --views=all
     mv checkpoints/wan_ortho_cam_12_lora_final checkpoints/runs/ortho_s$S
 done
 
@@ -40,7 +37,7 @@ CUDA_VISIBLE_DEVICES=0 python ./ortho/eval_longrollout.py --tag main --envs all 
 # =============================================================================
 
 for N in 1 3 6; do
-    CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $COMMON --num_envs=$N --seed=0 --views=all $ORTHO_FLAGS
+    CUDA_VISIBLE_DEVICES=0 python ./ortho/new_train_ortho_wan.py $COMMON --num_envs=$N --seed=0 --views=all
     mv checkpoints/wan_ortho_cam_${N}_lora_final checkpoints/runs/envs_$N
 done
 
