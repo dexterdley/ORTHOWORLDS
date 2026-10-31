@@ -12,12 +12,12 @@ import torch
 import cv2
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
+IMG_H, IMG_W = 256, 256
 
 class OrthoTransitionBuffer:
     """Stores paired orthographic views (t and t+1) with actions across multiple environments."""
 
-    def __init__(self, capacity=4000, img_h=128, img_w=128, max_action_len=8, env_name="Bipedal Walker"):
+    def __init__(self, capacity=4000, img_h=IMG_H, img_w=IMG_W, max_action_len=8, env_name="Bipedal Walker"):
         self.capacity = capacity
         self.img_h = img_h
         self.img_w = img_w

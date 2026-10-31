@@ -475,13 +475,19 @@ def compose_player_prompts(action_batch, env_name=None, camera_pose=None):
             action_str = f"action [{', '.join(f'{x.item():+.2f}' for x in a)}]"
 
         cam_str = ""
-        if sample_cam and str(sample_cam).strip().lower() not in ("none", ""):
-            clean_cam = str(sample_cam).strip()
-            cam_str = f", Camera pose {clean_cam}"
+        if isinstance(sample_cam, dict):
+            # Command, camera position rounded to whole units, yaw/pitch in whole degrees (yaw wrapped to [-180, 180))
+            yaw = (math.degrees(float(sample_cam.get("yaw", 0.0))) + 180.0) % 360.0 - 180.0
+            pitch = math.degrees(float(sample_cam.get("pitch", 0.0)))
+            cam_str = (f"camera {sample_cam.get('command', 'Center')}, "
+                       f"x: {float(sample_cam.get('x', 0.0)):+.0f}, "
+                       f"y: {float(sample_cam.get('y', 0.0)):+.0f}, "
+                       f"z: {float(sample_cam.get('z', 0.0)):+.0f}, "
+                       f"yaw: {yaw:+.0f} deg, pitch: {pitch:+.0f} deg, ")
+        elif sample_cam and str(sample_cam).strip().lower() not in ("none", ""):
+            cam_str = f"camera {str(sample_cam).strip()}, "
 
-        full_prompt = (
-            f"{matched_template['title']}: {action_str}, {matched_template['suffix']}{cam_str}."
-        )
+        full_prompt = f"{matched_template['title']}: {cam_str}{action_str}, {matched_template['suffix']}."
         prompts.append(full_prompt)
 
     return prompts
