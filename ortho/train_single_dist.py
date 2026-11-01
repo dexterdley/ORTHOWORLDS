@@ -601,7 +601,7 @@ def main(args):
     registry = _build_registry()
     reg_dict = dict(registry)
     buffer = OrthoTransitionBuffer(
-        capacity=args.buffer_capacity, img_h=IMG_H, img_w=IMG_W, max_action_len=8
+        capacity=args.rollout_steps * min(args.num_envs, len(registry)), img_h=IMG_H, img_w=IMG_W, max_action_len=8
     )
 
     active_envs, agents = collect_all_envs_rollouts(
@@ -770,7 +770,6 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Single Game Views (DDP)")
     parser.add_argument("--rollout_steps", type=int, default=2048, help="Rollout steps per environment, collected independently on each rank")
-    parser.add_argument("--buffer_capacity", type=int, default=40000, help="Capacity of multi-environment transition buffer")
     parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", help="HuggingFace model ID")
     parser.add_argument("--lora_rank", type=int, default=64, help="LoRA rank dimension")
     parser.add_argument("--batch_size", type=int, default=16, help="Per-GPU batch size (effective batch = batch_size * world_size)")

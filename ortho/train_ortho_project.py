@@ -3,17 +3,22 @@ Fine-tuning Wan2.1-1.3B with LoRA for Orthographic Multi-View World Modeling.
 
 Modelling Process
 
-Linear projector: Ortho-Base plus a sketch frame
+Linear projector: Ortho-Base + Linear Sketch
 
 frame:     0     1     2     3      4      |   5      6      7      8
          Top   Side  Rear   FPV   Sketch   |  Top    Side   Rear   FPV
-          |     |     |             ^      |
-          +-----+-----+             |      |
-                |                   |      |
-                v                   |      |
-        [ Linear Proj. ] -----------+      |
-         ---------- clean context -------- | ---- views_{t+1} (noisy at tau) ----
-loss:                                      |   yes    yes    yes    yes
+          |     |     |             ^      |                        ^
+          +-----+-----+         (a) |      |                    (b) |
+                |                   |      |                        |
+                v                   |      |                        |
+        [ Linear Proj. ] -----------+------|------------------------+
+                |
+         -------|-- clean context -------- | ---- views_{t+1} (noisy at tau) ----
+loss:           +-(c)-> MSE vs FPV_{t+1}   |   yes    yes    yes    yes
+
+(a) clean context frame; the DiT's output at frame 4 is discarded
+(b) FPV_{t+1} noise ~ N(sketch.detach(), I), in training and in the sampler
+(c) aux MSE(sketch, clean FPV_{t+1}) on the projector, added to the four view losses
 
 Usage:
 CUDA_VISIBLE_DEVICES=3 python ./ortho/train_ortho_project.py --rollout_steps=4096 --epochs=20 --batch_size=32 --teacher_forcing_prob=0.5 --steps_per_epoch=200 --num_envs=3 --lr=3e-4 --model_id=./Wan2.1-T2V-1.3B-Diffusers/
@@ -100,20 +105,27 @@ class LinearProjector(nn.Module):
         super().__init__()
         self.h_lat, self.w_lat = h_lat, w_lat
         hw = h_lat * w_lat
-        # Per view: a spatial map (hw ortho tokens -> hw sketch tokens), then its own channel mix; views are summed.
-        # One channel mix shared across views caps the sketch well above the best linear predictor (toy: 0.72 vs 0.59).
-        self.spatial = nn.Parameter(torch.eye(hw).repeat(n_src, 1, 1))   # (3, hw_out, hw_in)
-        self.channel = nn.Linear(n_src * c_lat, c_lat)
+        n_in = n_src * 3 # each view x [1, sin(yaw), cos(yaw)]
+        self.spatial = nn.Parameter(torch.eye(hw).repeat(n_in, 1, 1))
+        self.channel = nn.Linear(n_in * c_lat, c_lat)
         self.bias = nn.Parameter(torch.zeros(c_lat, hw))
-        with torch.no_grad():                      # init = copy Rear, so frame 4 starts sensible
-            self.channel.weight.zero_(); self.channel.weight[:, (n_src - 1) * c_lat:] = torch.eye(c_lat)
+        with torch.no_grad(): # init = copy plain Rear (unchanged behaviour)
+            self.channel.weight.zero_(); self.channel.weight[:, (n_src - 1) * c_lat : n_src * c_lat] = torch.eye(c_lat)
             self.channel.bias.zero_()
 
-    def forward(self, latents_ortho):              # (B,C,3,h,w) -> (B,C,1,h,w)
+    def forward(self, latents_ortho, cam):
+        x = latents_ortho.float()
+        s, c_ = cam[:, 0].view(-1, 1, 1, 1, 1), cam[:, 1].view(-1, 1, 1, 1, 1)
+        latents_ortho = torch.cat([x, x * s, x * c_], dim=2)
+
         b, c, v = latents_ortho.shape[:3]
-        x = torch.einsum("bcvp,vqp->bvcq", latents_ortho.float().reshape(b, c, v, -1), self.spatial)  # (B,3,C,hw)
+        x = torch.einsum("bcvp,vqp->bvcq", latents_ortho.float().reshape(b, c, v, -1), self.spatial)  # (B,9,C,hw).
         x = self.channel(x.reshape(b, v * c, -1).transpose(1, 2)).transpose(1, 2) + self.bias          # (B,C,hw)
         return x.view(b, c, 1, self.h_lat, self.w_lat)
+
+def cam_feats(cam_states):
+    yaw = torch.tensor([float(cs.get("yaw", 0.0)) for cs in cam_states], device=device)
+    return torch.stack([yaw.sin(), yaw.cos()], dim=1)
 
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
@@ -123,6 +135,7 @@ def train_ortho_flow_step(
     latents_t,
     latents_next,
     prompt_embeds,
+    cam,
     shift=3.0,
     ctx_noise_max=0.15,
 ):
@@ -146,7 +159,7 @@ def train_ortho_flow_step(
     ctx_noise = torch.randn_like(latents_t_fp32)
     cond_latents_t = ((1.0 - tau_ctx) * latents_t_fp32 + tau_ctx * ctx_noise).to(dtype=transformer.dtype)
 
-    sketch_latents_t = transformer.sketch_proj(cond_latents_t[:, :, :3]).to(dtype=transformer.dtype)
+    sketch_latents_t = transformer.sketch_proj(cond_latents_t[:, :, :3], cam).to(dtype=transformer.dtype)
 
     # 3. Noise all 4 target views at t+1 simultaneously
     latents_next_fp32 = latents_next.float()
@@ -175,7 +188,16 @@ def train_ortho_flow_step(
         F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
         for idx in range(num_views)
     ]
-    loss = sum(per_view_losses)
+
+    # Focus lens: weight FPV tokens by how wrong the sketch is there (vs GT FPV_{t+1}); detached, mean 1 per sample
+    with torch.no_grad():
+        err = (sketch_latents_t.float() - latents_next_fp32[:, :, 3:4]).pow(2).mean(1, keepdim=True)   # (B,1,1,h,w)
+        z = (err - err.mean((3, 4), keepdim=True)) / (err.std((3, 4), keepdim=True) + 1e-6)          # standardise per sample
+        lens_w = 1.0 + torch.sigmoid(z)      # ~1 where the sketch is right, up to 1+λ where it is wrong
+        lens_w = lens_w / lens_w.mean((3, 4), keepdim=True)
+    fpv_lens_loss = (lens_w * (pred_velocity[:, :, 3:4] - target_velocity[:, :, 3:4]).pow(2)).mean()
+
+    loss = sum(per_view_losses[:3]) + fpv_lens_loss
     aux_loss = F.mse_loss(sketch_latents_t.float(), latents_next_fp32[:, :, 3:4])
 
     loss = loss + aux_loss
@@ -190,6 +212,7 @@ def train_ortho_trajectory_step(
     latents_t0,
     latents_next_seq,
     prompt_embeds_seq,
+    cam_seq,
     shift=3.0,
     teacher_forcing_prob=0.5,
     ctx_noise_max=0.15,
@@ -213,6 +236,7 @@ def train_ortho_trajectory_step(
     for s in range(seq_len):
         target_latents = latents_next_seq[s]
         prompt_embeds = prompt_embeds_seq[s]
+        cam = cam_seq[s]
         is_last_step = (s == seq_len - 1)
 
         if not is_last_step:
@@ -221,6 +245,7 @@ def train_ortho_trajectory_step(
                 latents_t=curr_latents,
                 latents_next=target_latents,
                 prompt_embeds=prompt_embeds,
+                cam=cam,
                 shift=shift,
                 ctx_noise_max=ctx_noise_max,
             )
@@ -230,6 +255,7 @@ def train_ortho_trajectory_step(
                 latents_t=curr_latents,
                 latents_next=target_latents,
                 prompt_embeds=prompt_embeds,
+                cam=cam,
                 shift=shift,
                 ctx_noise_max=ctx_noise_max,
             )
@@ -247,11 +273,13 @@ def train_ortho_trajectory_step(
         if not is_last_step:
             if teacher_forcing_prob > 0.0:
                 b = curr_latents.shape[0]
-                use_ar_mask = (torch.rand((b, 1, 1, 1, 1), device=curr_latents.device) < teacher_forcing_prob).to(dtype=transformer.dtype)
-                #curr_latents = use_ar_mask * pred_next_latents + (1.0 - use_ar_mask) * target_latents
-                with torch.no_grad():
-                    sampled = predict_next_view_latents(transformer, curr_latents, prompt_embeds, steps=4)
-                curr_latents = use_ar_mask * sampled + (1.0 - use_ar_mask) * target_latents
+                use_ar = torch.rand(b, device=curr_latents.device) < teacher_forcing_prob   # (B,) which samples self-predict
+                next_latents = target_latents.clone()
+                if use_ar.any():
+                    with torch.no_grad():
+                        next_latents[use_ar] = predict_next_view_latents(
+                            transformer, curr_latents[use_ar], prompt_embeds[use_ar], cam[use_ar], steps=4)
+                curr_latents = next_latents
             else:
                 curr_latents = target_latents
 
@@ -261,7 +289,7 @@ def train_ortho_trajectory_step(
 # AUTOREGRESSIVE VIDEO ROLLOUT & SAMPLING
 # ==========================================
 @torch.no_grad()
-def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, shift=3.0):
+def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=20, shift=3.0):
     """
     Simultaneously denoises all 4 orthographic views at t+1 via reverse Euler Flow Matching.
     Input:
@@ -271,7 +299,7 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
     """
     b, c, num_views, h, w = latents_t.shape
     latents_t = latents_t.to(dtype=transformer.dtype)
-    sketch_t = transformer.sketch_proj(latents_t[:, :, :3]).to(dtype=transformer.dtype)
+    sketch_t = transformer.sketch_proj(latents_t[:, :, :3], cam).to(dtype=transformer.dtype)
 
     # Keep Euler state in float32 to prevent bfloat16 rounding stagnation
     x_tau = torch.randn((b, c, num_views, h, w), device=latents_t.device, dtype=torch.float32)
@@ -342,6 +370,7 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, env_name, 
         # Render the GT target before predicting: training prompts use the camera state read right after this render
         next_top, next_rear, next_side, next_fpv = env.render(camera_pose=camera_command)
         cam_state = _camera_state(env, camera_command)
+        cam = cam_feats([cam_state])
 
         # Same float32 action vector the buffer stores (a scalar discrete action becomes length 1)
         act = np.atleast_1d(np.asarray(action, dtype=np.float32))
@@ -358,13 +387,14 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, env_name, 
         prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
 
         # Same sketch the sampler starts the FPV from; decoded for logging only
-        sketch_views = decode_latents_to_views(vae, transformer.sketch_proj(curr_latents[:, :, :3]))  # (1, 1, 3, H, W)
+        sketch_views = decode_latents_to_views(vae, transformer.sketch_proj(curr_latents[:, :, :3], cam))  # (1, 1, 3, H, W)
         gen_sketch.append(sketch_views[0, 0].cpu())
 
         next_latents = predict_next_view_latents(
             transformer=transformer,
             latents_t=curr_latents,
             prompt_embeds=prompt_embeds,
+            cam=cam,
             steps=steps,
         )
 
@@ -518,7 +548,7 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
 
     for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
         if pose_hold <= 0:
-          current_pose = random.choice(["Center", "Up", "Down", "Left", "Right"])
+          current_pose = random.choice(["Right"])
           pose_hold = random.randint(8, 16)
         else:
           pose_hold -= 1
@@ -624,7 +654,7 @@ def main(args):
     registry = _build_registry()
     reg_dict = dict(registry)
     buffer = OrthoTransitionBuffer(
-        capacity=args.buffer_capacity, img_h=IMG_H, img_w=IMG_W, max_action_len=8
+        capacity=args.rollout_steps * min(args.num_envs, len(registry)), img_h=IMG_H, img_w=IMG_W, max_action_len=8
     )
 
     active_envs, agents = collect_all_envs_rollouts(
@@ -684,6 +714,7 @@ def main(args):
                 # Encode target views and text prompts for each step along the trajectory
                 latents_next_seq = []
                 prompt_embeds_seq = []
+                cam_seq = []
 
                 for s in range(args.train_seq_len):
                     latents_s = encode_views_to_latents(vae, views_next_seq[s], out_dtype=model.dtype)
@@ -700,6 +731,7 @@ def main(args):
                     ).to(device)
                     embeds_s = text_encoder(**text_inputs).last_hidden_state.to(dtype=model.dtype)
                     prompt_embeds_seq.append(embeds_s)
+                    cam_seq.append(cam_feats(camera_poses_seq[s]))
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -709,6 +741,7 @@ def main(args):
                 latents_t0=latents_t,
                 latents_next_seq=latents_next_seq,
                 prompt_embeds_seq=prompt_embeds_seq,
+                cam_seq=cam_seq,
                 teacher_forcing_prob=curr_teacher_forcing_prob,
                 ctx_noise_max=args.ctx_noise_max,
             )
@@ -777,7 +810,6 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Single Game Views")
     parser.add_argument("--rollout_steps", type=int, default=2048, help="Rollout steps when training on a single environment")
-    parser.add_argument("--buffer_capacity", type=int, default=40000, help="Capacity of multi-environment transition buffer")
     parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", help="HuggingFace model ID")
     parser.add_argument("--lora_rank", type=int, default=64, help="LoRA rank dimension")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per gradient step")
