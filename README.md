@@ -65,7 +65,7 @@ pip install -U diffusers transformers accelerate peft torch torchvision opencv-p
 Trains orthographic cross-view flow matching with text prompt conditioning:
 
 ```bash
-python ortho/train_ortho_wan.py \
+python ortho/train_ortho_base.py \
     --model_id Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --batch_size 2 \
     --lora_rank 16 \

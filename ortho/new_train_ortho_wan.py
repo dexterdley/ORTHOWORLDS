@@ -42,6 +42,7 @@ from torch.utils.tensorboard import SummaryWriter
 # HuggingFace & Diffusers imports
 from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent,  _annotate_frame_pose, _psnr
 from buffer import OrthoTransitionBuffer
+from models import _get_wan_latent_stats, encode_views_to_latents, decode_latents_to_views
 
 from stable_baselines3 import PPO
 from huggingface_sb3 import load_from_hub
@@ -106,56 +107,6 @@ ARMS = {
     "ortho_base":   {"context": ALL_VIEWS,  "targets": ALL_VIEWS, "memory": False},
     "ortho_memory": {"context": ALL_VIEWS,  "targets": ALL_VIEWS, "memory": True},
 }
-
-# ==========================================
-# WAN 2.1 HELPERS
-# ==========================================
-def _get_wan_latent_stats(vae, target_device, target_dtype):
-    """Retrieves per-channel mean and std from AutoencoderKLWan config."""
-    if hasattr(vae.config, "latents_mean") and vae.config.latents_mean is not None:
-        mean = torch.tensor(vae.config.latents_mean, device=target_device, dtype=target_dtype).view(1, -1, 1, 1, 1)
-        std = torch.tensor(vae.config.latents_std, device=target_device, dtype=target_dtype).view(1, -1, 1, 1, 1)
-    return mean, std
-
-def encode_views_to_latents(vae, views_tensor, out_dtype=None):
-    """
-    Encodes 4 orthographic views into normalized Wan 3D VAE latents ~ N(0, I).
-    views_tensor: (B, 4, 3, H, W) in [-1, 1] -> Latents: (B, 16, 4, h, w)
-    """
-    b, num_views, c, h, w = views_tensor.shape
-    flat_views = views_tensor.view(b * num_views, c, 1, h, w)
-
-    with torch.no_grad():
-        latent_dist = vae.encode(flat_views.to(dtype=vae.dtype)).latent_dist
-        latents = latent_dist.mode() if hasattr(latent_dist, "mode") else latent_dist.sample()
-        mean, std = _get_wan_latent_stats(vae, latents.device, latents.dtype)
-        latents = (latents - mean) / std
-
-    _, c_lat, _, h_lat, w_lat = latents.shape
-    latents = latents.view(b, num_views, c_lat, h_lat, w_lat).permute(0, 2, 1, 3, 4)
-    if out_dtype is not None:
-        latents = latents.to(dtype=out_dtype)
-    return latents
-
-def decode_latents_to_views(vae, latents):
-    """
-    Unnormalizes and decodes 4 orthographic views latents back into image tensors.
-    latents: (B, C_lat, 4, h_lat, w_lat) -> (B, 4, 3, H, W) in [0, 1]
-    """
-    b, c_lat, num_views, h_lat, w_lat = latents.shape
-    flat_latents = latents.permute(0, 2, 1, 3, 4).reshape(b * num_views, c_lat, 1, h_lat, w_lat)
-    flat_latents = flat_latents.to(dtype=vae.dtype)
-
-    mean, std = _get_wan_latent_stats(vae, flat_latents.device, flat_latents.dtype)
-    flat_latents = flat_latents * std + mean
-
-    with torch.no_grad():
-        decoded = vae.decode(flat_latents).sample  # (B * num_views, 3, 1, H, W)
-
-    decoded = decoded.squeeze(2)  # (B * num_views, 3, H, W)
-    views = decoded.view(b, num_views, 3, decoded.shape[-2], decoded.shape[-1])
-    views = torch.clamp((views + 1.0) / 2.0, 0.0, 1.0)
-    return views
 
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING

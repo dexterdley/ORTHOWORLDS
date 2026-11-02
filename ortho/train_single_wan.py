@@ -31,65 +31,16 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 # HuggingFace & Diffusers imports
-from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose, _psnr
+from utils import _build_registry, _build_heldout_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose, _psnr
 from buffer import OrthoTransitionBuffer
+from models import _get_wan_latent_stats, encode_views_to_latents, decode_latents_to_views
 
 from stable_baselines3 import PPO
 from huggingface_sb3 import load_from_hub
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-IMG_H, IMG_W = 256, 256
-
-# ==========================================
-# WAN 2.1 HELPERS
-# ==========================================
-def _get_wan_latent_stats(vae, target_device, target_dtype):
-    """Retrieves per-channel mean and std from AutoencoderKLWan config."""
-    if hasattr(vae.config, "latents_mean") and vae.config.latents_mean is not None:
-        mean = torch.tensor(vae.config.latents_mean, device=target_device, dtype=target_dtype).view(1, -1, 1, 1, 1)
-        std = torch.tensor(vae.config.latents_std, device=target_device, dtype=target_dtype).view(1, -1, 1, 1, 1)
-    return mean, std
-
-def encode_views_to_latents(vae, views_tensor, out_dtype=None):
-    """
-    Encodes 4 orthographic views into normalized Wan 3D VAE latents ~ N(0, I).
-    views_tensor: (B, 4, 3, H, W) in [-1, 1] -> Latents: (B, 16, 4, h, w)
-    """
-    b, num_views, c, h, w = views_tensor.shape
-    flat_views = views_tensor.view(b * num_views, c, 1, h, w)
-
-    with torch.no_grad():
-        latent_dist = vae.encode(flat_views.to(dtype=vae.dtype)).latent_dist
-        latents = latent_dist.mode() if hasattr(latent_dist, "mode") else latent_dist.sample()
-        mean, std = _get_wan_latent_stats(vae, latents.device, latents.dtype)
-        latents = (latents - mean) / std
-
-    _, c_lat, _, h_lat, w_lat = latents.shape
-    latents = latents.view(b, num_views, c_lat, h_lat, w_lat).permute(0, 2, 1, 3, 4)
-    if out_dtype is not None:
-        latents = latents.to(dtype=out_dtype)
-    return latents
-
-def decode_latents_to_views(vae, latents):
-    """
-    Unnormalizes and decodes 4 orthographic views latents back into image tensors.
-    latents: (B, C_lat, 4, h_lat, w_lat) -> (B, 4, 3, H, W) in [0, 1]
-    """
-    b, c_lat, num_views, h_lat, w_lat = latents.shape
-    flat_latents = latents.permute(0, 2, 1, 3, 4).reshape(b * num_views, c_lat, 1, h_lat, w_lat)
-    flat_latents = flat_latents.to(dtype=vae.dtype)
-
-    mean, std = _get_wan_latent_stats(vae, flat_latents.device, flat_latents.dtype)
-    flat_latents = flat_latents * std + mean
-
-    with torch.no_grad():
-        decoded = vae.decode(flat_latents).sample  # (B * num_views, 3, 1, H, W)
-
-    decoded = decoded.squeeze(2)  # (B * num_views, 3, H, W)
-    views = decoded.view(b, num_views, 3, decoded.shape[-2], decoded.shape[-1])
-    views = torch.clamp((views + 1.0) / 2.0, 0.0, 1.0)
-    return views
+IMG_H, IMG_W = 224, 224
 
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
@@ -222,7 +173,7 @@ def train_ortho_trajectory_step(
                 use_ar_mask = (torch.rand((b, 1, 1, 1, 1), device=curr_latents.device) < teacher_forcing_prob).to(dtype=transformer.dtype)
                 #curr_latents = use_ar_mask * pred_next_latents + (1.0 - use_ar_mask) * target_latents
                 with torch.no_grad():
-                    sampled = predict_next_view_latents(transformer, curr_latents, prompt_embeds, steps=4)
+                    sampled = predict_next_view_latents(transformer, curr_latents, prompt_embeds, steps=8)
                 curr_latents = use_ar_mask * sampled + (1.0 - use_ar_mask) * target_latents
             else:
                 curr_latents = target_latents
@@ -395,8 +346,8 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
     """
     agents = agents or {}
     transformer.eval()
-    unique_envs = ['Bipedal Walker', 'Lunar Lander', 'MultiCar Racing']
-    reg_dict = dict(_build_registry())
+    unique_envs = ['Parkour Runner', 'Lunar Lander', 'MultiCar Racing']
+    reg_dict = dict(_build_registry() + _build_heldout_registry())
     
     print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch} across envs: {', '.join(unique_envs)}...")
 
@@ -412,7 +363,7 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
             tokenizer=tokenizer,
             env_name=env_name,
             env=env,
-            agent=agents.get(env_name),
+            agent=agents.get(env_name, agents.get("Bipedal Walker")),
             rollout_steps=rollout_steps,
             steps=steps,
             seed=seed,
@@ -744,7 +695,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for LoRA parameters")
     parser.add_argument("--save_every", type=int, default=2, help="Save checkpoint every N epochs")
     parser.add_argument("--eval_every", type=int, default=1, help="Generate and evaluate views every N epochs")
-    parser.add_argument("--eval_steps", type=int, default=20, help="Number of Euler flow matching sampling steps per frame")
+    parser.add_argument("--eval_steps", type=int, default=8, help="Number of Euler flow matching sampling steps per frame")
     parser.add_argument("--rollout_video_steps", type=int, default=16, help="Autoregressive rollout steps for validation videos")
     parser.add_argument("--video_fps", type=int, default=15, help="FPS for TensorBoard video logging")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")

@@ -40,92 +40,16 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 # HuggingFace & Diffusers imports
-from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose, _psnr
+from utils import _build_registry, _build_heldout_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose, _psnr
 from buffer import OrthoTransitionBuffer
+from models import _get_wan_latent_stats, encode_views_to_latents, decode_latents_to_views, cam_feats, LinearProjector, SoftZProjector
 
 from stable_baselines3 import PPO
 from huggingface_sb3 import load_from_hub
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-IMG_H, IMG_W = 96,96
-
-# ==========================================
-# WAN 2.1 HELPERS
-# ==========================================
-def _get_wan_latent_stats(vae, target_device, target_dtype):
-    """Retrieves per-channel mean and std from AutoencoderKLWan config."""
-    if hasattr(vae.config, "latents_mean") and vae.config.latents_mean is not None:
-        mean = torch.tensor(vae.config.latents_mean, device=target_device, dtype=target_dtype).view(1, -1, 1, 1, 1)
-        std = torch.tensor(vae.config.latents_std, device=target_device, dtype=target_dtype).view(1, -1, 1, 1, 1)
-    return mean, std
-
-def encode_views_to_latents(vae, views_tensor, out_dtype=None):
-    """
-    Encodes 4 orthographic views into normalized Wan 3D VAE latents ~ N(0, I).
-    views_tensor: (B, 4, 3, H, W) in [-1, 1] -> Latents: (B, 16, 4, h, w)
-    """
-    b, num_views, c, h, w = views_tensor.shape
-    flat_views = views_tensor.view(b * num_views, c, 1, h, w)
-
-    with torch.no_grad():
-        latent_dist = vae.encode(flat_views.to(dtype=vae.dtype)).latent_dist
-        latents = latent_dist.mode() if hasattr(latent_dist, "mode") else latent_dist.sample()
-        mean, std = _get_wan_latent_stats(vae, latents.device, latents.dtype)
-        latents = (latents - mean) / std
-
-    _, c_lat, _, h_lat, w_lat = latents.shape
-    latents = latents.view(b, num_views, c_lat, h_lat, w_lat).permute(0, 2, 1, 3, 4)
-    if out_dtype is not None:
-        latents = latents.to(dtype=out_dtype)
-    return latents
-
-def decode_latents_to_views(vae, latents):
-    """
-    Unnormalizes and decodes 4 orthographic views latents back into image tensors.
-    latents: (B, C_lat, 4, h_lat, w_lat) -> (B, 4, 3, H, W) in [0, 1]
-    """
-    b, c_lat, num_views, h_lat, w_lat = latents.shape
-    flat_latents = latents.permute(0, 2, 1, 3, 4).reshape(b * num_views, c_lat, 1, h_lat, w_lat)
-    flat_latents = flat_latents.to(dtype=vae.dtype)
-
-    mean, std = _get_wan_latent_stats(vae, flat_latents.device, flat_latents.dtype)
-    flat_latents = flat_latents * std + mean
-
-    with torch.no_grad():
-        decoded = vae.decode(flat_latents).sample  # (B * num_views, 3, 1, H, W)
-
-    decoded = decoded.squeeze(2)  # (B * num_views, 3, H, W)
-    views = decoded.view(b, num_views, 3, decoded.shape[-2], decoded.shape[-1])
-    views = torch.clamp((views + 1.0) / 2.0, 0.0, 1.0)
-    return views
-
-class LinearProjector(nn.Module):
-    def __init__(self, c_lat=16, h_lat=IMG_H // 8, w_lat=IMG_W // 8, n_src=3):
-        super().__init__()
-        self.h_lat, self.w_lat = h_lat, w_lat
-        hw = h_lat * w_lat
-        n_in = n_src * 3 # each view x [1, sin(yaw), cos(yaw)]
-        self.spatial = nn.Parameter(torch.eye(hw).repeat(n_in, 1, 1))
-        self.channel = nn.Linear(n_in * c_lat, c_lat)
-        self.bias = nn.Parameter(torch.zeros(c_lat, hw))
-        with torch.no_grad(): # init = copy plain Rear (unchanged behaviour)
-            self.channel.weight.zero_(); self.channel.weight[:, (n_src - 1) * c_lat : n_src * c_lat] = torch.eye(c_lat)
-            self.channel.bias.zero_()
-
-    def forward(self, latents_ortho, cam):
-        x = latents_ortho.float()
-        s, c_ = cam[:, 0].view(-1, 1, 1, 1, 1), cam[:, 1].view(-1, 1, 1, 1, 1)
-        latents_ortho = torch.cat([x, x * s, x * c_], dim=2)
-
-        b, c, v = latents_ortho.shape[:3]
-        x = torch.einsum("bcvp,vqp->bvcq", latents_ortho.float().reshape(b, c, v, -1), self.spatial)  # (B,9,C,hw).
-        x = self.channel(x.reshape(b, v * c, -1).transpose(1, 2)).transpose(1, 2) + self.bias          # (B,C,hw)
-        return x.view(b, c, 1, self.h_lat, self.w_lat)
-
-def cam_feats(cam_states):
-    yaw = torch.tensor([float(cs.get("yaw", 0.0)) for cs in cam_states], device=device)
-    return torch.stack([yaw.sin(), yaw.cos()], dim=1)
+IMG_H, IMG_W = 224, 224
 
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
@@ -278,7 +202,7 @@ def train_ortho_trajectory_step(
                 if use_ar.any():
                     with torch.no_grad():
                         next_latents[use_ar] = predict_next_view_latents(
-                            transformer, curr_latents[use_ar], prompt_embeds[use_ar], cam[use_ar], steps=4)
+                            transformer, curr_latents[use_ar], prompt_embeds[use_ar], cam[use_ar], steps=8)
                 curr_latents = next_latents
             else:
                 curr_latents = target_latents
@@ -289,7 +213,7 @@ def train_ortho_trajectory_step(
 # AUTOREGRESSIVE VIDEO ROLLOUT & SAMPLING
 # ==========================================
 @torch.no_grad()
-def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=20, shift=3.0):
+def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=20, shift=3.0, fpv_next=None):
     """
     Simultaneously denoises all 4 orthographic views at t+1 via reverse Euler Flow Matching.
     Input:
@@ -299,11 +223,11 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=
     """
     b, c, num_views, h, w = latents_t.shape
     latents_t = latents_t.to(dtype=transformer.dtype)
-    sketch_t = transformer.sketch_proj(latents_t[:, :, :3], cam).to(dtype=transformer.dtype)
+    sketch_next = transformer.sketch_proj(latents_t[:, :, :3], cam).to(dtype=transformer.dtype)
 
     # Keep Euler state in float32 to prevent bfloat16 rounding stagnation
     x_tau = torch.randn((b, c, num_views, h, w), device=latents_t.device, dtype=torch.float32)
-    x_tau[:, :, 3:4] += sketch_t.float()
+    x_tau[:, :, 3:4] += sketch_next.float()
 
     # Shifted timestep schedule from 1.0 -> 0.0
     sigmas = torch.linspace(1.0, 0.0, steps + 1, device=latents_t.device, dtype=torch.float32)
@@ -315,7 +239,7 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=
         dt = sigma_curr - sigma_next
 
         t_tensor = torch.full((b,), sigma_curr * 1000.0, device=latents_t.device, dtype=transformer.dtype)
-        combined = torch.cat([latents_t, sketch_t, x_tau.to(dtype=transformer.dtype)], dim=2)  # (B, C, 9, h, w)
+        combined = torch.cat([latents_t, sketch_next, x_tau.to(dtype=transformer.dtype)], dim=2)  # (B, C, 9, h, w)
 
         pred_velocity = transformer(
             hidden_states=combined,
@@ -458,8 +382,8 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
     """
     agents = agents or {}
     transformer.eval()
-    unique_envs = ['Bipedal Walker', 'Lunar Lander', 'MultiCar Racing']
-    reg_dict = dict(_build_registry())
+    unique_envs = ['Parkour Runner', 'Lunar Lander', 'MultiCar Racing']
+    reg_dict = dict(_build_registry() + _build_heldout_registry())
     
     print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch} across envs: {', '.join(unique_envs)}...")
 
@@ -475,7 +399,7 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
             tokenizer=tokenizer,
             env_name=env_name,
             env=env,
-            agent=agents.get(env_name),
+            agent=agents.get(env_name, agents.get("Bipedal Walker")),
             rollout_steps=rollout_steps,
             steps=steps,
             seed=seed,
@@ -504,11 +428,6 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
         writer.add_video(f"Test/{clean_tag}/Rear",     vid_rear,     epoch, fps=fps)
         writer.add_video(f"Test/{clean_tag}/Side",     vid_side,     epoch, fps=fps)
         writer.add_video(f"Test/{clean_tag}/FPV",      vid_fpv_vis,  epoch, fps=fps)
-
-        writer.add_video(f"GT/{clean_tag}/Top-Down", vid_gt_top_down, epoch, fps=fps)
-        writer.add_video(f"GT/{clean_tag}/Rear",     vid_gt_rear,     epoch, fps=fps)
-        writer.add_video(f"GT/{clean_tag}/Side",     vid_gt_side,     epoch, fps=fps)
-        writer.add_video(f"GT/{clean_tag}/FPV",      vid_gt_fpv_vis,  epoch, fps=fps)
         writer.add_video(f"Test/{clean_tag}/Sketch",  vid_sketch,      epoch, fps=fps)
 
     transformer.train()
@@ -665,7 +584,8 @@ def main(args):
     model, vae, text_encoder, tokenizer = load_model(
         model_id=args.model_id, lora_rank=args.lora_rank
     )
-    model.sketch_proj = LinearProjector().to(device)
+    # model.sketch_proj = LinearProjector().to(device)
+    model.sketch_proj = SoftZProjector(h_lat=IMG_H // 8, w_lat=IMG_W // 8).to(device)
 
     proj_params = list(model.sketch_proj.parameters())
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("sketch_proj.")]
@@ -823,7 +743,7 @@ def parse_args():
                         help="Learning rate for the sketch projector (at the LoRA lr it barely leaves its copy-Rear init)")
     parser.add_argument("--save_every", type=int, default=2, help="Save checkpoint every N epochs")
     parser.add_argument("--eval_every", type=int, default=1, help="Generate and evaluate views every N epochs")
-    parser.add_argument("--eval_steps", type=int, default=20, help="Number of Euler flow matching sampling steps per frame")
+    parser.add_argument("--eval_steps", type=int, default=8, help="Number of Euler flow matching sampling steps per frame")
     parser.add_argument("--rollout_video_steps", type=int, default=16, help="Autoregressive rollout steps for validation videos")
     parser.add_argument("--video_fps", type=int, default=15, help="FPS for TensorBoard video logging")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")

@@ -5,7 +5,7 @@ The 3D FPV view is the main output of the world model; the orthographic top / si
 are supporting views. Any number of models are rolled out from the same ground-truth start frames
 with the same logged actions and camera commands, and compared on the FPV view:
   - Per-step PSNR / SSIM / LPIPS (step 1 = single-step prediction), AUC-PSNR, drift onset (PSNR < 20 dB)
-  - FVD on FPV clips (R3D-18 features, see train_ortho_diffusion.compute_fvd)
+  - FVD on FPV clips (R3D-18 features, see metrics.compute_fvd)
 
 Models are LoRA checkpoint folders, named after the folder:
   --multi   predicts all 4 views jointly (new_train_ortho_wan.py / train_ortho_wan.py); FPV is view 3
@@ -49,7 +49,7 @@ from new_train_ortho_wan import (
     decode_latents_to_views,
     predict_next_view_latents,
 )
-from train_ortho_diffusion import compute_fvd, _get_lpips_fn
+from metrics import compute_fvd, _get_lpips_fn
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
