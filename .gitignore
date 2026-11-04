@@ -180,6 +180,7 @@ rollouts/
 *.npz
 *.pth
 *.tar.gz
+*.tgz
 ViZDoomPPO/runs/
 ViZDoomPPO/logs/
 car_racing/car_racing_dataset/

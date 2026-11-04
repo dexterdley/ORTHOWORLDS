@@ -167,11 +167,13 @@ def train_ortho_trajectory_step(
         if not is_last_step:
             if teacher_forcing_prob > 0.0:
                 b = curr_latents.shape[0]
-                use_ar_mask = (torch.rand((b, 1, 1, 1, 1), device=curr_latents.device) < teacher_forcing_prob).to(dtype=transformer.dtype)
-                #curr_latents = use_ar_mask * pred_next_latents + (1.0 - use_ar_mask) * target_latents
-                with torch.no_grad():
-                    sampled = predict_next_view_latents(transformer, curr_latents, prompt_embeds, steps=8)
-                curr_latents = use_ar_mask * sampled + (1.0 - use_ar_mask) * target_latents
+                use_ar = torch.rand(b, device=curr_latents.device) < teacher_forcing_prob   # (B,) which samples self-predict
+                next_latents = target_latents.clone()
+                if use_ar.any():  # sample only the self-predicting entries (was: whole batch, then masked)
+                    with torch.no_grad():
+                        next_latents[use_ar] = predict_next_view_latents(
+                            transformer, curr_latents[use_ar], prompt_embeds[use_ar], steps=8)
+                curr_latents = next_latents
             else:
                 curr_latents = target_latents
 
@@ -475,7 +477,7 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
         state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
     env.close()
 
-def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
+def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3, collect=True):
     """Loops through all registered environments and populates the multi-env buffer.
     Returns (active_envs, agents) where agents maps env_name -> the collection policy (reused by validation)."""
     print("=" * 60)
@@ -511,7 +513,8 @@ def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
             print(f"Loading PPO agent from: {ckpt_path}")
             agent = load_agent(ckpt_path, state_dim, env.action_space, device)
         
-        collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=env_name)
+        if collect:
+            collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=env_name)
         active_envs.append((env_name, env))
         agents[env_name] = agent
 
@@ -534,12 +537,23 @@ def main(args):
     registry = _build_registry()
     reg_dict = dict(registry)
     buffer = OrthoTransitionBuffer(
-        capacity=args.buffer_capacity, img_h=IMG_H, img_w=IMG_W, max_action_len=8
+        capacity=args.rollout_steps * min(args.num_envs, len(registry)), img_h=IMG_H, img_w=IMG_W, max_action_len=8
     )
 
+    # Rollout cache: the buffer depends on the RNG seed (camera-pose picks), the env seed (42 here), envs, steps and image size
+    cache_dir = (f"./buffer_cache/s{args.seed}_c42_r0"
+                 f"_e{args.num_envs}_n{args.rollout_steps}_{IMG_H}px")
+    cached = os.path.exists(os.path.join(cache_dir, "meta.pkl"))
     active_envs, agents = collect_all_envs_rollouts(
-        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs
+        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs,
+        collect=not cached,   # always load the PPO agents (validation needs them); render only without a cache
     )
+    if cached:
+        buffer.load(cache_dir)
+        print(f"[INFO] Loaded cached rollouts from {cache_dir} ({buffer.size} transitions)")
+    else:
+        buffer.save(cache_dir)
+    set_seed(args.seed)   # same RNG state from here on, whether collected or loaded
 
     # 2. Model & LoRA Setup
     model, vae, text_encoder, tokenizer = load_model(
@@ -680,7 +694,6 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Single Game Views")
     parser.add_argument("--rollout_steps", type=int, default=2048, help="Rollout steps when training on a single environment")
-    parser.add_argument("--buffer_capacity", type=int, default=40000, help="Capacity of multi-environment transition buffer")
     parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", help="HuggingFace model ID")
     parser.add_argument("--lora_rank", type=int, default=64, help="LoRA rank dimension")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per gradient step")

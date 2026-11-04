@@ -467,7 +467,7 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
 
     for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]"):
         if pose_hold <= 0:
-          current_pose = random.choice(["Right"])
+          current_pose = random.choice(["Center", "Up", "Down", "Left", "Right"])
           pose_hold = random.randint(8, 16)
         else:
           pose_hold -= 1
@@ -514,7 +514,7 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
         state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
     env.close()
 
-def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
+def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3, collect=True):
     """Loops through all registered environments and populates the multi-env buffer.
     Returns (active_envs, agents) where agents maps env_name -> the collection policy (reused by validation)."""
     print("=" * 60)
@@ -550,7 +550,8 @@ def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
             print(f"Loading PPO agent from: {ckpt_path}")
             agent = load_agent(ckpt_path, state_dim, env.action_space, device)
         
-        collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=env_name)
+        if collect:
+            collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=env_name)
         active_envs.append((env_name, env))
         agents[env_name] = agent
 
@@ -576,9 +577,20 @@ def main(args):
         capacity=args.rollout_steps * min(args.num_envs, len(registry)), img_h=IMG_H, img_w=IMG_W, max_action_len=8
     )
 
+    # Rollout cache: the buffer depends on the RNG seed (camera-pose picks), the env seed (42 here), envs, steps and image size
+    cache_dir = (f"./buffer_cache/s{args.seed}_c42_r0"
+                 f"_e{args.num_envs}_n{args.rollout_steps}_{IMG_H}px")
+    cached = os.path.exists(os.path.join(cache_dir, "meta.pkl"))
     active_envs, agents = collect_all_envs_rollouts(
-        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs
+        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs,
+        collect=not cached,   # always load the PPO agents (validation needs them); render only without a cache
     )
+    if cached:
+        buffer.load(cache_dir)
+        print(f"[INFO] Loaded cached rollouts from {cache_dir} ({buffer.size} transitions)")
+    else:
+        buffer.save(cache_dir)
+    set_seed(args.seed)   # same RNG state from here on, whether collected or loaded
 
     # 2. Model & LoRA Setup
     model, vae, text_encoder, tokenizer = load_model(

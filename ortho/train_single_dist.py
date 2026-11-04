@@ -43,6 +43,15 @@ from models import _get_wan_latent_stats, encode_views_to_latents, decode_latent
 from stable_baselines3 import PPO
 from huggingface_sb3 import load_from_hub
 
+def get_registries(hifi=False):
+    """(train_registry, heldout_registry): GymBox by default, Godot hi-fi with --hifi."""
+    if not hifi:
+        return _build_registry(), _build_heldout_registry()
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hifi"))
+    from wrappers import build_hifi_registry, build_hifi_heldout_registry
+    return build_hifi_registry(), build_hifi_heldout_registry()
+
 # torchrun sets LOCAL_RANK; set the CUDA device before anything touches "cuda" (utils/buffer use the bare "cuda" device)
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 torch.cuda.set_device(local_rank)
@@ -179,11 +188,13 @@ def train_ortho_trajectory_step(
         if not is_last_step:
             if teacher_forcing_prob > 0.0:
                 b = curr_latents.shape[0]
-                use_ar_mask = (torch.rand((b, 1, 1, 1, 1), device=curr_latents.device) < teacher_forcing_prob).to(dtype=_unwrap(transformer).dtype)
-                #curr_latents = use_ar_mask * pred_next_latents + (1.0 - use_ar_mask) * target_latents
-                with torch.no_grad():
-                    sampled = predict_next_view_latents(_unwrap(transformer), curr_latents, prompt_embeds, steps=8)
-                curr_latents = use_ar_mask * sampled + (1.0 - use_ar_mask) * target_latents
+                use_ar = torch.rand(b, device=curr_latents.device) < teacher_forcing_prob   # (B,) which samples self-predict
+                next_latents = target_latents.clone()
+                if use_ar.any():  # sample only the self-predicting entries (was: whole batch, then masked)
+                    with torch.no_grad():
+                        next_latents[use_ar] = predict_next_view_latents(
+                            _unwrap(transformer), curr_latents[use_ar], prompt_embeds[use_ar], steps=16)
+                curr_latents = next_latents
             else:
                 curr_latents = target_latents
 
@@ -348,7 +359,7 @@ def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, env_name, 
 
 
 @torch.no_grad()
-def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, epoch, agents=None, rollout_steps=16, steps=20, fps=15, seed=42):
+def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, epoch, agents=None, rollout_steps=16, steps=20, fps=15, seed=42, hifi=False):
     """
     Performs autoregressive video rollouts for each view and writes the videos to TensorBoard.
     `agents` maps env_name -> the policy used during data collection (random actions if missing).
@@ -356,8 +367,10 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
     agents = agents or {}
     transformer.eval()
     unique_envs = ['Parkour Runner', 'Lunar Lander', 'MultiCar Racing']
-    reg_dict = dict(_build_registry() + _build_heldout_registry())
-    
+    # reg_dict = dict(_build_registry() + _build_heldout_registry())
+    train_reg, heldout_reg = get_registries(hifi)
+    reg_dict = dict(train_reg + heldout_reg)
+
     print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch} across envs: {', '.join(unique_envs)}...")
 
     for env_idx, env_name in enumerate(unique_envs):
@@ -485,7 +498,7 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
         state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
     env.close()
 
-def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3, seed=42):
+def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3, seed=42, collect=True):
     """Loops through all registered environments and populates the multi-env buffer.
     Returns (active_envs, agents) where agents maps env_name -> the collection policy (reused by validation)."""
     print("=" * 60)
@@ -520,8 +533,8 @@ def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3, s
         else:
             print(f"Loading PPO agent from: {ckpt_path}")
             agent = load_agent(ckpt_path, state_dim, env.action_space, device)
-        
-        collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=seed, env_name=env_name)
+        if collect:
+            collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=seed, env_name=env_name)
         active_envs.append((env_name, env))
         agents[env_name] = agent
 
@@ -549,15 +562,29 @@ def main(args):
         print("=" * 60)
 
     # 1. Environments & Replay Buffer (one buffer per rank)
-    registry = _build_registry()
+    # registry = _build_registry()
+    registry, _ = get_registries(args.hifi)
     reg_dict = dict(registry)
     buffer = OrthoTransitionBuffer(
         capacity=args.rollout_steps * min(args.num_envs, len(registry)), img_h=IMG_H, img_w=IMG_W, max_action_len=8
     )
 
+    # Rollout cache: the buffer depends on the RNG seed (camera-pose picks), the env seed, rank, envs, steps and image size
+    cache_dir = (f"./buffer_cache/s{args.seed}_c{args.seed + rank}_r{rank}"
+                f"_e{args.num_envs}_n{args.rollout_steps}_{IMG_H}px{'_hifi' if args.hifi else ''}")
+
+    cached = os.path.exists(os.path.join(cache_dir, "meta.pkl"))
     active_envs, agents = collect_all_envs_rollouts(
-        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs, seed=args.seed + rank
+        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs, seed=args.seed + rank,
+        collect=not cached,   # always load the PPO agents (validation needs them); render only without a cache
     )
+    if cached:
+        buffer.load(cache_dir)
+        if is_main():
+            print(f"[INFO] Loaded cached rollouts from {cache_dir} ({buffer.size} transitions)")
+    else:
+        buffer.save(cache_dir)
+    set_seed(args.seed + rank)   # same RNG state from here on, whether collected or loaded
 
     # 2. Model & LoRA Setup
     model, vae, text_encoder, tokenizer = load_model(
@@ -580,10 +607,11 @@ def main(args):
 
     writer = None
     if is_main():
-        log_dir = f"./runs/wan_single_dist_multienv_cam_{args.num_envs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_dir = f"./runs/wan_single_dist_multienv_cam_{args.num_envs}{'_hifi' if args.hifi else ''}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         writer = SummaryWriter(log_dir=log_dir)
         print(f"TensorBoard logging to: {log_dir}")
 
+    ckpt_base = f"./checkpoints/wan_single_dist_cam_{args.num_envs}{'_hifi' if args.hifi else ''}"
     view_names = ["3D_FPV"]
 
     # 3. Multi-Step Trajectory Training Loop
@@ -691,11 +719,12 @@ def main(args):
                 steps=args.eval_steps,
                 fps=args.video_fps,
                 seed=args.seed + 1000,
+                hifi=args.hifi,
             )
 
         # Checkpointing
         if (epoch + 1) % args.save_every == 0 and is_main():
-            ckpt_dir = f"./checkpoints/wan_single_dist_lora_epoch_{epoch+1}"
+            ckpt_dir = f"{ckpt_base}_lora_epoch_{epoch+1}"
             os.makedirs(ckpt_dir, exist_ok=True)
             model.save_pretrained(ckpt_dir)
             print(f"  [SAVED] LoRA checkpoint to {ckpt_dir}")
@@ -705,8 +734,9 @@ def main(args):
 
     if is_main():
         print("\nTraining Complete! Saving final LoRA weights...")
-        os.makedirs(f"./checkpoints/wan_single_dist_cam_{args.num_envs}_lora_final", exist_ok=True)
-        model.save_pretrained(f"./checkpoints/wan_single_dist_cam_{args.num_envs}_lora_final")
+        final_dir = f"{ckpt_base}_lora_final"
+        os.makedirs(final_dir, exist_ok=True)
+        model.save_pretrained(final_dir)
         writer.close()
 
     for _, env in active_envs:
@@ -737,6 +767,7 @@ def parse_args():
     parser.add_argument("--video_fps", type=int, default=15, help="FPS for TensorBoard video logging")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--num_envs", type=int, default=12, help="Number of training envs")
+    parser.add_argument("--hifi", action="store_true", default=False, help="Render with the Godot hi-fi envs")
     return parser.parse_args()
 
 if __name__ == "__main__":

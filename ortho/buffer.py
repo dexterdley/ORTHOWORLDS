@@ -5,11 +5,12 @@ Circular replay buffer for synchronized orthographic multi-view transitions.
 Stores (views_t, views_next, action, done, env_name) tuples and supports
 sampling both random single-step batches and contiguous multi-step trajectories.
 """
-
+import os
 import random
 import numpy as np
 import torch
 import cv2
+import pickle
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_H, IMG_W = 256, 256
@@ -38,7 +39,8 @@ class OrthoTransitionBuffer:
         self.env_names = [None] * capacity
         # Camera state per transition (e.g. 'Center', 'Up', 'Down', 'Left', 'Right')
         self.camera_states = [None] * capacity
-
+        self._ARRAYS = ("views_t", "views_next", "actions", "action_lens", "dones")
+        
     def _resize(self, img):
         if img.shape[0] != self.img_h or img.shape[1] != self.img_w:
             return cv2.resize(img, (self.img_w, self.img_h), interpolation=cv2.INTER_AREA)
@@ -112,7 +114,7 @@ class OrthoTransitionBuffer:
         else:
             start_idxs = np.random.choice(valid_starts, size=batch_size)
 
-        views_t = torch.from_numpy(self.views_t[start_idxs]).float().to(target_device) / 127.5 - 1.0
+        views_t = torch.from_numpy(self.views_t[start_idxs]).to(target_device).float() / 127.5 - 1.0
 
         views_next_seq = []
         actions_seq = []
@@ -121,7 +123,7 @@ class OrthoTransitionBuffer:
 
         for s in range(seq_len):
             step_idxs = np.minimum(start_idxs + s, self.size - 1)
-            views_next_s = torch.from_numpy(self.views_next[step_idxs]).float().to(target_device) / 127.5 - 1.0
+            views_next_s = torch.from_numpy(self.views_next[step_idxs]).to(target_device).float() / 127.5 - 1.0
             actions_s = [
                 torch.from_numpy(self.actions[idx, :self.action_lens[idx]]).float().to(target_device)
                 for idx in step_idxs
@@ -163,3 +165,24 @@ class OrthoTransitionBuffer:
         if return_camera_states:
             return vt_seq, vn_seq, act_seq, env_seq, cam_seq
         return vt_seq, vn_seq, act_seq, env_seq
+
+    def save(self, path):
+        """Writes the filled part of the buffer: one .npy per array (loadable memory-mapped) + metadata."""
+        os.makedirs(path, exist_ok=True)
+        for k in self._ARRAYS:
+            np.save(os.path.join(path, f"{k}.npy"), getattr(self, k)[:self.size])
+        meta = {"size": self.size, "ptr": self.ptr, "capacity": self.capacity, "img_hw": (self.img_h, self.img_w),
+                "env_names": self.env_names[:self.size], "camera_states": self.camera_states[:self.size]}
+        with open(os.path.join(path, "meta.pkl"), "wb") as f:
+            pickle.dump(meta, f)
+
+    def load(self, path, mmap=True):
+        """Loads a saved buffer; image arrays are memory-mapped (read from disk on demand, not held in RAM)."""
+        with open(os.path.join(path, "meta.pkl"), "rb") as f:
+            meta = pickle.load(f)
+        assert meta["img_hw"] == (self.img_h, self.img_w), f"cache is {meta['img_hw']}, buffer is {(self.img_h, self.img_w)}"
+        for k in self._ARRAYS:
+            mode = "r" if (mmap and k.startswith("views")) else None
+            setattr(self, k, np.load(os.path.join(path, f"{k}.npy"), mmap_mode=mode))
+        self.size, self.ptr, self.capacity = meta["size"], meta["ptr"], meta["capacity"]
+        self.env_names, self.camera_states = meta["env_names"], meta["camera_states"]
