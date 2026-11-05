@@ -159,6 +159,10 @@ def train_ortho_trajectory_step(
     total_loss = 0.0
     avg_per_view = [0.0] * num_views
 
+    b, dev = latents_t0.shape[0], latents_t0.device
+    switch = seq_len - (torch.rand(b, device=dev) ** ((1 - teacher_forcing_prob) / max(teacher_forcing_prob, 1e-6)) * (seq_len - 1)).round()  # (1) step each sample starts self-feeding
+    use_x0 = torch.rand(b, device=dev) < 0.5
+
     for s in range(seq_len):
         target_latents = latents_next_seq[s]
         prompt_embeds = prompt_embeds_seq[s]
@@ -187,9 +191,15 @@ def train_ortho_trajectory_step(
         # Prepare context for step s + 1 (Student Forcing vs. Teacher Forcing per sample)
         if not is_last_step:
             if teacher_forcing_prob > 0.0:
-                b = curr_latents.shape[0]
-                use_ar = torch.rand(b, device=curr_latents.device) < teacher_forcing_prob   # (B,) which samples self-predict
-                next_latents = target_latents.clone()
+                #b = curr_latents.shape[0]
+                #use_ar = torch.rand(b, device=curr_latents.device) < teacher_forcing_prob   # (B,) which samples self-predict
+                #next_latents = target_latents.clone()
+                
+                use_ar = (s + 1) >= switch   # (1) sticky: once self-fed, stays self-fed
+                lam = (torch.rand(b, 1, 1, 1, 1, device=dev) * (use_ar & use_x0).view(-1, 1, 1, 1, 1)).to(target_latents.dtype)
+                next_latents = torch.lerp(target_latents, pred_next_latents, lam)
+                use_ar &= ~use_x0
+
                 if use_ar.any():  # sample only the self-predicting entries (was: whole batch, then masked)
                     with torch.no_grad():
                         next_latents[use_ar] = predict_next_view_latents(
@@ -607,11 +617,11 @@ def main(args):
 
     writer = None
     if is_main():
-        log_dir = f"./runs/wan_single_dist_multienv_cam_{args.num_envs}{'_hifi' if args.hifi else ''}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_dir = f"./runs/wan_single_dist_multienv_cam_check_{args.num_envs}{'_hifi' if args.hifi else ''}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         writer = SummaryWriter(log_dir=log_dir)
         print(f"TensorBoard logging to: {log_dir}")
 
-    ckpt_base = f"./checkpoints/wan_single_dist_cam_{args.num_envs}{'_hifi' if args.hifi else ''}"
+    ckpt_base = f"./checkpoints/wan_single_dist_cam_check_{args.num_envs}{'_hifi' if args.hifi else ''}"
     view_names = ["3D_FPV"]
 
     # 3. Multi-Step Trajectory Training Loop
