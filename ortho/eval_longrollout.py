@@ -8,14 +8,16 @@ with the same logged actions and camera commands, and compared on the FPV view:
   - FVD on FPV clips (R3D-18 features, see metrics.compute_fvd)
 
 Models are LoRA checkpoint folders, named after the folder:
-  --multi   predicts all 4 views jointly (new_train_ortho_wan.py / train_ortho_wan.py); FPV is view 3
-  --single  predicts the FPV view only (train_single_wan.py)
+  --multi   predicts all 4 views jointly (train_ortho_dist.py / train_ortho_base.py); FPV is view 3
+  --single  predicts the FPV view only (train_single_dist.py / train_single_wan.py)
+The first --single model (else the first --multi) is the reference for the paired AUC-PSNR differences
+(other - reference, 95% bootstrap CI over rollouts; positive = better than the FPV-only baseline).
 
-Usage:
-  python eval_longrollout.py \\
-      --multi ./checkpoints/runs/ortho \\
-      --single ./checkpoints/runs/fpv_only \\
-      --envs all --rollout_steps 32 --n_rollouts 20
+Usage (from the repo root, so ./checkpoints resolves):
+  python ortho/eval_longrollout.py \\
+      --multi  ./checkpoints/wan_ortho_dist_cam_12_lora_final \\
+      --single ./checkpoints/wan_single_dist_cam_check_12_lora_final \\
+      --model_id ./Wan2.1-T2V-1.3B-Diffusers/ --num_envs 3 --rollout_steps 32 --n_rollouts 20 --eval_steps 16
 
 Saves to results/eval/<tag>/:
   per_step.csv        <- env, model, step, metric means (curves)
@@ -43,12 +45,10 @@ from tqdm import tqdm
 
 from utils import _build_registry, _build_heldout_registry, load_base_model, load_agent, compose_player_prompts, set_seed
 from buffer import OrthoTransitionBuffer
-from new_train_ortho_wan import (
-    collect_rollouts,
-    encode_views_to_latents,
-    decode_latents_to_views,
-    predict_next_view_latents,
-)
+from models import encode_views_to_latents, decode_latents_to_views
+# Same data collection, sampler and resolution as the DDP training scripts (the sampler is identical in
+# train_single_dist.py and works for 1-view and 4-view latents alike)
+from train_ortho_dist import collect_rollouts, predict_next_view_latents, IMG_H, IMG_W
 from metrics import compute_fvd, _get_lpips_fn
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -89,8 +89,9 @@ def drift_onset(psnr_curve, thresh=DRIFT_DB):
 
 def model_specs(multi_paths, single_paths):
     """Checkpoint folders -> [(name, kind, path)], each model named after its folder."""
-    specs = [(os.path.basename(os.path.normpath(p)), "multi", p) for p in multi_paths]
-    specs += [(os.path.basename(os.path.normpath(p)), "single", p) for p in single_paths]
+    # FPV-only baselines first: the first model is the reference for the paired differences
+    specs = [(os.path.basename(os.path.normpath(p)), "single", p) for p in single_paths]
+    specs += [(os.path.basename(os.path.normpath(p)), "multi", p) for p in multi_paths]
     names = [n for n, _, _ in specs]
     if len(set(names)) != len(names):
         raise ValueError(f"Checkpoint folders must have distinct names, got {names}")
@@ -127,24 +128,14 @@ def load_models(base_transformer, specs):
 # ENVIRONMENTS & DATA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_eval_envs(which, num_envs):
-    """Returns [(label, env_name, factory, split)]; held-out envs appear with and without obstacles."""
-    entries = []
-    if which in ("train", "all"):
-        for name, factory in _build_registry()[:num_envs]:
-            entries.append((name, name, factory, "train"))
-    if which in ("heldout", "all"):
-        for obstacles in (True, False):
-            for name, factory in _build_heldout_registry(obstacles=obstacles):
-                label = name if obstacles else f"{name} (no obstacles)"
-                entries.append((label, name, factory, "heldout"))
-    if which not in ("train", "heldout", "all"):
-        wanted = [w.strip() for w in which.split(",")]
-        all_entries = build_eval_envs("all", num_envs=10**6)
-        entries = [e for e in all_entries if e[0] in wanted]
-        missing = set(wanted) - {e[0] for e in entries}
-        if missing:
-            raise ValueError(f"Unknown environments: {sorted(missing)}")
+def build_eval_envs(num_envs):
+    """Returns [(label, env_name, factory, split)]: the first `num_envs` training envs, then every held-out env
+    with and without obstacles."""
+    entries = [(name, name, factory, "train") for name, factory in _build_registry()[:num_envs]]
+    for obstacles in (True, False):
+        for name, factory in _build_heldout_registry(obstacles=obstacles):
+            label = name if obstacles else f"{name} (no obstacles)"
+            entries.append((label, name, factory, "heldout"))
     return entries
 
 def make_agent(env_name, env):
@@ -166,7 +157,7 @@ def make_agent(env_name, env):
 def collect_eval_buffer(env_name, factory, n_steps, seed):
     env = factory()
     agent = make_agent(env_name, env)
-    buffer = OrthoTransitionBuffer(capacity=n_steps + 16, img_h=96, img_w=96, max_action_len=8)
+    buffer = OrthoTransitionBuffer(capacity=n_steps + 16, img_h=IMG_H, img_w=IMG_W, max_action_len=8)
     collect_rollouts(env, agent, buffer, n_steps=n_steps, seed=seed, env_name=env_name)   # closes env
     return buffer
 
@@ -207,8 +198,9 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
     if len(seqs) < n_rollouts:
         print(f"  [WARN] {env_name}: only {len(seqs)}/{n_rollouts} full-length rollout windows available")
     if not seqs:
-        return None, None, None
+        return None, None, None, None
 
+    pbar = tqdm(total=len(seqs) * rollout_steps, desc=f"Eval [{env_name}]", unit="step")
     for b0 in range(0, len(seqs), batch_size):
         chunk = seqs[b0:b0 + batch_size]
         B = len(chunk)
@@ -221,6 +213,7 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
 
         frames = defaultdict(list)
         for step in range(rollout_steps):
+            pbar.update(len(chunk))
             acts = [c[2][step] for c in chunk]
             envs = [c[3][step] or env_name for c in chunk]
             cams = [c[4][step] for c in chunk]
@@ -248,10 +241,21 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
         if strip is None:
             strip = {key: [fr[s - 1][0] for s in strip_steps if s <= rollout_steps] for key, fr in frames.items()}
 
+    pbar.close()
     curves = {key: {metric: [float(np.mean(v)) for v in per_step] for metric, per_step in metrics.items()}
               for key, metrics in acc.items()}
+    # Per-rollout AUC-PSNR (N,), index-aligned across models since every model sees the same windows in order
+    auc = {key: np.mean(np.array(metrics["psnr"]), axis=0) for key, metrics in acc.items()}
     clips = {key: torch.cat(c, dim=0) for key, c in clips.items()}
-    return curves, clips, strip
+    return curves, clips, strip, auc
+
+
+def paired_diff(a, b, n_boot=10000, seed=0):
+    """Mean of a - b over paired rollouts with a 95% bootstrap CI."""
+    d = np.asarray(a) - np.asarray(b)
+    rng = np.random.default_rng(seed)
+    boots = d[rng.integers(0, len(d), size=(n_boot, len(d)))].mean(axis=1)
+    return float(d.mean()), float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -397,17 +401,18 @@ def main(args):
     model_names = [n for n, _, _ in models]
     strip_steps = [int(s) for s in args.strip_steps.split(",")]
 
-    env_entries = build_eval_envs(args.envs, args.num_envs)
+    env_entries = build_eval_envs(args.num_envs)
     print(f"\nEvaluating {len(models)} models on {len(env_entries)} environments "
           f"({args.n_rollouts} rollouts x {args.rollout_steps} steps, seed {args.seed})")
 
     table, all_curves, split_of = {}, {}, {}
     pooled_clips = {"train": defaultdict(list), "heldout": defaultdict(list)}
+    pooled_auc_diff = {"train": {}, "heldout": {}}
 
     for label, env_name, factory, split in env_entries:
         print(f"\n=== {label} [{split}] ===")
         buffer = collect_eval_buffer(env_name, factory, args.buffer_steps, args.seed)
-        curves, clips, strip = evaluate_env(
+        curves, clips, strip, auc = evaluate_env(
             model, models, vae, text_encoder, tokenizer, buffer, env_name,
             rollout_steps=args.rollout_steps, n_rollouts=args.n_rollouts, eval_steps=args.eval_steps,
             batch_size=args.batch_size, strip_steps=strip_steps,
@@ -434,6 +439,12 @@ def main(args):
             r = table[label][name]
             print(f"  {name:<20} FPV PSNR@1 {fmt(r['psnr@1'])} | AUC {fmt(r['auc_psnr'])} | "
                   f"drift {r['drift'] or '>' + str(args.rollout_steps)} | FVD {fmt(r['fvd'], 1)}")
+        # Paired AUC-PSNR difference of every model against the first one (same start frames / actions)
+        ref = model_names[0]
+        for name in model_names[1:]:
+            m, lo, hi = paired_diff(auc[name], auc[ref])
+            print(f"  AUC-PSNR {name} - {ref}: {m:+.2f} dB  [95% CI {lo:+.2f}, {hi:+.2f}]  (n={len(auc[ref])})")
+            pooled_auc_diff[split].setdefault(name, []).extend(auc[name] - auc[ref])
 
     # Aggregate rows over training / held-out environments (FVD pooled over all clips of the split)
     for split, title in (("train", "Train (mean)"), ("heldout", "Held-out (mean)")):
@@ -451,6 +462,9 @@ def main(args):
                              for key in all_curves[envs[0]]}
         clean = re.sub(r"[^0-9a-zA-Z]+", "_", title).strip("_").lower()
         plot_curves(all_curves[title], model_names, os.path.join(out_dir, f"{clean}_curves.png"), title)
+        for name, d in pooled_auc_diff[split].items():
+            m, lo, hi = paired_diff(d, np.zeros(len(d)))
+            print(f"[{title}] AUC-PSNR {name} - {model_names[0]}: {m:+.2f} dB  [95% CI {lo:+.2f}, {hi:+.2f}]  (n={len(d)})")
 
     write_summary_csv(os.path.join(out_dir, "summary.csv"), table)
     write_per_step_csv(os.path.join(out_dir, "per_step.csv"), all_curves)
@@ -463,13 +477,11 @@ def main(args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="FPV-centred long-horizon rollout evaluation of multi-view and single-view world models")
-    p.add_argument("--multi", nargs="*", default=["./checkpoints/wan_ortho_cam_3_lora_final"],
-                   help="Checkpoint folders of multi-view models (FPV + supporting views)")
-    p.add_argument("--single", nargs="*", default=["./checkpoints/wan_single_cam_3_lora_final"],
-                   help="Checkpoint folders of FPV-only models")
+    p.add_argument("--multi", nargs="*", default=["./checkpoints/wan_ortho_dist_cam_12_lora_final"],
+                   help="Checkpoint folders of multi-view models (FPV + supporting views), e.g. train_ortho_dist.py")
+    p.add_argument("--single", nargs="*", default=["./checkpoints/wan_single_dist_cam_check_12_lora_final"],
+                   help="Checkpoint folders of FPV-only models, e.g. train_single_dist.py")
     p.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
-    p.add_argument("--envs", type=str, default="all",
-                   help="'train', 'heldout', 'all', or a comma-separated list of env labels")
     p.add_argument("--num_envs", type=int, default=12, help="Number of training envs (registry order) to evaluate")
     p.add_argument("--rollout_steps", type=int, default=32)
     p.add_argument("--n_rollouts", type=int, default=20, help="Rollouts per environment")

@@ -180,6 +180,7 @@ def train_ortho_trajectory_step(
                 b = curr_latents.shape[0]
                 use_ar = torch.rand(b, device=curr_latents.device) < teacher_forcing_prob   # (B,) which samples self-predict
                 next_latents = target_latents.clone()
+                
                 if use_ar.any():
                     with torch.no_grad():
                         next_latents[use_ar] = predict_next_view_latents(

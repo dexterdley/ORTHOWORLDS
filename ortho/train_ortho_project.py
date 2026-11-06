@@ -88,11 +88,10 @@ def train_ortho_flow_step(
     # 3. Noise all 4 target views at t+1 simultaneously
     latents_next_fp32 = latents_next.float()
     noise = torch.randn_like(latents_next_fp32)
-    noise[:, :, 3:4] += sketch_latents_t.detach().float()
+    # noise[:, :, 3:4] += sketch_latents_t.detach().float()
     noisy_latents_next_fp32 = (1.0 - tau_exp) * latents_next_fp32 + tau_exp * noise
     noisy_latents_next = noisy_latents_next_fp32.to(dtype=transformer.dtype)
 
-    
     combined_latents = torch.cat([cond_latents_t, sketch_latents_t, noisy_latents_next], dim=2)
 
     # 5. Ground truth velocity: v_target = noise - x_0
@@ -108,6 +107,7 @@ def train_ortho_flow_step(
 
     # 7. Supervise all 4 target views at t+1 (indices 4:8)
     pred_velocity = model_pred[:, :, num_views + 1 :].float()
+    pred_velocity[:, :, 3:4] -= transformer.sketch_proj.skip * sketch_latents_t.detach().float()
     per_view_losses = [
         F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
         for idx in range(num_views)
@@ -227,7 +227,7 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=
 
     # Keep Euler state in float32 to prevent bfloat16 rounding stagnation
     x_tau = torch.randn((b, c, num_views, h, w), device=latents_t.device, dtype=torch.float32)
-    x_tau[:, :, 3:4] += sketch_next.float()
+    # x_tau[:, :, 3:4] += sketch_next.float()
 
     # Shifted timestep schedule from 1.0 -> 0.0
     sigmas = torch.linspace(1.0, 0.0, steps + 1, device=latents_t.device, dtype=torch.float32)
@@ -246,6 +246,7 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=
             timestep=t_tensor,
             encoder_hidden_states=prompt_embeds,
         ).sample[:, :, num_views + 1 :].float()  # (B, C, 4, h, w)
+        pred_velocity[:, :, 3:4] -= transformer.sketch_proj.skip * sketch_next.float()
         x_tau = x_tau - dt * pred_velocity
 
     return x_tau.to(dtype=transformer.dtype)
@@ -598,6 +599,7 @@ def main(args):
     )
     # model.sketch_proj = LinearProjector().to(device)
     model.sketch_proj = SoftZProjector(h_lat=IMG_H // 8, w_lat=IMG_W // 8).to(device)
+    model.sketch_proj.skip = torch.nn.Parameter(torch.zeros(1, 16, 1, 1, 1, device=device))
 
     proj_params = list(model.sketch_proj.parameters())
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("sketch_proj.")]
@@ -612,7 +614,7 @@ def main(args):
     total_steps = args.epochs * args.steps_per_epoch
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
 
-    log_dir = f"./runs/wan_project_multienv_cam_{args.num_envs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir = f"./runs/wan_project_multienv_cam_skip_{args.num_envs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging to: {log_dir}")
 
@@ -720,14 +722,14 @@ def main(args):
 
         # Checkpointing
         if (epoch + 1) % args.save_every == 0:
-            ckpt_dir = f"./checkpoints/wan_project_lora_epoch_{epoch+1}"
+            ckpt_dir = f"./checkpoints/wan_project_lora_skip_epoch_{epoch+1}"
             os.makedirs(ckpt_dir, exist_ok=True)
             model.save_pretrained(ckpt_dir)
             torch.save(model.sketch_proj.state_dict(), os.path.join(ckpt_dir, "sketch_proj.pt"))
             print(f"  [SAVED] LoRA checkpoint to {ckpt_dir}")
 
     print("\nTraining Complete! Saving final LoRA weights...")
-    final_dir = f"./checkpoints/wan_project_cam_{args.num_envs}_lora_final"
+    final_dir = f"./checkpoints/wan_project_cam_{args.num_envs}_lora_skip_final"
     os.makedirs(final_dir, exist_ok=True)
     model.save_pretrained(final_dir)
     torch.save(model.sketch_proj.state_dict(), os.path.join(final_dir, "sketch_proj.pt"))
