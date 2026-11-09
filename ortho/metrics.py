@@ -75,9 +75,12 @@ def _get_r3d_model():
 
 
 @torch.no_grad()
-def _extract_video_features(videos: torch.Tensor) -> np.ndarray:
+def _extract_video_features(videos: torch.Tensor, batch_size: int = 16) -> np.ndarray:
     """Extract R3D-18 features from a batch of videos.
-    
+
+    Clips are moved to the GPU `batch_size` at a time (the model is in eval mode, so the features are
+    identical to a single full-batch pass); pooled FVD over many envs would otherwise not fit in memory.
+
     Args:
         videos: (N, T, 3, H, W) float32 in [0, 1], H/W >= 112 recommended.
                 If H/W < 112, frames are upsampled automatically.
@@ -86,25 +89,27 @@ def _extract_video_features(videos: torch.Tensor) -> np.ndarray:
     """
     model = _get_r3d_model()
     N, T, C, H, W = videos.shape
-    
+
     # R3D expects (N, C, T, H, W) and input in approx. ImageNet normalisation
     # We normalise [0,1] → ImageNet mean/std
     mean = torch.tensor([0.43216, 0.394666, 0.37645], device=device).view(1, 3, 1, 1, 1)
     std  = torch.tensor([0.22803, 0.22145,  0.216989], device=device).view(1, 3, 1, 1, 1)
-    
-    v = videos.to(device).float()          # (N, T, C, H, W)
-    v = v.permute(0, 2, 1, 3, 4)          # (N, C, T, H, W)
-    
-    # Upsample spatial dims to at least 112 x 112 if needed
-    if H < 112 or W < 112:
-        v = F.interpolate(v.reshape(N * C, T, H, W).unsqueeze(1),
-                          size=(T, 112, 112), mode='trilinear',
-                          align_corners=False).squeeze(1).view(N, C, T, 112, 112)
-    
-    v = (v - mean) / std
-    
-    feats = model(v)                       # (N, 512)
-    return feats.cpu().numpy()
+
+    feats = []
+    for i in range(0, N, batch_size):
+        v = videos[i:i + batch_size].to(device).float()   # (n, T, C, H, W)
+        n = v.shape[0]
+        v = v.permute(0, 2, 1, 3, 4)                      # (n, C, T, H, W)
+
+        # Upsample spatial dims to at least 112 x 112 if needed
+        if H < 112 or W < 112:
+            v = F.interpolate(v.reshape(n * C, T, H, W).unsqueeze(1),
+                              size=(T, 112, 112), mode='trilinear',
+                              align_corners=False).squeeze(1).view(n, C, T, 112, 112)
+
+        v = (v - mean) / std
+        feats.append(model(v).cpu())                      # (n, 512)
+    return torch.cat(feats, dim=0).numpy()
 
 
 def _frechet_distance(mu1: np.ndarray, sigma1: np.ndarray,

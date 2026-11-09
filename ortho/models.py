@@ -85,7 +85,7 @@ class SoftZProjector(nn.Module):
         P0 = torch.zeros(hw, n_src, hw)
         P0[:, n_src - 1] = torch.eye(hw) * init_peak                        # init ~ copy Rear
         P0 = P0.view(hw, n_src * hw)
-        self.pos = nn.Parameter(torch.stack([P0, torch.zeros_like(P0), torch.zeros_like(P0)]))  # [1, sin, cos] x (hw, 3hw)
+        self.pos = nn.Parameter(torch.stack([P0] + [torch.zeros_like(P0)] * 4))  # [1, sin/cos yaw, sin/cos pitch] x (hw, 3hw)
         self.null_logit = nn.Parameter(torch.zeros(hw))                      # "ray hits nothing"
         self.bg = nn.Parameter(torch.zeros(hw, c_lat))                       # background for empty rays
         self.score = nn.ModuleList([nn.Sequential(nn.Linear(c_lat, hidden), nn.GELU(), nn.Linear(hidden, 1)) for _ in range(n_src)])
@@ -109,4 +109,5 @@ class SoftZProjector(nn.Module):
 
 def cam_feats(cam_states, device="cuda" if torch.cuda.is_available() else "cpu"):
     yaw = torch.tensor([float(cs.get("yaw", 0.0)) for cs in cam_states], device=device)
-    return torch.stack([yaw.sin(), yaw.cos()], dim=1)
+    pitch = torch.tensor([float(cs.get("pitch", 0.0)) for cs in cam_states], device=device)
+    return torch.stack([yaw.sin(), yaw.cos(), pitch.sin(), pitch.cos()], dim=1)

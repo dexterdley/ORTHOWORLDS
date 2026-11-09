@@ -10,6 +10,7 @@ with the same logged actions and camera commands, and compared on the FPV view:
 Models are LoRA checkpoint folders, named after the folder:
   --multi   predicts all 4 views jointly (train_ortho_dist.py / train_ortho_base.py); FPV is view 3
   --single  predicts the FPV view only (train_single_dist.py / train_single_wan.py)
+  --project predicts all 4 views jointly from an FPV sketch (train_ortho_project_dist.py); loads sketch_proj.pt from the folder
 The first --single model (else the first --multi) is the reference for the paired AUC-PSNR differences
 (other - reference, 95% bootstrap CI over rollouts; positive = better than the FPV-only baseline).
 
@@ -17,6 +18,7 @@ Usage (from the repo root, so ./checkpoints resolves):
   python ortho/eval_longrollout.py \\
       --multi  ./checkpoints/wan_ortho_dist_cam_12_lora_final \\
       --single ./checkpoints/wan_single_dist_cam_check_12_lora_final \\
+      --project ./checkpoints/wan_project_dist_cam_12_lora_final \\
       --model_id ./Wan2.1-T2V-1.3B-Diffusers/ --num_envs 3 --rollout_steps 32 --n_rollouts 20 --eval_steps 16
 
 Saves to results/eval/<tag>/:
@@ -45,10 +47,11 @@ from tqdm import tqdm
 
 from utils import _build_registry, _build_heldout_registry, load_base_model, load_agent, compose_player_prompts, set_seed
 from buffer import OrthoTransitionBuffer
-from models import encode_views_to_latents, decode_latents_to_views
+from models import encode_views_to_latents, decode_latents_to_views, SoftZProjector, cam_feats
 # Same data collection, sampler and resolution as the DDP training scripts (the sampler is identical in
 # train_single_dist.py and works for 1-view and 4-view latents alike)
 from train_ortho_dist import collect_rollouts, predict_next_view_latents, IMG_H, IMG_W
+from train_ortho_project_dist import predict_next_view_latents as predict_next_view_latents_project
 from metrics import compute_fvd, _get_lpips_fn
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -87,11 +90,12 @@ def drift_onset(psnr_curve, thresh=DRIFT_DB):
 # MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def model_specs(multi_paths, single_paths):
+def model_specs(multi_paths, single_paths, project_paths):
     """Checkpoint folders -> [(name, kind, path)], each model named after its folder."""
     # FPV-only baselines first: the first model is the reference for the paired differences
     specs = [(os.path.basename(os.path.normpath(p)), "single", p) for p in single_paths]
     specs += [(os.path.basename(os.path.normpath(p)), "multi", p) for p in multi_paths]
+    specs += [(os.path.basename(os.path.normpath(p)), "project", p) for p in project_paths]
     names = [n for n, _, _ in specs]
     if len(set(names)) != len(names):
         raise ValueError(f"Checkpoint folders must have distinct names, got {names}")
@@ -105,11 +109,18 @@ def train_arg(path, key, default):
     except FileNotFoundError:
         return default
 
+def load_projector(path):
+    """Sketch projector saved next to an Ortho-Project LoRA. Strict load: a checkpoint from another projector class fails here."""
+    proj = SoftZProjector(h_lat=IMG_H // 8, w_lat=IMG_W // 8).to(device)
+    proj.load_state_dict(torch.load(os.path.join(path, "sketch_proj.pt"), map_location=device))
+    return proj.eval()
+
 def load_models(base_transformer, specs):
-    """Loads every LoRA as a named adapter on one shared base DiT. Returns (peft_model, [(name, kind, adapter)])."""
+    """Loads every LoRA as a named adapter on one shared base DiT.
+    Returns (peft_model, [(name, kind, adapter)], {adapter: sketch projector} for the --project models)."""
     from peft import PeftModel
 
-    model, models = None, []
+    model, models, projectors = None, [], {}
     for i, (name, kind, path) in enumerate(specs):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint for '{name}' not found: {path}")
@@ -118,10 +129,12 @@ def load_models(base_transformer, specs):
             model = PeftModel.from_pretrained(base_transformer, path, adapter_name=adapter)
         else:
             model.load_adapter(path, adapter_name=adapter)
+        if kind == "project":
+            projectors[adapter] = load_projector(path)
         print(f"  [LOADED] {name} ({kind}) <- {path}")
         models.append((name, kind, adapter))
     model.eval()
-    return model, models
+    return model, models, projectors
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,7 +187,7 @@ def encode_prompts(text_encoder, tokenizer, acts, env_names, cams, dtype):
     return text_encoder(**tokens).last_hidden_state.to(dtype=dtype)
 
 @torch.no_grad()
-def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
+def evaluate_env(model, models, projectors, vae, text_encoder, tokenizer, buffer, env_name,
                  rollout_steps, n_rollouts, eval_steps, batch_size, strip_steps):
     """
     Rolls out every model from the same GT start frames with the same logged actions / camera commands.
@@ -208,7 +221,7 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
 
         state = {}
         for name, kind, adapter in models:
-            init = vt0 if kind == "multi" else vt0[:, FPV_IDX:FPV_IDX + 1]
+            init = vt0[:, FPV_IDX:FPV_IDX + 1] if kind == "single" else vt0
             state[name] = encode_views_to_latents(vae, init, out_dtype=model.dtype)
 
         frames = defaultdict(list)
@@ -218,6 +231,7 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
             envs = [c[3][step] or env_name for c in chunk]
             cams = [c[4][step] for c in chunk]
             embeds = encode_prompts(text_encoder, tokenizer, acts, envs, cams, model.dtype)
+            cam = cam_feats(cams)
 
             gt = torch.from_numpy(np.stack([c[1][step] for c in chunk])).float().to(device) / 255.0  # (B, 4, 3, H, W)
             gt_fpv = gt[:, FPV_IDX]
@@ -225,7 +239,11 @@ def evaluate_env(model, models, vae, text_encoder, tokenizer, buffer, env_name,
 
             for name, kind, adapter in models:
                 model.set_adapter(adapter)
-                next_lat = predict_next_view_latents(model, state[name], embeds, steps=eval_steps)
+                if kind == "project":
+                    model.sketch_proj = projectors[adapter]                      # the sampler reads transformer.sketch_proj
+                    next_lat = predict_next_view_latents_project(model, state[name], embeds, cam, steps=eval_steps)
+                else:
+                    next_lat = predict_next_view_latents(model, state[name], embeds, steps=eval_steps)
                 dec = decode_latents_to_views(vae, next_lat)                     # (B, V, 3, H, W) in [0, 1]
                 state[name] = encode_views_to_latents(vae, dec * 2.0 - 1.0, out_dtype=model.dtype)
 
@@ -388,16 +406,16 @@ def main(args):
     out_dir = os.path.join(args.out_root, tag)
     os.makedirs(out_dir, exist_ok=True)
 
-    specs = model_specs(args.multi, args.single)
+    specs = model_specs(args.multi, args.single, args.project)
     for name, kind, path in specs:
         views = train_arg(path, "views", None)
-        if views is not None and (views == "all") != (kind == "multi"):
+        if views is not None and (views == "all") != (kind != "single"):
             raise ValueError(f"'{name}' was trained with --views {views} but passed via --{kind}")
         # Mirrored target layout was removed from training/sampling; such checkpoints would sample wrongly
         if train_arg(path, "target_order", "same") != "same":
             raise ValueError(f"'{name}' was trained with --target_order mirror, which is no longer supported")
     base_transformer, vae, text_encoder, tokenizer = load_base_model(model_id=args.model_id)
-    model, models = load_models(base_transformer, specs)
+    model, models, projectors = load_models(base_transformer, specs)
     model_names = [n for n, _, _ in models]
     strip_steps = [int(s) for s in args.strip_steps.split(",")]
 
@@ -413,7 +431,7 @@ def main(args):
         print(f"\n=== {label} [{split}] ===")
         buffer = collect_eval_buffer(env_name, factory, args.buffer_steps, args.seed)
         curves, clips, strip, auc = evaluate_env(
-            model, models, vae, text_encoder, tokenizer, buffer, env_name,
+            model, models, projectors, vae, text_encoder, tokenizer, buffer, env_name,
             rollout_steps=args.rollout_steps, n_rollouts=args.n_rollouts, eval_steps=args.eval_steps,
             batch_size=args.batch_size, strip_steps=strip_steps,
         )
@@ -481,6 +499,8 @@ def parse_args():
                    help="Checkpoint folders of multi-view models (FPV + supporting views), e.g. train_ortho_dist.py")
     p.add_argument("--single", nargs="*", default=["./checkpoints/wan_single_dist_cam_check_12_lora_final"],
                    help="Checkpoint folders of FPV-only models, e.g. train_single_dist.py")
+    p.add_argument("--project", nargs="*", default=["./checkpoints/wan_project_dist_cam_12_lora_final"],
+                   help="Checkpoint folders of projection models with a sketch_proj.pt, e.g. train_ortho_project_dist.py")
     p.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
     p.add_argument("--num_envs", type=int, default=12, help="Number of training envs (registry order) to evaluate")
     p.add_argument("--rollout_steps", type=int, default=32)

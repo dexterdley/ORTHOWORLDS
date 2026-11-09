@@ -3,22 +3,17 @@ Fine-tuning Wan2.1-1.3B with LoRA for Orthographic Multi-View World Modeling.
 
 Modelling Process
 
-Linear projector: Ortho-Base + Linear Sketch
+Linear projector: Ortho-Base plus a sketch frame
 
 frame:     0     1     2     3      4      |   5      6      7      8
          Top   Side  Rear   FPV   Sketch   |  Top    Side   Rear   FPV
-          |     |     |             ^      |                        ^
-          +-----+-----+         (a) |      |                    (b) |
-                |                   |      |                        |
-                v                   |      |                        |
-        [ Linear Proj. ] -----------+------|------------------------+
-                |
-         -------|-- clean context -------- | ---- views_{t+1} (noisy at tau) ----
-loss:           +-(c)-> MSE vs FPV_{t+1}   |   yes    yes    yes    yes
-
-(a) clean context frame; the DiT's output at frame 4 is discarded
-(b) FPV_{t+1} noise ~ N(sketch.detach(), I), in training and in the sampler
-(c) aux MSE(sketch, clean FPV_{t+1}) on the projector, added to the four view losses
+          |     |     |             ^      |
+          +-----+-----+             |      |
+                |                   |      |
+                v                   |      |
+        [ Linear Proj. ] -----------+      |
+         ---------- clean context -------- | ---- views_{t+1} (noisy at tau) ----
+loss:                                      |   yes    yes    yes    yes
 
 Usage:
 CUDA_VISIBLE_DEVICES=3 python ./ortho/train_ortho_project.py --rollout_steps=4096 --epochs=20 --batch_size=32 --teacher_forcing_prob=0.5 --steps_per_epoch=200 --num_envs=3 --lr=3e-4 --model_id=./Wan2.1-T2V-1.3B-Diffusers/
@@ -40,16 +35,16 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 # HuggingFace & Diffusers imports
-from utils import _build_registry, _build_heldout_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose, _psnr
+from utils import _build_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose, _psnr
 from buffer import OrthoTransitionBuffer
-from models import _get_wan_latent_stats, encode_views_to_latents, decode_latents_to_views, cam_feats, LinearProjector, SoftZProjector
+from models import _get_wan_latent_stats, encode_views_to_latents, decode_latents_to_views, LinearProjector, SoftZProjector, cam_feats
 
 from stable_baselines3 import PPO
 from huggingface_sb3 import load_from_hub
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-IMG_H, IMG_W = 224, 224
+IMG_H, IMG_W = 96,96
 
 # ==========================================
 # MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
@@ -88,10 +83,11 @@ def train_ortho_flow_step(
     # 3. Noise all 4 target views at t+1 simultaneously
     latents_next_fp32 = latents_next.float()
     noise = torch.randn_like(latents_next_fp32)
-    # noise[:, :, 3:4] += sketch_latents_t.detach().float()
+    noise[:, :, 3:4] += sketch_latents_t.detach().float()
     noisy_latents_next_fp32 = (1.0 - tau_exp) * latents_next_fp32 + tau_exp * noise
     noisy_latents_next = noisy_latents_next_fp32.to(dtype=transformer.dtype)
 
+    
     combined_latents = torch.cat([cond_latents_t, sketch_latents_t, noisy_latents_next], dim=2)
 
     # 5. Ground truth velocity: v_target = noise - x_0
@@ -107,21 +103,11 @@ def train_ortho_flow_step(
 
     # 7. Supervise all 4 target views at t+1 (indices 4:8)
     pred_velocity = model_pred[:, :, num_views + 1 :].float()
-    pred_velocity[:, :, 3:4] -= transformer.sketch_proj.skip * sketch_latents_t.detach().float()
     per_view_losses = [
         F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
         for idx in range(num_views)
     ]
-
-    # Focus lens: weight FPV tokens by how wrong the sketch is there (vs GT FPV_{t+1}); detached, mean 1 per sample
-    with torch.no_grad():
-        err = (sketch_latents_t.float() - latents_next_fp32[:, :, 3:4]).pow(2).mean(1, keepdim=True)   # (B,1,1,h,w)
-        z = (err - err.mean((3, 4), keepdim=True)) / (err.std((3, 4), keepdim=True) + 1e-6)          # standardise per sample
-        lens_w = 1.0 + torch.sigmoid(z)      # ~1 where the sketch is right, up to 1+λ where it is wrong
-        lens_w = lens_w / lens_w.mean((3, 4), keepdim=True)
-    fpv_lens_loss = (lens_w * (pred_velocity[:, :, 3:4] - target_velocity[:, :, 3:4]).pow(2)).mean()
-
-    loss = sum(per_view_losses[:3]) + fpv_lens_loss
+    loss = sum(per_view_losses)
     aux_loss = F.mse_loss(sketch_latents_t.float(), latents_next_fp32[:, :, 3:4])
 
     loss = loss + aux_loss
@@ -197,13 +183,11 @@ def train_ortho_trajectory_step(
         if not is_last_step:
             if teacher_forcing_prob > 0.0:
                 b = curr_latents.shape[0]
-                use_ar = torch.rand(b, device=curr_latents.device) < teacher_forcing_prob   # (B,) which samples self-predict
-                next_latents = target_latents.clone()
-                if use_ar.any():
-                    with torch.no_grad():
-                        next_latents[use_ar] = predict_next_view_latents(
-                            transformer, curr_latents[use_ar], prompt_embeds[use_ar], cam[use_ar], steps=8)
-                curr_latents = next_latents
+                use_ar_mask = (torch.rand((b, 1, 1, 1, 1), device=curr_latents.device) < teacher_forcing_prob).to(dtype=transformer.dtype)
+                #curr_latents = use_ar_mask * pred_next_latents + (1.0 - use_ar_mask) * target_latents
+                with torch.no_grad():
+                    sampled = predict_next_view_latents(transformer, curr_latents, prompt_embeds, cam, steps=4)
+                curr_latents = use_ar_mask * sampled + (1.0 - use_ar_mask) * target_latents
             else:
                 curr_latents = target_latents
 
@@ -213,7 +197,7 @@ def train_ortho_trajectory_step(
 # AUTOREGRESSIVE VIDEO ROLLOUT & SAMPLING
 # ==========================================
 @torch.no_grad()
-def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=20, shift=3.0, fpv_next=None):
+def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=20, shift=3.0):
     """
     Simultaneously denoises all 4 orthographic views at t+1 via reverse Euler Flow Matching.
     Input:
@@ -223,11 +207,11 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=
     """
     b, c, num_views, h, w = latents_t.shape
     latents_t = latents_t.to(dtype=transformer.dtype)
-    sketch_next = transformer.sketch_proj(latents_t[:, :, :3], cam).to(dtype=transformer.dtype)
+    sketch_t = transformer.sketch_proj(latents_t[:, :, :3], cam).to(dtype=transformer.dtype)
 
     # Keep Euler state in float32 to prevent bfloat16 rounding stagnation
     x_tau = torch.randn((b, c, num_views, h, w), device=latents_t.device, dtype=torch.float32)
-    # x_tau[:, :, 3:4] += sketch_next.float()
+    x_tau[:, :, 3:4] += sketch_t.float()
 
     # Shifted timestep schedule from 1.0 -> 0.0
     sigmas = torch.linspace(1.0, 0.0, steps + 1, device=latents_t.device, dtype=torch.float32)
@@ -239,14 +223,13 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, cam, steps=
         dt = sigma_curr - sigma_next
 
         t_tensor = torch.full((b,), sigma_curr * 1000.0, device=latents_t.device, dtype=transformer.dtype)
-        combined = torch.cat([latents_t, sketch_next, x_tau.to(dtype=transformer.dtype)], dim=2)  # (B, C, 9, h, w)
+        combined = torch.cat([latents_t, sketch_t, x_tau.to(dtype=transformer.dtype)], dim=2)  # (B, C, 9, h, w)
 
         pred_velocity = transformer(
             hidden_states=combined,
             timestep=t_tensor,
             encoder_hidden_states=prompt_embeds,
         ).sample[:, :, num_views + 1 :].float()  # (B, C, 4, h, w)
-        pred_velocity[:, :, 3:4] -= transformer.sketch_proj.skip * sketch_next.float()
         x_tau = x_tau - dt * pred_velocity
 
     return x_tau.to(dtype=transformer.dtype)
@@ -383,8 +366,8 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
     """
     agents = agents or {}
     transformer.eval()
-    unique_envs = ['Parkour Runner', 'Lunar Lander', 'MultiCar Racing']
-    reg_dict = dict(_build_registry() + _build_heldout_registry())
+    unique_envs = ['Bipedal Walker', 'Lunar Lander', 'MultiCar Racing']
+    reg_dict = dict(_build_registry())
     
     print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch} across envs: {', '.join(unique_envs)}...")
 
@@ -400,7 +383,7 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
             tokenizer=tokenizer,
             env_name=env_name,
             env=env,
-            agent=agents.get(env_name, agents.get("Bipedal Walker")),
+            agent=agents.get(env_name),
             rollout_steps=rollout_steps,
             steps=steps,
             seed=seed,
@@ -429,6 +412,11 @@ def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, e
         writer.add_video(f"Test/{clean_tag}/Rear",     vid_rear,     epoch, fps=fps)
         writer.add_video(f"Test/{clean_tag}/Side",     vid_side,     epoch, fps=fps)
         writer.add_video(f"Test/{clean_tag}/FPV",      vid_fpv_vis,  epoch, fps=fps)
+
+        writer.add_video(f"GT/{clean_tag}/Top-Down", vid_gt_top_down, epoch, fps=fps)
+        writer.add_video(f"GT/{clean_tag}/Rear",     vid_gt_rear,     epoch, fps=fps)
+        writer.add_video(f"GT/{clean_tag}/Side",     vid_gt_side,     epoch, fps=fps)
+        writer.add_video(f"GT/{clean_tag}/FPV",      vid_gt_fpv_vis,  epoch, fps=fps)
         writer.add_video(f"Test/{clean_tag}/Sketch",  vid_sketch,      epoch, fps=fps)
 
     transformer.train()
@@ -515,7 +503,7 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
         state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
     env.close()
 
-def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3, collect=True):
+def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3):
     """Loops through all registered environments and populates the multi-env buffer.
     Returns (active_envs, agents) where agents maps env_name -> the collection policy (reused by validation)."""
     print("=" * 60)
@@ -551,8 +539,7 @@ def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3, c
             print(f"Loading PPO agent from: {ckpt_path}")
             agent = load_agent(ckpt_path, state_dim, env.action_space, device)
         
-        if collect:
-            collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=env_name)
+        collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=42, env_name=env_name)
         active_envs.append((env_name, env))
         agents[env_name] = agent
 
@@ -575,31 +562,19 @@ def main(args):
     registry = _build_registry()
     reg_dict = dict(registry)
     buffer = OrthoTransitionBuffer(
-        capacity=args.rollout_steps * min(args.num_envs, len(registry)), img_h=IMG_H, img_w=IMG_W, max_action_len=8
+        capacity=args.buffer_capacity, img_h=IMG_H, img_w=IMG_W, max_action_len=8
     )
 
-    # Rollout cache: the buffer depends on the RNG seed (camera-pose picks), the env seed (42 here), envs, steps and image size
-    cache_dir = (f"./buffer_cache/s{args.seed}_c42_r0"
-                 f"_e{args.num_envs}_n{args.rollout_steps}_{IMG_H}px")
-    cached = os.path.exists(os.path.join(cache_dir, "meta.pkl"))
     active_envs, agents = collect_all_envs_rollouts(
-        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs,
-        collect=not cached,   # always load the PPO agents (validation needs them); render only without a cache
+        registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs
     )
-    if cached:
-        buffer.load(cache_dir)
-        print(f"[INFO] Loaded cached rollouts from {cache_dir} ({buffer.size} transitions)")
-    else:
-        buffer.save(cache_dir)
-    set_seed(args.seed)   # same RNG state from here on, whether collected or loaded
 
     # 2. Model & LoRA Setup
     model, vae, text_encoder, tokenizer = load_model(
         model_id=args.model_id, lora_rank=args.lora_rank
     )
-    # model.sketch_proj = LinearProjector().to(device)
+    #model.sketch_proj = LinearProjector(h_lat=IMG_H // 8, w_lat=IMG_W // 8).to(device)
     model.sketch_proj = SoftZProjector(h_lat=IMG_H // 8, w_lat=IMG_W // 8).to(device)
-    model.sketch_proj.skip = torch.nn.Parameter(torch.zeros(1, 16, 1, 1, 1, device=device))
 
     proj_params = list(model.sketch_proj.parameters())
     lora_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("sketch_proj.")]
@@ -614,7 +589,7 @@ def main(args):
     total_steps = args.epochs * args.steps_per_epoch
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
 
-    log_dir = f"./runs/wan_project_multienv_cam_skip_{args.num_envs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir = f"./runs/wan_project_multienv_cam_{args.num_envs}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging to: {log_dir}")
 
@@ -675,9 +650,9 @@ def main(args):
                 latents_t0=latents_t,
                 latents_next_seq=latents_next_seq,
                 prompt_embeds_seq=prompt_embeds_seq,
-                cam_seq=cam_seq,
                 teacher_forcing_prob=curr_teacher_forcing_prob,
                 ctx_noise_max=args.ctx_noise_max,
+                cam_seq=cam_seq
             )
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -722,14 +697,14 @@ def main(args):
 
         # Checkpointing
         if (epoch + 1) % args.save_every == 0:
-            ckpt_dir = f"./checkpoints/wan_project_lora_skip_epoch_{epoch+1}"
+            ckpt_dir = f"./checkpoints/wan_project_lora_epoch_{epoch+1}"
             os.makedirs(ckpt_dir, exist_ok=True)
             model.save_pretrained(ckpt_dir)
             torch.save(model.sketch_proj.state_dict(), os.path.join(ckpt_dir, "sketch_proj.pt"))
             print(f"  [SAVED] LoRA checkpoint to {ckpt_dir}")
 
     print("\nTraining Complete! Saving final LoRA weights...")
-    final_dir = f"./checkpoints/wan_project_cam_{args.num_envs}_lora_skip_final"
+    final_dir = f"./checkpoints/wan_project_cam_{args.num_envs}_lora_final"
     os.makedirs(final_dir, exist_ok=True)
     model.save_pretrained(final_dir)
     torch.save(model.sketch_proj.state_dict(), os.path.join(final_dir, "sketch_proj.pt"))
@@ -744,6 +719,7 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Single Game Views")
     parser.add_argument("--rollout_steps", type=int, default=2048, help="Rollout steps when training on a single environment")
+    parser.add_argument("--buffer_capacity", type=int, default=40000, help="Capacity of multi-environment transition buffer")
     parser.add_argument("--model_id", type=str, default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", help="HuggingFace model ID")
     parser.add_argument("--lora_rank", type=int, default=64, help="LoRA rank dimension")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per gradient step")
@@ -757,7 +733,7 @@ def parse_args():
                         help="Learning rate for the sketch projector (at the LoRA lr it barely leaves its copy-Rear init)")
     parser.add_argument("--save_every", type=int, default=2, help="Save checkpoint every N epochs")
     parser.add_argument("--eval_every", type=int, default=1, help="Generate and evaluate views every N epochs")
-    parser.add_argument("--eval_steps", type=int, default=8, help="Number of Euler flow matching sampling steps per frame")
+    parser.add_argument("--eval_steps", type=int, default=20, help="Number of Euler flow matching sampling steps per frame")
     parser.add_argument("--rollout_video_steps", type=int, default=16, help="Autoregressive rollout steps for validation videos")
     parser.add_argument("--video_fps", type=int, default=15, help="FPS for TensorBoard video logging")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
