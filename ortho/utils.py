@@ -8,6 +8,8 @@ import torch.nn as nn
 from diffusers import WanPipeline
 from peft import LoraConfig, get_peft_model
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
@@ -641,3 +643,15 @@ def load_base_model(model_id="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"):
     transformer.to(device)
 
     return transformer, vae, text_encoder, tokenizer
+
+
+# ==========================================
+# DISTRIBUTED HELPERS (no-ops on a single GPU)
+# ==========================================
+def _unwrap(model):
+    """Returns the underlying module of a DDP-wrapped model (DDP does not expose .dtype, .save_pretrained, etc.)."""
+    return model.module if isinstance(model, DDP) else model
+
+
+def is_main():
+    return not dist.is_initialized() or dist.get_rank() == 0

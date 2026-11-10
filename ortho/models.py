@@ -111,3 +111,43 @@ def cam_feats(cam_states, device="cuda" if torch.cuda.is_available() else "cpu")
     yaw = torch.tensor([float(cs.get("yaw", 0.0)) for cs in cam_states], device=device)
     pitch = torch.tensor([float(cs.get("pitch", 0.0)) for cs in cam_states], device=device)
     return torch.stack([yaw.sin(), yaw.cos(), pitch.sin(), pitch.cos()], dim=1)
+
+class CrossViewProjector(nn.Module):
+    """Renders view `tgt` from the other three by a soft z-buffer (leave-one-out): per target cell, softmax
+    over source cells of (learned ray logit(yaw, pitch) + occupancy score of the cell).
+    The per-view encoders (score, value) are shared across targets; ray logits, null logit and background
+    are per target. A 3-view input (Top, Side, Rear) renders the FPV, as SoftZProjector did.
+    Views: 0 Top, 1 Side, 2 Rear, 3 FPV."""
+    def __init__(self, h_lat, w_lat, c_lat=16, n_views=4, init_peak=8.0, hidden=32, init_src=(1, 2, 1, 2)):
+        super().__init__()
+        self.h_lat, self.w_lat = h_lat, w_lat
+        hw = h_lat * w_lat
+        self.src = [[j for j in range(n_views) if j != i] for i in range(n_views)]   # sources of each target
+        P0 = torch.zeros(n_views, hw, n_views - 1, hw)
+        for i, j in enumerate(init_src):                                    # init ~ copy init_src[i] (FPV <- Rear, as before)
+            P0[i, :, self.src[i].index(j)] = torch.eye(hw) * init_peak
+        P0 = P0.view(n_views, hw, (n_views - 1) * hw)
+        self.pos = nn.Parameter(torch.stack([P0] + [torch.zeros_like(P0)] * 4, 1))  # (tgt, [1, sin/cos yaw, sin/cos pitch], hw, 3hw)
+        self.null_logit = nn.Parameter(torch.zeros(n_views, hw))            # "ray hits nothing", per target
+        self.bg = nn.Parameter(torch.zeros(n_views, hw, c_lat))             # background for empty rays, per target
+        self.score = nn.ModuleList([nn.Sequential(nn.Linear(c_lat, hidden), nn.GELU(), nn.Linear(hidden, 1)) for _ in range(n_views)])  # shared by all targets
+        self.value = nn.ModuleList([nn.Linear(c_lat, c_lat) for _ in range(n_views)])
+        with torch.no_grad():
+            for s in self.score: s[-1].weight.zero_(); s[-1].bias.zero_()    # start purely positional
+            for v in self.value: v.weight.copy_(torch.eye(c_lat)); v.bias.zero_()
+
+    def forward(self, views, cam, tgt=3):
+        x = views.float()                                                    # (B, C, 4, h, w), or (B, C, 3, h, w) for FPV
+        if x.shape[2] == 3:                                                  # FPV slot is never a source for tgt=3
+            x = torch.cat([x, torch.zeros_like(x[:, :, :1])], 2)
+        b, c, v = x.shape[:3]
+        src = self.src[tgt]
+        tok = x.reshape(b, c, v, -1).permute(0, 2, 3, 1)                     # (B, 4, hw, C)
+        score = torch.cat([self.score[i](tok[:, i]) for i in src], 1).squeeze(-1)   # (B, 3hw)  occupancy
+        val = torch.cat([self.value[i](tok[:, i]) for i in src], 1)                 # (B, 3hw, C)
+        basis = torch.cat([torch.ones_like(cam[:, :1]), cam.float()], 1)     # (B, 5)
+        logits = torch.einsum("bk,kqn->bqn", basis, self.pos[tgt]) + score[:, None, :]   # (B, hw, 3hw)
+        null = self.null_logit[tgt].view(1, -1, 1).expand(b, -1, 1)
+        attn = torch.softmax(torch.cat([logits, null], -1), -1)              # (B, hw, 3hw + 1)
+        out = attn[..., :-1] @ val + attn[..., -1:] * self.bg[tgt]           # (B, hw, C)
+        return out.transpose(1, 2).reshape(b, c, 1, self.h_lat, self.w_lat)

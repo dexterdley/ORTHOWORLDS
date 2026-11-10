@@ -20,37 +20,24 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 ./ortho/tr
 
 import os
 import math
-import contextlib
-import random
 import argparse
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
-import numpy as np
-import cv2
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 # HuggingFace & Diffusers imports
-from utils import _build_registry, _build_heldout_registry, load_model, compose_player_prompts, set_active_env, set_seed, load_agent, _annotate_frame_pose, _psnr
+from utils import load_model, compose_player_prompts, set_active_env, set_seed, is_main
 from buffer import OrthoTransitionBuffer
-from models import _get_wan_latent_stats, encode_views_to_latents, decode_latents_to_views
+from models import _get_wan_latent_stats, encode_views_to_latents
+from data_rollout import get_registries, collect_all_envs_rollouts
+from flow import train_ortho_trajectory_step
+from validation import evaluate_and_log_videos
 
-from stable_baselines3 import PPO
-from huggingface_sb3 import load_from_hub
-
-def get_registries(hifi=False):
-    """(train_registry, heldout_registry): GymBox by default, Godot hi-fi with --hifi."""
-    if not hifi:
-        return _build_registry(), _build_heldout_registry()
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hifi"))
-    from wrappers import build_hifi_registry, build_hifi_heldout_registry
-    return build_hifi_registry(), build_hifi_heldout_registry()
 
 # torchrun sets LOCAL_RANK; set the CUDA device before anything touches "cuda" (utils/buffer use the bare "cuda" device)
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -58,490 +45,6 @@ torch.cuda.set_device(local_rank)
 device = f"cuda:{local_rank}"
 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 IMG_H, IMG_W = 224, 224
-
-def _unwrap(model):
-    """Returns the underlying module of a DDP-wrapped model (DDP does not expose .dtype, .save_pretrained, etc.)."""
-    return model.module if isinstance(model, DDP) else model
-
-def is_main():
-    return not dist.is_initialized() or dist.get_rank() == 0
-
-# ==========================================
-# MULTI-STEP TRAJECTORY FLOW MATCHING TRAINING
-# ==========================================
-def train_ortho_flow_step(
-    transformer,
-    latents_t,
-    latents_next,
-    prompt_embeds,
-    shift=3.0,
-    ctx_noise_max=0.15,
-):
-    """
-    Single transition Flow-Matching step (used inside multi-step trajectory rollout).
-    Applies mild context noise to `latents_t` to prevent autoregressive drift,
-    and optionally returns the model's reconstructed clean latent `pred_x0` at t+1.
-    """
-    b, c, num_views, h, w = latents_next.shape
-
-    # 1. Sample shifted logit-normal flow-matching timestep tau in (0, 1)
-    u = torch.randn(b, device=latents_next.device, dtype=torch.float32)
-    tau = torch.sigmoid(u)
-    tau = (shift * tau) / (1.0 + (shift - 1.0) * tau)
-    tau = tau.clamp(1e-4, 1.0 - 1e-4)
-    tau_exp = tau.view(b, 1, 1, 1, 1)
-
-    # 2. Context noise augmentation on conditioning views `latents_t`
-    latents_t_fp32 = latents_t.float()
-    tau_ctx = torch.rand((b, 1, 1, 1, 1), device=latents_t.device, dtype=torch.float32) * ctx_noise_max
-    ctx_noise = torch.randn_like(latents_t_fp32)
-    cond_latents_t = ((1.0 - tau_ctx) * latents_t_fp32 + tau_ctx * ctx_noise).to(dtype=_unwrap(transformer).dtype)
-
-    # 3. Noise all 4 target views at t+1 simultaneously
-    latents_next_fp32 = latents_next.float()
-    noise = torch.randn_like(latents_next_fp32)
-    noisy_latents_next_fp32 = (1.0 - tau_exp) * latents_next_fp32 + tau_exp * noise
-    noisy_latents_next = noisy_latents_next_fp32.to(dtype=_unwrap(transformer).dtype)
-
-    # 4. Concatenate conditioning views (frames 0:4) and noisy target views (frames 4:8)
-    combined_latents = torch.cat([cond_latents_t, noisy_latents_next], dim=2)
-
-    # 5. Ground truth velocity: v_target = noise - x_0
-    target_velocity = noise - latents_next_fp32
-
-    # 6. DiT Forward pass
-    timesteps = (tau * 1000.0).to(dtype=_unwrap(transformer).dtype)
-    model_pred = transformer(
-        hidden_states=combined_latents,
-        timestep=timesteps,
-        encoder_hidden_states=prompt_embeds,
-    ).sample
-
-    # 7. Supervise all 4 target views at t+1 (indices 4:8)
-    pred_velocity = model_pred[:, :, num_views : 2 * num_views].float()
-
-    per_view_losses = [
-        F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
-        for idx in range(num_views)
-    ]
-    loss = sum(per_view_losses)
-
-    # Reconstruct 1-step denoised prediction: x_0_hat = x_tau - tau * v_pred
-    with torch.no_grad():
-        pred_x0 = (noisy_latents_next_fp32 - tau_exp * pred_velocity.detach()).clamp(-6.0, 6.0)
-        #confidence = (1.0 - tau_exp).clamp(0.2, 1.0)
-        #rollout_latent = (confidence * pred_x0 + (1.0 - confidence) * latents_next_fp32).to(dtype=transformer.dtype)
-        rollout_latent = pred_x0.to(dtype=_unwrap(transformer).dtype)
-    return loss, [l.item() for l in per_view_losses], rollout_latent
-
-def train_ortho_trajectory_step(
-    transformer,
-    latents_t0,
-    latents_next_seq,
-    prompt_embeds_seq,
-    shift=3.0,
-    teacher_forcing_prob=0.5,
-    ctx_noise_max=0.15,
-):
-    """
-    Unrolls a multi-step trajectory of length `seq_len` during training.
-    - At step s=0, conditions on ground-truth `latents_t0`.
-    - At step s>0, with probability `teacher_forcing_prob`, conditions on the model's own predicted
-      latent from step s-1 (student forcing) so the model learns to recover from its
-      own rollout errors over multi-step horizons.
-    - Backpropagates `(loss_s / seq_len)` at each step so peak VRAM remains constant.
-    - Under DDP, gradients accumulate locally and are all-reduced only on the final step's backward.
-    """
-    seq_len = len(latents_next_seq)
-    num_views = latents_t0.shape[2]
-
-    curr_latents = latents_t0
-    total_loss = 0.0
-    avg_per_view = [0.0] * num_views
-
-    for s in range(seq_len):
-        target_latents = latents_next_seq[s]
-        prompt_embeds = prompt_embeds_seq[s]
-        is_last_step = (s == seq_len - 1)
-
-        # Skip the gradient all-reduce until the last step of the trajectory (forward and backward must both be inside no_sync)
-        sync_ctx = transformer.no_sync() if (isinstance(transformer, DDP) and not is_last_step) else contextlib.nullcontext()
-        with sync_ctx:
-            step_loss, step_view_losses, pred_next_latents = train_ortho_flow_step(
-                transformer=transformer,
-                latents_t=curr_latents,
-                latents_next=target_latents,
-                prompt_embeds=prompt_embeds,
-                shift=shift,
-                ctx_noise_max=ctx_noise_max,
-            )
-
-            # Normalize loss across trajectory length and backpropagate immediately to save VRAM
-            scaled_loss = step_loss / float(seq_len)
-            scaled_loss.backward()
-
-        total_loss += step_loss.item() / float(seq_len)
-        for v_idx in range(num_views):
-            avg_per_view[v_idx] += step_view_losses[v_idx] / float(seq_len)
-
-        # Prepare context for step s + 1 (Student Forcing vs. Teacher Forcing per sample)
-        if not is_last_step:
-            if teacher_forcing_prob > 0.0:
-                b = curr_latents.shape[0]
-                use_ar = torch.rand(b, device=curr_latents.device) < teacher_forcing_prob   # (B,) which samples self-predict
-                next_latents = target_latents.clone()
-
-                if use_ar.any():  # sample only the self-predicting entries (was: whole batch, then masked)
-                    with torch.no_grad():
-                        next_latents[use_ar] = predict_next_view_latents(
-                            _unwrap(transformer), curr_latents[use_ar], prompt_embeds[use_ar], steps=16)
-                curr_latents = next_latents
-            else:
-                curr_latents = target_latents
-
-    return total_loss, avg_per_view
-
-# ==========================================
-# AUTOREGRESSIVE VIDEO ROLLOUT & SAMPLING
-# ==========================================
-@torch.no_grad()
-def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, shift=3.0):
-    """
-    Simultaneously denoises all 4 orthographic views at t+1 via reverse Euler Flow Matching.
-    Input:
-      latents_t: (B, C, 4, h, w) - clean past views at time t
-    Output:
-      latents_next: (B, C, 4, h, w) - predicted views at time t+1
-    """
-    b, c, num_views, h, w = latents_t.shape
-    latents_t = latents_t.to(dtype=transformer.dtype)
-
-    # Keep Euler state in float32 to prevent bfloat16 rounding stagnation
-    x_tau = torch.randn((b, c, num_views, h, w), device=latents_t.device, dtype=torch.float32)
-
-    # Shifted timestep schedule from 1.0 -> 0.0
-    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=latents_t.device, dtype=torch.float32)
-    sigmas = (shift * sigmas) / (1.0 + (shift - 1.0) * sigmas)
-
-    for step_i in range(steps):
-        sigma_curr = sigmas[step_i]
-        sigma_next = sigmas[step_i + 1]
-        dt = sigma_curr - sigma_next
-
-        t_tensor = torch.full((b,), sigma_curr * 1000.0, device=latents_t.device, dtype=transformer.dtype)
-        combined = torch.cat([latents_t, x_tau.to(dtype=transformer.dtype)], dim=2)  # (B, C, 8, h, w)
-
-        pred_velocity = transformer(
-            hidden_states=combined,
-            timestep=t_tensor,
-            encoder_hidden_states=prompt_embeds,
-        ).sample[:, :, num_views : 2 * num_views].float()  # (B, C, 4, h, w)
-        x_tau = x_tau - dt * pred_velocity
-
-    return x_tau.to(dtype=transformer.dtype)
-
-@torch.no_grad()
-def autoregressive_rollout(transformer, vae, text_encoder, tokenizer, env_name, env, agent=None,
-                           rollout_steps=16, steps=20, camera_command="Right", seed=42):
-    """
-    Autoregressive video rollout for single FPV view.
-    Returns:
-      gen_views: (vid_top, vid_rear, vid_side, vid_fpv) each (1, T, 3, H, W) in [0, 1]
-      gt_views:  (gt_top,  gt_rear,  gt_side,  gt_fpv)  each (1, T, 3, H, W) in [0, 1]
-      vis:       (gen_fpv_vis, gt_fpv_vis) pose-annotated FPV videos for logging
-    """
-    transformer.eval()
-
-    obs, _ = env.reset(seed=seed)
-    obs = _skip_intro(env, env_name, obs)
-    env.action_space.seed(seed)
-
-    # Same first render as collect_rollouts: "Center" is a no-op right after reset (yaw = pitch = 0)
-    img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
-
-    # Each view becomes its own batch item: (4, 1, 3, H, W) -> latents (4, C, 1, h, w)
-    vt = [cv2.resize(x, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA) for x in [img_top, im_side, im_rear, im_fpv]]
-    vt = np.stack([np.transpose(v, (2, 0, 1)) for v in vt])
-    vt = np.expand_dims(vt, axis=1)
-
-    curr_views = torch.from_numpy(vt).float().to(device) / 127.5 - 1.0
-    curr_latents = encode_views_to_latents(vae, curr_views, out_dtype=transformer.dtype)
-    num_views = curr_latents.shape[0]
-
-    # Frame storage (0: Top, 1: Side, 2: Rear, 3: FPV)
-    gen_top, gen_side, gen_rear, gen_fpv = [], [], [], []
-    gt_top,  gt_side,  gt_rear,  gt_fpv  = [], [], [], []
-    gen_fpv_vis, gt_fpv_vis = [], []  # pose-annotated copies, for logged videos only
-
-    print(f"Starting {rollout_steps}-step Autoregressive Rollout for [{env_name}] (camera {camera_command})...")
-
-    for step_i in range(rollout_steps):
-        if hasattr(agent, "predict"):
-            action, _ = agent.predict(obs, deterministic=True)
-        else:
-            action = env.action_space.sample()
-        obs, _, terminated, truncated, _ = env.step(action)
-
-        # Render the GT target before predicting: training prompts use the camera state read right after this render
-        next_top, next_rear, next_side, next_fpv = env.render(camera_pose=camera_command)
-        cam_state = _camera_state(env, camera_command)
-
-        # Same float32 action vector the buffer stores (a scalar discrete action becomes length 1)
-        act = np.atleast_1d(np.asarray(action, dtype=np.float32))
-        prompt = compose_player_prompts(
-            [act],
-            env_name=env_name,
-            camera_pose=cam_state,
-        )
-
-        text_inputs = tokenizer(
-            prompt, padding="max_length", max_length=128, truncation=True, return_tensors="pt"
-        ).to(device)
-        
-        prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(dtype=transformer.dtype)
-        prompt_embeds = prompt_embeds.expand(num_views, -1, -1)
-
-        next_latents = predict_next_view_latents(
-            transformer=transformer,
-            latents_t=curr_latents,
-            prompt_embeds=prompt_embeds,
-            steps=steps,
-        )
-
-        decoded_views = decode_latents_to_views(vae, next_latents)  # (4, 1, 3, H, W) in [0, 1]
-
-        # Store generated frames (0: Top, 1: Side, 2: Rear, 3: FPV)
-        gen_top.append(decoded_views[0, 0].cpu())
-        gen_side.append(decoded_views[1, 0].cpu())
-        gen_rear.append(decoded_views[2, 0].cpu())
-
-        vn = [cv2.resize(x, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA) for x in [next_top, next_side, next_rear, next_fpv]]
-        vn = np.stack([np.transpose(v, (2, 0, 1)) for v in vn])
-
-        gt_vn = torch.from_numpy(vn).float() / 255.0  # (4, 3, H, W)
-        gt_top.append(gt_vn[0])
-        gt_side.append(gt_vn[1])
-        gt_rear.append(gt_vn[2])
-
-        # Raw FPV frames are used for PSNR; the pose overlay only goes on the logged videos
-        curr_gen_fpv = decoded_views[3, 0].cpu()
-        curr_gt_fpv = gt_vn[3]
-
-        gen_fpv.append(curr_gen_fpv)
-        gt_fpv.append(curr_gt_fpv)
-        gen_fpv_vis.append(_annotate_frame_pose(curr_gen_fpv, camera_command))
-        gt_fpv_vis.append(_annotate_frame_pose(curr_gt_fpv, camera_command))
-
-        # Re-encode decoded RGB frame back through VAE to stay on the clean VAE manifold
-        next_views_norm = decoded_views * 2.0 - 1.0
-        curr_latents = encode_views_to_latents(vae, next_views_norm, out_dtype=transformer.dtype)
-
-        # Training windows never cross an episode reset, so stop instead of jumping to a new episode
-        if terminated or truncated:
-            break
-
-    vid_gen_top  = torch.stack(gen_top,  dim=0).unsqueeze(0)
-    vid_gen_side = torch.stack(gen_side, dim=0).unsqueeze(0)
-    vid_gen_rear = torch.stack(gen_rear, dim=0).unsqueeze(0)
-    vid_gen_fpv  = torch.stack(gen_fpv,  dim=0).unsqueeze(0)
-
-    vid_gt_top   = torch.stack(gt_top,   dim=0).unsqueeze(0)
-    vid_gt_side  = torch.stack(gt_side,  dim=0).unsqueeze(0)
-    vid_gt_rear  = torch.stack(gt_rear,  dim=0).unsqueeze(0)
-    vid_gt_fpv   = torch.stack(gt_fpv,   dim=0).unsqueeze(0)
-    vid_gen_fpv_vis = torch.stack(gen_fpv_vis, dim=0).unsqueeze(0)
-    vid_gt_fpv_vis  = torch.stack(gt_fpv_vis,  dim=0).unsqueeze(0)
-
-    transformer.train()
-    env.close()
-    return (vid_gen_top, vid_gen_rear, vid_gen_side, vid_gen_fpv,
-            vid_gt_top,  vid_gt_rear,  vid_gt_side,  vid_gt_fpv,
-            vid_gen_fpv_vis, vid_gt_fpv_vis)
-
-
-@torch.no_grad()
-def evaluate_and_log_videos(transformer, vae, text_encoder, tokenizer, writer, epoch, agents=None, rollout_steps=16, steps=20, fps=15, seed=42, hifi=False):
-    """
-    Performs autoregressive video rollouts for each view and writes the videos to TensorBoard.
-    `agents` maps env_name -> the policy used during data collection (random actions if missing).
-    """
-    agents = agents or {}
-    transformer.eval()
-    unique_envs = ['Parkour Runner', 'Lunar Lander', 'MultiCar Racing']
-    # reg_dict = dict(_build_registry() + _build_heldout_registry())
-    train_reg, heldout_reg = get_registries(hifi)
-    reg_dict = dict(train_reg + heldout_reg)
-
-    print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch} across envs: {', '.join(unique_envs)}...")
-
-    for env_idx, env_name in enumerate(unique_envs):
-        env = reg_dict[env_name]()
-
-        (vid_top_down, vid_rear, vid_side, vid_fpv,
-         vid_gt_top_down, vid_gt_rear, vid_gt_side, vid_gt_fpv,
-         vid_fpv_vis, vid_gt_fpv_vis) = autoregressive_rollout(
-            transformer=transformer,
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            env_name=env_name,
-            env=env,
-            agent=agents.get(env_name, agents.get("Bipedal Walker")),
-            rollout_steps=rollout_steps,
-            steps=steps,
-            seed=seed,
-        )
-
-        clean_tag = env_name.replace(" ", "_").lower()
-
-        psnr_top_down = _psnr(vid_top_down, vid_gt_top_down)
-        psnr_rear     = _psnr(vid_rear, vid_gt_rear)
-        psnr_side     = _psnr(vid_side, vid_gt_side)
-        psnr_fpv      = _psnr(vid_fpv, vid_gt_fpv)
-        psnr_mean     = (psnr_top_down + psnr_rear + psnr_side + psnr_fpv) / 4.0
-
-        writer.add_scalar(f"Validation/{clean_tag}/PSNR/Top Down", psnr_top_down, epoch)
-        writer.add_scalar(f"Validation/{clean_tag}/PSNR/Rear",     psnr_rear,     epoch)
-        writer.add_scalar(f"Validation/{clean_tag}/PSNR/Side",     psnr_side,     epoch)
-        writer.add_scalar(f"Validation/{clean_tag}/PSNR/FPV",      psnr_fpv,      epoch)
-        writer.add_scalar(f"Validation/{clean_tag}/PSNR/Mean",     psnr_mean,     epoch)
-
-        print(f"  [Epoch {epoch}] [{env_name}] Autoregressive Video PSNR: {psnr_mean:.2f} dB "
-              f"(Top-Down: {psnr_top_down:.2f}dB, Rear: {psnr_rear:.2f}dB, Side: {psnr_side:.2f}dB, FPV: {psnr_fpv:.2f}dB)")
-
-        # Always write per-env tagged videos; also alias as generic Test/ for the first env
-        writer.add_video(f"Test/{clean_tag}/Top-Down", vid_top_down, epoch, fps=fps)
-        writer.add_video(f"Test/{clean_tag}/Rear",     vid_rear,     epoch, fps=fps)
-        writer.add_video(f"Test/{clean_tag}/Side",     vid_side,     epoch, fps=fps)
-        writer.add_video(f"Test/{clean_tag}/FPV",      vid_fpv_vis,  epoch, fps=fps)
-
-    transformer.train()
-
-def _skip_intro(env, env_name, obs):
-    """Steps CarRacing past its zoom-in intro with no-op actions so those frames never reach the buffer."""
-    if env_name == "MultiCar Racing":
-        for _ in range(50):
-            obs, _, _, _, _ = env.step(np.zeros(3))
-    return obs
-
-def _camera_state(env, command):
-    """Camera state stored with each transition and fed to the prompt; read right after env.render(command)."""
-    return {
-        "command": command,
-        "x": getattr(env, "cam_x", 0.0),
-        "y": getattr(env, "cam_y", 0.0),
-        "z": getattr(env, "cam_z", 0.0),
-        "roll": getattr(env, "cam_roll", 0.0),
-        "yaw": getattr(env, "cam_yaw", 0.0),
-        "pitch": getattr(env, "cam_pitch", 0.0),
-    }
-
-def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker"):
-    """Collects camera rollouts storing stateful camera poses."""
-    obs, _ = env.reset(seed=seed)
-    obs = _skip_intro(env, env_name, obs)
-    env.action_space.seed(seed)
-    state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
-
-    pose_hold = 0
-
-    # Render once per env step (each render advances the camera), so views_next[k] == views_t[k+1]
-    # and every transition is one camera increment, matching the validation rollout.
-    # "Center" is a no-op right after reset (yaw = pitch = 0).
-    img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
-
-    for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]", disable=not is_main()):
-        if pose_hold <= 0:
-          current_pose = random.choice(["Center", "Up", "Down", "Left", "Right"])
-          pose_hold = random.randint(8, 16)
-        else:
-          pose_hold -= 1
-
-        with torch.inference_mode():
-          if hasattr(agent, "predict"):
-            action, _ = agent.predict(obs, deterministic=True)
-          else:
-            action = env.action_space.sample()
-
-        next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-
-        next_top, next_rear, next_side, next_fpv = env.render(
-            camera_pose=current_pose
-        )
-
-        # Extract wrapper's stateful angles if available
-        cam_state = _camera_state(env, current_pose)
-
-        buffer.push(
-            top_t=img_top,
-            side_t=im_side,
-            rear_t=im_rear,
-            fpv_t=im_fpv,
-            top_next=next_top,
-            side_next=next_side,
-            rear_next=next_rear,
-            fpv_next=next_fpv,
-            action=action,
-            done=done,
-            env_name=env_name,
-            camera_state=cam_state,
-        )
-
-        if done:
-          obs, _ = env.reset()
-          obs = _skip_intro(env, env_name, obs)
-          pose_hold = 0
-          img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
-        else:
-          obs = next_obs
-          img_top, im_rear, im_side, im_fpv = next_top, next_rear, next_side, next_fpv
-        state = torch.tensor(obs, dtype=torch.float32, device=device).reshape(1, -1)
-    env.close()
-
-def collect_all_envs_rollouts(registry, buffer, rollout_steps=150, num_envs=3, seed=42, collect=True):
-    """Loops through all registered environments and populates the multi-env buffer.
-    Returns (active_envs, agents) where agents maps env_name -> the collection policy (reused by validation)."""
-    print("=" * 60)
-    print(f"Collecting rollouts across all {min(num_envs, len(registry))} environments...")
-    print("=" * 60)
-
-    active_envs = []
-    agents = {}
-    for idx, (env_name, factory) in enumerate(registry[:num_envs]):
-        print(f"\n[{idx + 1}/{len(registry)}] Initializing environment: {env_name}")
-        env = factory()
-
-        obs, info = env.reset()
-        state_dim = int(np.prod(obs.shape if hasattr(obs, 'shape') else env.observation_space.shape))
-        clean_env_name = "".join(c for c in env_name if c.isalnum() or c in ('_', '-')).lower()
-        ckpt_path = os.path.join("checkpoints", f"ppo_{clean_env_name}.pt")
-        
-        if env_name == "Lunar Lander":
-            checkpoint = load_from_hub(
-                repo_id="Adilbai/ppo-LunarLander-v2",
-                filename="ppo-LunarLander-v2.zip"
-            )
-            agent = PPO.load(checkpoint)
-
-        elif env_name == "MultiCar Racing":
-            checkpoint = load_from_hub(
-                repo_id="igpaub/ppo-CarRacing-v2",
-                filename="ppo-CarRacing-v2.zip"
-            )
-            agent = PPO.load(checkpoint)
-
-        else:
-            print(f"Loading PPO agent from: {ckpt_path}")
-            agent = load_agent(ckpt_path, state_dim, env.action_space, device)
-        if collect:
-            collect_rollouts(env, agent, buffer, n_steps=rollout_steps, seed=seed, env_name=env_name)
-        active_envs.append((env_name, env))
-        agents[env_name] = agent
-
-    unique_recorded = list(dict.fromkeys([e for e in buffer.env_names[:buffer.size] if e is not None]))
-    print(f"\n[INFO] Buffer populated with {buffer.size} transitions across {len(unique_recorded)} environments: {', '.join(unique_recorded)}")
-    return active_envs, agents
 
 
 # ==========================================
@@ -575,9 +78,11 @@ def main(args):
                 f"_e{args.num_envs}_n{args.rollout_steps}_{IMG_H}px{'_hifi' if args.hifi else ''}")
 
     cached = os.path.exists(os.path.join(cache_dir, "meta.pkl"))
-    active_envs, agents = collect_all_envs_rollouts(
+    # With a cache, build no envs or agents: hifi envs launch Godot, which the training box may not have.
+    # Validation then replays clips from this buffer (ReplayEnv), so it needs no envs either.
+    active_envs, agents = ([], {}) if cached else collect_all_envs_rollouts(
         registry, buffer, rollout_steps=args.rollout_steps, num_envs=args.num_envs, seed=args.seed + rank,
-        collect=not cached,   # always load the PPO agents (validation needs them); render only without a cache
+        device=device,
     )
     if cached:
         buffer.load(cache_dir)
@@ -674,6 +179,7 @@ def main(args):
                 prompt_embeds_seq=prompt_embeds_seq,
                 teacher_forcing_prob=curr_teacher_forcing_prob,
                 ctx_noise_max=args.ctx_noise_max,
+                sf_steps=16,
             )
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -721,6 +227,10 @@ def main(args):
                 fps=args.video_fps,
                 seed=args.seed + 1000,
                 hifi=args.hifi,
+                replay_buffer=buffer if cached else None,
+                img_hw=(IMG_H, IMG_W),
+                per_view=True,
+                log_gt=args.log_gt,
             )
 
         # Checkpointing
@@ -766,6 +276,7 @@ def parse_args():
     parser.add_argument("--eval_steps", type=int, default=8, help="Number of Euler flow matching sampling steps per frame")
     parser.add_argument("--rollout_video_steps", type=int, default=16, help="Autoregressive rollout steps for validation videos")
     parser.add_argument("--video_fps", type=int, default=15, help="FPS for TensorBoard video logging")
+    parser.add_argument("--log_gt", action="store_true", help="Also log the ground-truth validation videos (identical every epoch)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--num_envs", type=int, default=12, help="Number of training envs")
     parser.add_argument("--hifi", action="store_true", default=False, help="Render with the Godot hi-fi envs")

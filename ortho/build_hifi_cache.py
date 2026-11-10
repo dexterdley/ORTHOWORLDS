@@ -16,7 +16,8 @@ import pickle
 
 import numpy as np
 
-from train_single_dist import get_registries, collect_all_envs_rollouts, set_seed, IMG_H, IMG_W
+from data_rollout import get_registries, collect_all_envs_rollouts, IMG_H, IMG_W
+from utils import set_seed
 from buffer import OrthoTransitionBuffer
 
 

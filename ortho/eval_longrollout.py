@@ -48,10 +48,10 @@ from tqdm import tqdm
 from utils import _build_registry, _build_heldout_registry, load_base_model, load_agent, compose_player_prompts, set_seed
 from buffer import OrthoTransitionBuffer
 from models import encode_views_to_latents, decode_latents_to_views, SoftZProjector, cam_feats
-# Same data collection, sampler and resolution as the DDP training scripts (the sampler is identical in
-# train_single_dist.py and works for 1-view and 4-view latents alike)
-from train_ortho_dist import collect_rollouts, predict_next_view_latents, IMG_H, IMG_W
-from train_ortho_project_dist import predict_next_view_latents as predict_next_view_latents_project
+# Same data collection, sampler and resolution as the training scripts (shared modules; the sampler
+# works for 1-view and 4-view latents alike)
+from data_rollout import collect_rollouts, IMG_H, IMG_W
+from flow import predict_next_view_latents, predict_next_view_latents_sketch as predict_next_view_latents_project
 from metrics import compute_fvd, _get_lpips_fn
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
