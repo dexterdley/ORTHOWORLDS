@@ -14,6 +14,8 @@ low-fi wrapper's, so camera dicts logged by collect_rollouts stay comparable.
 pair=True also runs the low-fi render() each call (env.last_lowfi) for paired data; the camera
 state then advances through the wrapper's own render(), exactly as in GymBox.
 aov=("rgb", "mask") also renders object-ID masks (env.last_masks, env.render_masks(target)).
+aov=(..., "depth") also renders depth: env.last_depth[view] = metres along that camera's viewing axis
+(the camera's far distance where nothing is hit).
 
 Registries mirror ortho/utils.py: build_hifi_registry() (training envs) and
 build_hifi_heldout_registry(obstacles) (held-out obstacle-transfer envs).
@@ -28,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from exporters import ENVS, get_exporter, resolve  # noqa: E402
 from exporters.base import VIEWS  # noqa: E402
-from renderer import GodotRenderer, mask_ids  # noqa: E402
+from renderer import GodotRenderer, depth_metres, mask_ids  # noqa: E402
 
 
 class HiFiOrthographicWrapper:
@@ -41,6 +43,7 @@ class HiFiOrthographicWrapper:
         self.pair = pair
         self.last_lowfi = None
         self.last_masks = None
+        self.last_depth = None
         self.cam_x = self.cam_y = self.cam_z = 0.0
         self._step = 0
         self._scene = None
@@ -106,6 +109,8 @@ class HiFiOrthographicWrapper:
         out = tuple(self._fit(frames[(v, "rgb")]) for v in VIEWS)
         if "mask" in self.aov:
             self.last_masks = {v: self._fit(frames[(v, "mask")], nearest=True) for v in VIEWS}
+        if "depth" in self.aov:
+            self.last_depth = {v: depth_metres(self._fit(frames[(v, "depth")], nearest=True)) for v in VIEWS}
         return out
 
     def _fit(self, img, nearest=False):

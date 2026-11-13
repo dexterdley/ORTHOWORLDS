@@ -106,7 +106,7 @@ func _on_hello(msg: Dictionary) -> void:
 		world.setup_look(look)
 		env_name = new_env
 		DisplayServer.window_set_title("OrthoWorlds HiFi - " + env_name)
-	rig.setup(view_size, aovs.has("mask"), mode == "lockstep")
+	rig.setup(view_size, aovs.has("mask"), mode == "lockstep", aovs.has("depth"))
 	rig.set_environments(look.env, look.env_ortho, look.env_mask)
 	rig.set_sky_card(look.card_material())
 	rig.set_live_updates(mode == "live", layout == 4)

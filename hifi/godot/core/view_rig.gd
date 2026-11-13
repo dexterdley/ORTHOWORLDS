@@ -6,18 +6,23 @@ extends Node
 ##   0      everything by default: seen by all four RGB views and the chase view
 ##   1..4   per-view RGB visibility for objects hidden from some views (EnvWorld.set_hidden)
 ##   5      chase camera (live only)
-##   11..14 flat-colour mask duplicates, seen only by the mask cameras (EnvWorld.register)
+##   11..14 flat-colour mask duplicates, seen only by the mask and depth cameras (EnvWorld.register)
+##   15..18 per-view depth read-out quads (depth AOV), seen only by that view's depth camera
 ## Python poses every camera ("cams" in each state message); nothing here computes a pose.
 
 const VIEWS := ["top", "rear", "side", "fpv"]
 const CHASE_BIT := 5
+const DEPTH_BIT := 15
 
 var size := Vector2i(600, 400)
 var want_mask := false
+var want_depth := false
 var rgb: Array[SubViewport] = []
 var cams: Array[Camera3D] = []
 var mask_vps: Array[SubViewport] = []
 var mask_cams: Array[Camera3D] = []
+var depth_vps: Array[SubViewport] = []
+var depth_cams: Array[Camera3D] = []
 var chase_vp: SubViewport
 var chase_cam: Camera3D
 var _env_persp: Environment
@@ -27,7 +32,7 @@ var _lockstep := true
 var _cards: Array[MeshInstance3D] = []
 
 
-func setup(view_size: Vector2i, with_mask: bool, lockstep: bool) -> void:
+func setup(view_size: Vector2i, with_mask: bool, lockstep: bool, with_depth := false) -> void:
 	for c in get_children():
 		c.queue_free()
 	rgb.clear()
@@ -35,8 +40,11 @@ func setup(view_size: Vector2i, with_mask: bool, lockstep: bool) -> void:
 	_cards.clear()
 	mask_vps.clear()
 	mask_cams.clear()
+	depth_vps.clear()
+	depth_cams.clear()
 	size = view_size
 	want_mask = with_mask
+	want_depth = with_depth
 	_lockstep = lockstep
 	for i in VIEWS.size():
 		var vp := _make_vp(VIEWS[i], true)
@@ -54,6 +62,17 @@ func setup(view_size: Vector2i, with_mask: bool, lockstep: bool) -> void:
 			mcam.current = true
 			mask_vps.append(mvp)
 			mask_cams.append(mcam)
+		if with_depth:
+			# Depth AOV: the flat mask twins fill this camera's depth buffer, then a full-screen quad
+			# writes it out as linear depth along the viewing axis (see _depth_quad)
+			var dvp := _make_vp(VIEWS[i] + "_depth", false)
+			var dcam := Camera3D.new()
+			dcam.cull_mask = (1 << (11 + i)) | (1 << (DEPTH_BIT + i))
+			dvp.add_child(dcam)
+			dcam.current = true
+			dcam.add_child(_depth_quad(1 << (DEPTH_BIT + i)))
+			depth_vps.append(dvp)
+			depth_cams.append(dcam)
 	chase_vp = _make_vp("chase", true)
 	chase_vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
 	chase_cam = Camera3D.new()
@@ -85,6 +104,48 @@ func _make_vp(vp_name: String, shaded: bool) -> SubViewport:
 	vp.render_target_update_mode = SubViewport.UPDATE_DISABLED if _lockstep else SubViewport.UPDATE_ALWAYS
 	add_child(vp)
 	return vp
+
+
+static var _depth_shader: Shader
+
+
+func _depth_quad(layer: int) -> MeshInstance3D:
+	## Full-screen quad for the depth AOV: reads its camera's depth buffer and writes the linear
+	## depth along the viewing axis as 24-bit millimetres (R = low byte, B = high byte). Nothing hit
+	## reads as the camera's far distance. Python decodes it with renderer.depth_metres().
+	if _depth_shader == null:
+		_depth_shader = Shader.new()
+		_depth_shader.code = """
+shader_type spatial;
+render_mode unshaded, fog_disabled, depth_test_disabled, depth_draw_never, cull_disabled, shadows_disabled, ambient_light_disabled;
+uniform sampler2D depth_tex : hint_depth_texture, filter_nearest;
+uniform float near = 0.05;
+uniform float far = 4000.0;
+uniform bool ortho = false;
+void vertex() { POSITION = vec4(VERTEX.xy, 1.0, 1.0); }
+void fragment() {
+	// Godot 4.3+ depth is reverse-Z: 1 at the near plane, 0 at the far plane (far = nothing hit).
+	// Linearised from the camera's own near/far (INV_PROJECTION_MATRIX is not reliable here).
+	float z = texture(depth_tex, SCREEN_UV).x;
+	float d = ortho ? far - z * (far - near) : near * far / (z * (far - near) + near);
+	uint mm = uint(clamp(d * 1000.0 + 0.5, 0.0, 16777215.0));
+	vec3 e = vec3(float(mm & 255u), float((mm >> 8u) & 255u), float(mm >> 16u)) / 255.0;
+	// the viewport stores sRGB: pre-linearise so the stored bytes are exactly e * 255
+	ALBEDO = mix(e / 12.92, pow((e + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), e));
+}
+"""
+	var mat := ShaderMaterial.new()
+	mat.shader = _depth_shader
+	var qm := QuadMesh.new()
+	qm.size = Vector2(2, 2)
+	var q := MeshInstance3D.new()
+	q.mesh = qm
+	q.material_override = mat
+	q.layers = layer
+	q.extra_cull_margin = 16384.0
+	q.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	q.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+	return q
 
 
 func set_sky_card(mat: Material) -> void:
@@ -119,6 +180,8 @@ func _apply_envs() -> void:
 		cams[i].environment = _env_ortho if cams[i].projection == Camera3D.PROJECTION_ORTHOGONAL else _env_persp
 	for mc in mask_cams:
 		mc.environment = _env_mask
+	for dc in depth_cams:
+		dc.environment = _env_mask
 	if chase_cam:
 		chase_cam.environment = _env_persp
 
@@ -130,6 +193,8 @@ func set_live_updates(on: bool, chase: bool) -> void:
 	for vp in rgb:
 		vp.render_target_update_mode = mode
 	for vp in mask_vps:
+		vp.render_target_update_mode = mode
+	for vp in depth_vps:
 		vp.render_target_update_mode = mode
 	chase_vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS if (on and chase) else SubViewport.UPDATE_DISABLED
 
@@ -157,6 +222,12 @@ func apply_cameras(prev: Array, cur: Array, alpha: float) -> void:
 				_cards[i].scale = Vector3(cams[i].size * aspect * 1.05, cams[i].size * 1.05, 1.0)
 		if i < mask_cams.size():
 			_pose(mask_cams[i], p, c, alpha)
+		if i < depth_cams.size():
+			_pose(depth_cams[i], p, c, alpha)
+			var dmat: ShaderMaterial = depth_cams[i].get_child(0).material_override
+			dmat.set_shader_parameter("near", depth_cams[i].near)
+			dmat.set_shader_parameter("far", depth_cams[i].far)
+			dmat.set_shader_parameter("ortho", depth_cams[i].projection == Camera3D.PROJECTION_ORTHOGONAL)
 	_apply_envs()
 
 
@@ -193,6 +264,8 @@ func capture(aovs: Array) -> Dictionary:
 			targets.append([VIEWS[i], "rgb", rgb[i]])
 		if aovs.has("mask") and i < mask_vps.size():
 			targets.append([VIEWS[i], "mask", mask_vps[i]])
+		if aovs.has("depth") and i < depth_vps.size():
+			targets.append([VIEWS[i], "depth", depth_vps[i]])
 	for t in targets:
 		t[2].render_target_update_mode = SubViewport.UPDATE_ONCE
 	await RenderingServer.frame_post_draw

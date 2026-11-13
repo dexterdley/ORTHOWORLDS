@@ -108,6 +108,12 @@ The id and class tables come from the world, available as `renderer.mask_table`.
 accepts ids, classes, exporter `mask_groups`, or int obstacle indices, matching the GymBox
 `render_masks()` targets for Parkour, Snowball and Rescue.
 
+## Depth
+
+With `aov=(..., "depth")` each view also has a depth image. `env.last_depth[view]` is the distance in metres along that camera's viewing axis (from the camera plane for the orthographic views), or the camera's far distance where nothing is hit.
+
+Godot writes it as 24-bit millimetres in RGB, and `renderer.depth_metres()` decodes it. It is rendered from the same flat geometry copies as the masks, so cutaways and per-view hiding match the RGB views.
+
 ## Determinism
 
 A lockstep frame depends only on the state it renders:

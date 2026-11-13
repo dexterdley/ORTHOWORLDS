@@ -232,3 +232,10 @@ def mask_ids(mask_img):
     """Decodes a mask frame: returns (instance index HxW int32, class code HxW uint8). 0 = background."""
     m = mask_img.astype(np.int32)
     return m[..., 0] + 256 * m[..., 1], mask_img[..., 2]
+
+
+def depth_metres(depth_img):
+    """Decodes a depth frame: metres along each camera's viewing axis (24-bit millimetres, R = low byte).
+    Pixels where nothing was hit read as the camera's far distance."""
+    d = depth_img.astype(np.int64)
+    return (d[..., 0] + 256 * d[..., 1] + 65536 * d[..., 2]).astype(np.float32) / 1000.0

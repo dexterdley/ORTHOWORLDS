@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 
 # Ensure local package path is imported
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 

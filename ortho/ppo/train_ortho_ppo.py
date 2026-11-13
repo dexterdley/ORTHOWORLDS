@@ -1,7 +1,8 @@
 # Standard library imports
 import math
 import random
-import os
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import time
 import argparse
 

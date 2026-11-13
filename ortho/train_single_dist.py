@@ -113,11 +113,11 @@ def main(args):
 
     writer = None
     if is_main():
-        log_dir = f"./runs/wan_single_dist_multienv_cam_check_{args.num_envs}{'_hifi' if args.hifi else ''}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_dir = f"./runs/wan_single_dist_multienv_cam_{args.num_envs}{'_hifi' if args.hifi else ''}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         writer = SummaryWriter(log_dir=log_dir)
         print(f"TensorBoard logging to: {log_dir}")
 
-    ckpt_base = f"./checkpoints/wan_single_dist_cam_check_{args.num_envs}{'_hifi' if args.hifi else ''}"
+    ckpt_base = f"./checkpoints/wan_single_dist_cam_{args.num_envs}{'_hifi' if args.hifi else ''}"
     view_names = ["3D_FPV"]
 
     # 3. Multi-Step Trajectory Training Loop
