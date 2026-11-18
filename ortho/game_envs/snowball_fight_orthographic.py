@@ -1,7 +1,7 @@
 import math
 import numpy as np
 import pygame
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, DepthCanvas
 
 try:
     import gymnasium as gym
@@ -1086,15 +1086,21 @@ class SnowballFightOrthographicWrapper(gym.Wrapper):
             d_c, x_c, z_c = orbit_camera_frame(dx * fx + dy * fy, dx * rx + dy * ry, dz, yaw, pitch, pivot)
             return (x_c, z_c, d_c)
 
+        # "box": view depth -> [-1, 1] depth box coords (DepthCanvas convention). Top: -z -> Side row GY - z * SE, near = up.
+        # Rear / side: facing / right -> the Top column / row they run along at facing 0 (+X / -Y), i.e. the Top image
+        # rotated about its centre to the facing; side flipped so -1 = near = the player's right.
         return {
             "top": {"tf": lambda v: (v[0] - tx, v[1] - ty, -v[2]), "near": None, "cull": (0.0, 0.0, -1.0),
-                    "scr": lambda a, b, d: (cx + a * ST, cy - b * ST), "rad": lambda r, d: r * ST},
+                    "scr": lambda a, b, d: (cx + a * ST, cy - b * ST), "rad": lambda r, d: r * ST,
+                    "box": lambda d: 2 * (GY + d * SE) / VH - 1},
             "rear": {"tf": lambda v: ((v[0] - px) * rx + (v[1] - py) * ry, v[2], (v[0] - px) * fx + (v[1] - py) * fy),
                      "near": -self.REAR_CUT, "cull": (fx, fy, 0.0),
-                     "scr": lambda a, b, d: (cx + a * SE, GY - b * SE), "rad": lambda r, d: r * SE},
+                     "scr": lambda a, b, d: (cx + a * SE, GY - b * SE), "rad": lambda r, d: r * SE,
+                     "box": lambda d: 2 * (d + (px - tx) * fx + (py - ty) * fy) * ST / VW},
             "side": {"tf": lambda v: ((v[0] - px) * fx + (v[1] - py) * fy, v[2], -((v[0] - px) * rx + (v[1] - py) * ry)),
                      "near": -self.REAR_CUT, "cull": (-rx, -ry, 0.0),
-                     "scr": lambda a, b, d: (cx + a * SE, GY - b * SE), "rad": lambda r, d: r * SE},
+                     "scr": lambda a, b, d: (cx + a * SE, GY - b * SE), "rad": lambda r, d: r * SE,
+                     "box": lambda d: 2 * (d - (px - tx) * rx - (py - ty) * ry) * ST / VH},
             "fpv": {"tf": fpv_tf, "near": self.Z_NEAR, "cull": None, "cam": self.cam_pos,
                     "scr": lambda a, b, d: (cx + a / d * f, cy - b / d * f), "rad": lambda r, d: r / d * f},
         }
@@ -1178,7 +1184,7 @@ class SnowballFightOrthographicWrapper(gym.Wrapper):
                     continue
                 depth = d
             key = (pr["layer"], idx if pr["layer"] == 0 else -depth)
-            out.append((key, pts, pr))
+            out.append((key, pts, pr, depth))
         out.sort(key=lambda t: t[0])
         return out
 
@@ -1199,11 +1205,11 @@ class SnowballFightOrthographicWrapper(gym.Wrapper):
         VW, VH = self.VIEWPORT_W, self.VIEWPORT_H
         if getattr(base, "player", None) is None:
             shape = (VH, VW) if mask_target is not None else (VH, VW, 3)
-            return tuple(np.zeros(shape, np.uint8) for _ in range(4))
+            return tuple(np.zeros(shape, np.uint8) for _ in range(4)), [np.full((VH, VW), np.inf, np.float32)] * 3
 
         prims = self._scene_prims()
         views = self._view_defs()
-        out = []
+        out, drawn = [], {}
         for name in ("top", "rear", "side", "fpv"):
             surf = pygame.Surface((VW, VH))
             if mask_target is not None:
@@ -1216,7 +1222,8 @@ class SnowballFightOrthographicWrapper(gym.Wrapper):
                     # Elevation views: the ground plane is edge-on; fill below the z = 0 line with snow
                     pygame.draw.rect(surf, COLOR_SNOW_OUT, (0, self.ground_y, VW, VH - self.ground_y))
                     pygame.draw.line(surf, (200, 210, 225), (0, self.ground_y), (VW, self.ground_y), 2)
-            for _, pts, pr in self._project(prims, views[name]):
+            drawn[name] = self._project(prims, views[name])
+            for _, pts, pr, _ in drawn[name]:
                 ipts = [(int(round(x)), int(round(y))) for x, y in pts]
                 if mask_target is not None:
                     col = (255, 255, 255) if self._mask_match(pr["tag"], mask_target) else (0, 0, 0)
@@ -1227,7 +1234,28 @@ class SnowballFightOrthographicWrapper(gym.Wrapper):
                         pygame.draw.polygon(surf, tuple(int(c * 0.72) for c in pr["color"]), ipts, 1)
             img = np.transpose(pygame.surfarray.array3d(surf), (1, 0, 2))
             out.append((img[..., 0] > 127).astype(np.uint8) if mask_target is not None else img)
-        return tuple(out)
+
+        # Ortho depth [Top, Side, Rear] (DepthCanvas convention): redraw the snow ground and each sorted draw list (fill +
+        # outline), view depth -> box coords. Faces: their mean depth; disks (spheres): centre moved by r toward the
+        # camera. Ground: the z = 0 plane (Top); in the elevations the snow below the horizon is the ground slab's face
+        # at the near cutaway plane (view depth -REAR_CUT), where every other object is cut too.
+        depth = []
+        for name in ("top", "side", "rear"):
+            canvas, box = DepthCanvas((VW, VH)), views[name]["box"]
+            if name == "top":
+                canvas.surf.fill(canvas.color(box(0.0)))
+            else:
+                g = canvas.color(box(views[name]["near"]))
+                pygame.draw.rect(canvas.surf, g, (0, self.ground_y, VW, VH - self.ground_y))
+                pygame.draw.line(canvas.surf, g, (0, self.ground_y), (VW, self.ground_y), 2)
+            for _, pts, pr, d in drawn[name]:
+                ipts = [(int(round(x)), int(round(y))) for x, y in pts]
+                c = canvas.color(box(d if pr["kind"] == "poly" else d - pr["r"]))
+                pygame.draw.polygon(canvas.surf, c, ipts)
+                if pr["outline"]:
+                    pygame.draw.polygon(canvas.surf, c, ipts, 1)
+            depth.append(canvas.read())
+        return tuple(out), depth
 
     # ------------------------------------------------------------------
     def render(self, camera_pose="Center"):
@@ -1236,7 +1264,8 @@ class SnowballFightOrthographicWrapper(gym.Wrapper):
         self.update_camera_pose(camera_pose)
         # Get dynamically calculated position from our property
         self.cam_x, self.cam_y, self.cam_z = self.cam_pos
-        return self._render_views()
+        imgs, self.last_depth = self._render_views()
+        return imgs
 
     def render_masks(self, target):
         """Visible binary masks (values 0/1, uint8, H x W) of `target` in (top, rear, side, fpv).
@@ -1244,7 +1273,7 @@ class SnowballFightOrthographicWrapper(gym.Wrapper):
         The full scene is drawn with the same projection / painter ordering as render(), target
         primitives in white and everything else in black, so occluded parts are excluded.
         Does not advance the camera pose or change any state."""
-        return self._render_views(mask_target=target)
+        return self._render_views(mask_target=target)[0]
 
 
 # Main test

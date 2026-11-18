@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, DepthCanvas
 
 try:
     import gymnasium as gym
@@ -1062,6 +1062,11 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
         """Top-down view: XY plane, centered on player."""
         surface = pygame.Surface((self.view_w, self.view_h))
         surface.fill(COLOR_GROUND)
+        canvas = DepthCanvas((self.view_w, self.view_h))
+        # Depth: height z -> Side row 0.7 H - 60 z (_project_side), as 2 row / H - 1 (near = up); fill = ground z = 0.
+        # Per face max z: exact for the flat top faces, the near (top) edge of the side faces Top sees edge-on
+        z_box = lambda z: 0.4 - 120.0 * z / self.view_h
+        canvas.surf.fill(canvas.color(z_box(0.0)))
 
         px, py = player_pos
         scale = 15.0  # pixels per meter
@@ -1084,6 +1089,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
                 if len(clipped) >= 3:
                     pygame.draw.polygon(surface, shape["color"], clipped)
                     pygame.gfxdraw.aapolygon(surface, clipped, (0, 0, 0))
+                    pygame.draw.polygon(canvas.surf, canvas.color(z_box(max(v[2] for v in verts))), clipped)
 
         self._draw_explosions(
             surface,
@@ -1093,7 +1099,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
-        )
+        ), canvas.read()
 
     def _draw_explosions(self, surface, to_screen, scale_x, scale_y):
         """Overlay the env's explosion fireballs on an orthographic view.
@@ -1106,6 +1112,14 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
         """Rear view: looking from behind the player (XZ plane from behind)."""
         surface = pygame.Surface((self.view_w, self.view_h))
         surface.fill(COLOR_SKY)
+        canvas = DepthCanvas((self.view_w, self.view_h))
+        # Depth: hull-right offset ry (m) -> Top row H/2 + 15 ry (exact at heading 0; Top does not rotate with the hull),
+        # as 2 row / H - 1. This projection's camera sits on the hull's left (screen x = -forward), so near = left = -ry.
+        # Per face mean ry; faces seen edge-on (1-px lines) show their near edge (min ry).
+        # Ground band: only its part below the ground line (z < 0, row 0.7 H) is geometry: the ground slab under the
+        # Top image, whose near face is the near box face (-1)
+        ry_box = lambda ry: 30.0 * ry / self.view_h
+        pygame.draw.rect(canvas.surf, canvas.color(-1.0), (0, int(self.view_h * 0.7), self.view_w, self.view_h))
 
         # Draw ground
         pygame.draw.rect(
@@ -1122,6 +1136,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
         for shape in sorted_shapes:
             verts = shape["verts"]
             points = []
+            rys = []
             for v in verts:
                 # Transform to player-relative coords
                 dx = v[0] - px
@@ -1135,12 +1150,16 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
                 sx = int(rx * scale + self.view_w / 2)
                 sy = int(self.view_h - rz * scale * 2 - self.view_h * 0.3)
                 points.append((sx, sy))
+                rys.append(ry)
 
             if len(points) >= 3:
                 clipped = self._clip_polygon_to_screen(points)
                 if len(clipped) >= 3:
                     pygame.draw.polygon(surface, shape["color"], clipped)
                     pygame.gfxdraw.aapolygon(surface, clipped, (0, 0, 0))
+                    edge_on = len({p[0] for p in points}) == 1 or len({p[1] for p in points}) == 1
+                    pygame.draw.polygon(canvas.surf, canvas.color(ry_box(min(rys) if edge_on else sum(rys) / len(rys))),
+                                        clipped)
 
         def rear_to_screen(x, y, z):
             dx, dy = x - px, y - py
@@ -1151,12 +1170,20 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
-        )
+        ), canvas.read()
 
     def _project_side(self, shapes, player_pos, player_angle):
         """Side view: looking from the right side of the player (YZ plane)."""
         surface = pygame.Surface((self.view_w, self.view_h))
         surface.fill(COLOR_SKY)
+        canvas = DepthCanvas((self.view_w, self.view_h))
+        # Depth: hull-right offset rx (m) -> Top row H/2 + 15 rx (exact at heading 0; Top does not rotate with the hull),
+        # as 2 row / H - 1, flipped: the camera is on the hull's right, so near = right = +rx.
+        # Per face mean rx; faces seen edge-on (1-px lines) show their near edge (max rx).
+        # Ground band: only its part below the ground line (z < 0, row 0.7 H) is geometry: the ground slab under the
+        # Top image, whose near face is the near box face (-1)
+        rx_box = lambda rx: -30.0 * rx / self.view_h
+        pygame.draw.rect(canvas.surf, canvas.color(-1.0), (0, int(self.view_h * 0.7), self.view_w, self.view_h))
 
         pygame.draw.rect(
             surface, COLOR_GROUND, (0, self.view_h // 2, self.view_w, self.view_h // 2)
@@ -1172,6 +1199,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
         for shape in sorted_shapes:
             verts = shape["verts"]
             points = []
+            rxs = []
             for v in verts:
                 dx = v[0] - px
                 dy = v[1] - py
@@ -1184,12 +1212,16 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
                 sx = int(ry * scale + self.view_w / 2)
                 sy = int(self.view_h - rz * scale * 2 - self.view_h * 0.3)
                 points.append((sx, sy))
+                rxs.append(rx)
 
             if len(points) >= 3:
                 clipped = self._clip_polygon_to_screen(points)
                 if len(clipped) >= 3:
                     pygame.draw.polygon(surface, shape["color"], clipped)
                     pygame.gfxdraw.aapolygon(surface, clipped, (0, 0, 0))
+                    edge_on = len({p[0] for p in points}) == 1 or len({p[1] for p in points}) == 1
+                    pygame.draw.polygon(canvas.surf, canvas.color(rx_box(max(rxs) if edge_on else sum(rxs) / len(rxs))),
+                                        clipped)
 
         def side_to_screen(x, y, z):
             dx, dy = x - px, y - py
@@ -1200,7 +1232,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
-        )
+        ), canvas.read()
 
     def _project_fpv(self, shapes, player_pos, player_angle):
         """3D FPV: third-person perspective projection from the orbit camera trailing the player tank."""
@@ -1410,9 +1442,10 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
 
         player_pos = (env.player_body.position[0], env.player_body.position[1])
 
-        im_top_down = self._project_top_down(shapes, player_pos)
-        im_rear = self._project_rear(shapes, player_pos, env.player_body.angle)
-        im_side = self._project_side(shapes, player_pos, env.player_body.angle)
+        im_top_down, top_depth = self._project_top_down(shapes, player_pos)
+        im_rear, rear_depth = self._project_rear(shapes, player_pos, env.player_body.angle)
+        im_side, side_depth = self._project_side(shapes, player_pos, env.player_body.angle)
+        self.last_depth = [top_depth, side_depth, rear_depth]
         # Get dynamically calculated position from our property
         self.cam_x, self.cam_y, self.cam_z = self.cam_pos
         im_fpv = self._project_fpv(shapes, player_pos, env.player_body.angle)

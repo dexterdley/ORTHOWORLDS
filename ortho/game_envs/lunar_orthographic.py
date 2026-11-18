@@ -3,6 +3,7 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
+from .camera_utils import DepthCanvas
 
 class LunarOrthographicWrapper(gym.Wrapper):
     """
@@ -94,6 +95,7 @@ class LunarOrthographicWrapper(gym.Wrapper):
             
         if base_env.lander is None:
             dummy = np.zeros((self.VIEWPORT_H, self.VIEWPORT_W, 3), dtype=np.uint8)
+            self.last_depth = [np.full((self.VIEWPORT_H, self.VIEWPORT_W), np.inf, np.float32)] * 3
             return dummy, dummy, dummy, dummy
 
         lander_x = base_env.lander.position.x * self.SCALE
@@ -260,6 +262,17 @@ class LunarOrthographicWrapper(gym.Wrapper):
                     gfxdraw.filled_polygon(surf, ipts, safe_color)
                 except Exception:
                     pass
+
+        # --- 5. Ortho depth (DepthCanvas convention): redraw the sorted lists, sort depth -> [-1, 1] box coords ---
+        W, H = self.VIEWPORT_W, self.VIEWPORT_H
+        self.last_depth = []
+        for proj_list, to_box in [(proj_top,   lambda d: 1 + 2 * d / H),   # -vy -> Side row (H - vy); near = up
+                                  (proj_side,  lambda d: 2 * d / W),       # rx  -> Top col (rx + cx); near = -x
+                                  (proj_front, lambda d: 2 * d / H)]:      # -vz -> Top row (vz + cy), flipped; near = +z
+            canvas = DepthCanvas((W, H))
+            for d, pts, _, _ in proj_list:
+                canvas.polygon(pts, to_box(d))
+            self.last_depth.append(canvas.read())
 
         out_imgs = []
         for surf in [top_surf, front_surf, side_surf, fpv_surf]:

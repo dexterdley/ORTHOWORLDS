@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, DepthCanvas
 
 try:
     import gymnasium as gym
@@ -637,9 +637,10 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
         objects_3d = self._extrude_world(env)
 
         # Render four views
-        im_top_down = self._render_top_down(objects_3d, player_x, player_y)
-        im_rear = self._render_rear(objects_3d, player_x, player_y)
-        im_side = self._render_side(objects_3d, player_x, player_y)
+        im_top_down, depth_top = self._render_top_down(objects_3d, player_x, player_y)
+        im_rear, depth_rear = self._render_rear(objects_3d, player_x, player_y)
+        im_side, depth_side = self._render_side(objects_3d, player_x, player_y)
+        self.last_depth = [depth_top, depth_side, depth_rear]
         # Get dynamically calculated position from our property
         self.cam_x, self.cam_y, self.cam_z = self.cam_pos
         im_fpv = self._render_fpv(objects_3d, player_x, player_y)
@@ -725,6 +726,10 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
         """Top-down view: X-right, Z-up (Y into screen)"""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill((50, 50, 80))
+        canvas = DepthCanvas((self.view_width, self.view_height))
+        # Depth: world Y (height) -> Side row H - (y - player_y + 3) * 12, as 2 * row / H - 1 (near = up).
+        # Each body is drawn once as a volume silhouette, so its visible surface is its top (max y)
+        y_box = lambda y: 1 - 2 * (y - player_y + 3) * 12.0 / self.view_height
 
         scale = 12.0
 
@@ -763,6 +768,8 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                     if any(0 <= v[0] < self.view_width and 0 <= v[1] < self.view_height for v in rect_verts):
                         try:
                             pygame.draw.polygon(surface, obj['color'], rect_verts)
+                            pygame.draw.polygon(canvas.surf, canvas.color(y_box(max(v[1] for v in verts))),
+                                                rect_verts)
                             pygame.gfxdraw.aapolygon(surface, rect_verts, (0, 0, 0))
                         except (ValueError, TypeError):
                             pass
@@ -775,15 +782,20 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                 sr = int(r * scale)
                 if 0 <= sx < self.view_width and 0 <= sy < self.view_height and sr > 0:
                     pygame.draw.circle(surface, obj['color'], (sx, sy), sr)
+                    pygame.draw.circle(canvas.surf, canvas.color(y_box(cy + r)), (sx, sy), sr)
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
-        ).copy()
+        ).copy(), canvas.read()
 
     def _render_rear(self, objects, player_x, player_y):
         """Rear view: looking from behind (negative X direction)"""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
+        canvas = DepthCanvas((self.view_width, self.view_height))
+        # Depth: world X -> Top col (x - player_x) * 12 + W / 2, as 2 * col / W - 1 (near = -x);
+        # visible surface of each volume = its near face (min x)
+        x_box = lambda x: 2 * (x - player_x) * 12.0 / self.view_width
 
         scale = 15.0
 
@@ -809,6 +821,7 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                 if any(0 <= v[0] < self.view_width and 0 <= v[1] < self.view_height for v in screen_verts):
                     try:
                         pygame.draw.polygon(surface, obj['color'], screen_verts)
+                        pygame.draw.polygon(canvas.surf, canvas.color(x_box(min(v[0] for v in verts))), screen_verts)
                         pygame.gfxdraw.aapolygon(surface, screen_verts, (0, 0, 0))
                     except (ValueError, TypeError):
                         pass
@@ -821,15 +834,20 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                 sr = int(r * scale)
                 if sr > 0:
                     pygame.draw.circle(surface, obj['color'], (sx, sy), sr)
+                    pygame.draw.circle(canvas.surf, canvas.color(x_box(cx - r)), (sx, sy), sr)
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
-        ).copy()
+        ).copy(), canvas.read()
 
     def _render_side(self, objects, player_x, player_y):
         """Side view: X-horizontal, Y-vertical"""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
+        canvas = DepthCanvas((self.view_width, self.view_height))
+        # Depth: world Z -> Top row H / 2 - z * 12, as 2 * row / H - 1 (near = +z, larger z_min drawn last);
+        # visible surface of each volume = its near face (z_max)
+        z_box = lambda o: -2 * o['z_max'] * 12.0 / self.view_height
 
         scale = 12.0
 
@@ -850,6 +868,7 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                     if any(0 <= v[0] < self.view_width and 0 <= v[1] < self.view_height for v in screen_verts):
                         try:
                             pygame.draw.polygon(surface, obj['color'], screen_verts)
+                            pygame.draw.polygon(canvas.surf, canvas.color(z_box(obj)), screen_verts)
                             pygame.gfxdraw.aapolygon(surface, screen_verts, (0, 0, 0))
                         except (ValueError, TypeError):
                             pass
@@ -862,11 +881,12 @@ class CatapultWarOrthographicWrapper(gym.Wrapper):
                 sr = int(r * scale)
                 if sr > 0 and 0 <= sx < self.view_width and 0 <= sy < self.view_height:
                     pygame.draw.circle(surface, obj['color'], (sx, sy), sr)
+                    pygame.draw.circle(canvas.surf, canvas.color(z_box(obj)), (sx, sy), sr)
                     pygame.gfxdraw.aacircle(surface, sx, sy, sr, (0, 0, 0))
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
-        ).copy()
+        ).copy(), canvas.read()
 
     def _render_fpv(self, objects, player_x, player_y):
         """Third-person 3D view: trailing camera behind the catapult looking toward the enemy"""

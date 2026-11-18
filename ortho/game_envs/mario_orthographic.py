@@ -8,7 +8,7 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
-from .camera_utils import orbit_camera_frame, orbit_camera_offset, rotate_camera_frame
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, rotate_camera_frame, DepthCanvas
 from Box2D.b2 import (world, polygonShape, contactListener)
 
 FPS      = 50
@@ -607,6 +607,15 @@ class MarioOrthographicWrapper(gym.Wrapper):
         pygame.draw.rect(side_surf, GRASS_C, (0, VH - y_shift, VW, y_shift))
         pygame.draw.line(side_surf, (100, 210, 60), (0, VH - y_shift), (VW, VH - y_shift), 2)
 
+        # Ortho depth canvases (DepthCanvas convention, [-1, 1] box coords): Top grass fill = ground plane y = 0 over the
+        # whole Top view, so the Side / Rear grass strip below y = 0 is that ground's near face, at the box's near side
+        depth_top, depth_side, depth_rear = (DepthCanvas((VW, VH)) for _ in range(3))
+        depth_top.surf.fill(depth_top.color(1 - 2 * y_shift / VH))
+        for canvas in (depth_rear, depth_side):
+            c = canvas.color(-1.0)
+            pygame.draw.rect(canvas.surf, c, (0, VH - y_shift, VW, y_shift))
+            pygame.draw.line(canvas.surf, c, (0, VH - y_shift), (VW, VH - y_shift), 2)
+
         # FPV: sky above, green grass below the horizon, which moves with the camera's net tilt
         # (look-at tilt up lowers it, orbit pitch looking down raises it)
         net_pitch = self.look_pitch - self.cam_pitch
@@ -616,6 +625,7 @@ class MarioOrthographicWrapper(gym.Wrapper):
         pygame.draw.line(fpv_surf, (100, 210, 60), (0, horizon), (VW, horizon), 2)
 
         if not hasattr(base, 'player'):
+            self.last_depth = [np.full((VH, VW), np.inf, np.float32)] * 3
             return [np.zeros((VH, VW, 3), np.uint8)] * 4
 
         polys_3d = []
@@ -836,6 +846,16 @@ class MarioOrthographicWrapper(gym.Wrapper):
         self._draw(proj_rear, rear_surf)
         self._draw(proj_side, side_surf)
         self._draw(proj_fpv,  fpv_surf)
+
+        # Ortho depth: redraw the sorted lists (translucent west wall skipped), own mean depth -> box coords
+        for canvas, proj_list, to_box in [
+                (depth_top,  proj_top,  lambda d: 1 + 2 * (d - y_shift) / VH),  # -vy -> Side row (VH - y_shift - vy); near = up
+                (depth_side, proj_side, lambda d: 2 * d / VH),                  # vz  -> Top row (vz + cy); near = -z
+                (depth_rear, proj_rear, lambda d: 2 * d / VW)]:                 # sx  -> Top col (sx + cx); near = -x
+            for d, pts, color, _ in proj_list:
+                if len(color) == 3 or color[3] == 255:
+                    canvas.polygon(pts, to_box(d))
+        self.last_depth = [depth_top.read(), depth_side.read(), depth_rear.read()]
 
         # ---- FPV HUD overlays ----        
         pygame.draw.rect(fpv_surf, (200, 200, 200), (10, VH - 20, 160, 10), 1)

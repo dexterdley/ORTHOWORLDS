@@ -4,7 +4,7 @@ import pygame
 from pygame import gfxdraw
 import math 
 import cv2
-from .camera_utils import apply_camera_pose
+from .camera_utils import apply_camera_pose, DepthCanvas
 
 class MultiCarOrthographicWrapper(gym.Wrapper):
     """
@@ -101,6 +101,7 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
             pygame.draw.rect(surf, base_env.bg_color, ground_rect)
 
         if base_env.car is None or not base_env.road_poly:
+            self.last_depth = [np.full(top_down_img.shape[:2], np.inf, np.float32)] * 3
             return top_down_img, top_down_img, top_down_img, top_down_img
 
         # Ego car acts as the camera origin
@@ -349,4 +350,29 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
             img_resized = cv2.resize(img, target_shape, interpolation=cv2.INTER_AREA)
             out_imgs.append(img_resized)
             
+        # 6. Ortho depth (DepthCanvas convention), [-1, 1] box coords; flipped / resized like the RGB (nearest)
+        # Top = CarRacing's own render: car-frame point (rx, ry) at (rx * zoom + W/2, ry * zoom + H/4), then a vertical
+        # flip; zoom animates 0.1 * SCALE -> ZOOM * SCALE (0.6 -> 16.2) over the first second. Field, grass and road all
+        # lie at height 0 (field polygon only); then Car.draw() wheels + hull at their top-face heights.
+        W, H = self.WINDOW_W, self.WINDOW_H
+        zoom = 0.6 * max(1 - base_env.t, 0) + 16.2 * min(base_env.t, 1)
+        to_top = lambda x, y: (((x - car_x) * cos_a - (y - car_y) * sin_a) * zoom + W / 2,
+                               ((x - car_x) * sin_a + (y - car_y) * cos_a) * zoom + H / 4)
+        h_box = lambda h: 2 * (self.camera_height - h) * self.scale_factor / H   # height -> Side row; near = up
+        canvas = DepthCanvas((W, H))
+        canvas.polygon([to_top(x, y) for x, y in [(PLAYFIELD, PLAYFIELD), (PLAYFIELD, -PLAYFIELD),
+                                                  (-PLAYFIELD, -PLAYFIELD), (-PLAYFIELD, PLAYFIELD)]], h_box(0.0))
+        for obj in base_env.car.drawlist:
+            h = CAR_HEIGHT if obj is base_env.car.hull else WHEEL_HEIGHT
+            for f in obj.fixtures:
+                pygame.draw.polygon(canvas.surf, canvas.color(h_box(h)), [to_top(*(f.body.transform * v)) for v in f.shape.vertices])
+        self.last_depth = [cv2.flip(canvas.read(), 0)]
+        for proj_list, to_box in [(proj_polys_side, lambda d: 2 * d * zoom / W),                               # -rx -> Top col (rx * zoom + W/2), flipped; near = +rx
+                                  (proj_polys_rear, lambda d: 2 * (d - self.camera_dist) * zoom / H - 0.5)]:  # ry + dist -> Top row (3H/4 - ry * zoom), flipped; near = -ry
+            canvas = DepthCanvas((W, H))
+            for d, pts, _, _ in proj_list:
+                canvas.polygon(pts, to_box(d))
+            self.last_depth.append(canvas.read())
+        self.last_depth = [cv2.resize(d, target_shape, interpolation=cv2.INTER_NEAREST) for d in self.last_depth]
+
         return top_down_img, out_imgs[0], out_imgs[1], out_imgs[2]

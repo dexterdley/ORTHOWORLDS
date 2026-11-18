@@ -2,7 +2,7 @@ import math
 import numpy as np
 import pygame
 from pygame import gfxdraw
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, DepthCanvas
 
 try:
     import gymnasium as gym
@@ -633,6 +633,7 @@ class DroneDogfightOrthographicWrapper(gym.Wrapper):
         pygame.draw.line(fpv_surf, (200, 230, 200), (0, self.VIEWPORT_H // 2), (self.VIEWPORT_W, self.VIEWPORT_H // 2), 2)
 
         if not hasattr(base, 'player'):
+            self.last_depth = [np.full((self.VIEWPORT_H, self.VIEWPORT_W), np.inf, np.float32)] * 3
             return [np.zeros((self.VIEWPORT_H, self.VIEWPORT_W, 3), np.uint8)] * 4
 
         S = self.SCALE
@@ -889,6 +890,16 @@ class DroneDogfightOrthographicWrapper(gym.Wrapper):
         draw_proj(proj_rear, rear_surf)
         draw_proj(proj_side, side_surf)
         draw_proj(proj_fpv,  fpv_surf)
+
+        # Ortho depth (DepthCanvas convention): redraw the sorted lists, sort depth -> [-1, 1] box coords
+        self.last_depth = []
+        for proj_list, to_box in [(proj_top,  lambda d: 1 - 2 * d / VH),   # vz  -> Side row (VH - vz); near = up
+                                  (proj_side, lambda d: 2 * d / VH),       # -sy -> Top row (cy - sy); near = +y
+                                  (proj_rear, lambda d: 2 * d / VW)]:      # sx  -> Top col (sx + cx); near = -x
+            canvas = DepthCanvas((VW, VH))
+            for d, pts, _, _ in proj_list:
+                canvas.polygon(pts, to_box(d))
+            self.last_depth.append(canvas.read())
 
         # ----------------------------------------------------------------
         # G. FPV HUD Reticle Overlay

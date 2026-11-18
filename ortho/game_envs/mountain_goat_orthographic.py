@@ -20,7 +20,7 @@ Fully compatible with Gym/Gymnasium and Box2D SWIG bindings.
 
 import math
 import numpy as np
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, DepthCanvas
 import pygame
 from pygame import gfxdraw
 
@@ -639,8 +639,13 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
         pygame.draw.rect(side_surf, FLOOR_C, (0, self.VH // 2, self.VW, self.VH // 2))
         pygame.draw.rect(fpv_surf,  FLOOR_C, (0, self.VH // 2, self.VW, self.VH // 2))
 
+        # Ortho depth canvases (DepthCanvas convention, [-1, 1] box coords): the rock Top fill and the floor backdrop
+        # rects (below the goat's height) are backdrops and stay inf like the sky
+        depth_top, depth_side, depth_rear = (DepthCanvas((self.VW, self.VH)) for _ in range(3))
+
         if not hasattr(base, 'torso') or base.torso is None:
             dummy = np.zeros((self.VH, self.VW, 3), dtype=np.uint8)
+            self.last_depth = [np.full((self.VH, self.VW), np.inf, np.float32)] * 3
             return dummy, dummy, dummy, dummy
 
         polys_3d = []
@@ -868,6 +873,15 @@ class MountainGoatOrthographicWrapper(gym.Wrapper):
                         gfxdraw.filled_polygon(surf, ipts, safe_c)
                     except Exception:
                         pass
+
+        # Ortho depth: redraw the sorted lists, own mean depth -> box coords (side joint markers below are UI, skipped)
+        for canvas, proj_list, to_box in [
+                (depth_top,  proj_top,  lambda d: 2 * (d + goat_y) / self.VH),  # -vy -> Side row (VH/2 - vy + goat_y); near = up
+                (depth_side, proj_side, lambda d: 2 * d / self.VH),             # vz  -> Top row (vz + cy); near = -z
+                (depth_rear, proj_rear, lambda d: 2 * d / self.VW)]:            # rel_x -> Top col (rel_x + cx); near = -x
+            for d, pts, _, _ in proj_list:
+                canvas.polygon(pts, to_box(d))
+        self.last_depth = [depth_top.read(), depth_side.read(), depth_rear.read()]
 
         # Draw glowing joint markers on side elevation
         for j in base.joints[:4]:

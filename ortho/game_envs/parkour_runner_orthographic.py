@@ -53,8 +53,10 @@ from gymnasium.envs.box2d.bipedal_walker import (
 
 try:
     from .bipedal_orthographic import BipedalOrthographicWrapper
+    from .camera_utils import DepthCanvas
 except ImportError:  # executed as a script from inside game_envs/
     from bipedal_orthographic import BipedalOrthographicWrapper
+    from camera_utils import DepthCanvas
 
 # Course bounds in terrain steps (walker spawns at TERRAIN_STARTPAD / 2 = step 10)
 COURSE_MIN_STEP = 14
@@ -477,6 +479,7 @@ class ParkourRunnerOrthographicWrapper(BipedalOrthographicWrapper):
 
         if base_env.hull is None:
             dummy = np.zeros((self.VIEWPORT_H, self.VIEWPORT_W) + (() if mask_mode else (3,)), dtype=np.uint8)
+            self.last_depth = [np.full((self.VIEWPORT_H, self.VIEWPORT_W), np.inf, np.float32)] * 3
             return dummy, dummy, dummy, dummy
 
         scroll_x = base_env.scroll * self.SCALE
@@ -547,6 +550,17 @@ class ParkourRunnerOrthographicWrapper(BipedalOrthographicWrapper):
                     pass
             img = np.transpose(pygame.surfarray.array3d(surf), (1, 0, 2))
             out_imgs.append((img[..., 0] > 127).astype(np.uint8) if mask_mode else img)
+
+        # --- 7. Ortho depth (DepthCanvas convention): redraw the sorted lists, own mean depth -> [-1, 1] box coords ---
+        W, H = self.VIEWPORT_W, self.VIEWPORT_H
+        self.last_depth = []
+        for proj_list, to_box in [(projs[0], lambda d: 1 + 2 * d / H),   # -vy -> Side row (H - vy); near = up
+                                  (projs[2], lambda d: 2 * d / H),       # vz  -> Top row (vz + cy); near = -z
+                                  (projs[1], lambda d: 2 * d / W - 1)]:  # x   -> Top col; near = -x
+            canvas = DepthCanvas((W, H))
+            for d, pts, _, _, _, _ in proj_list:
+                canvas.polygon(pts, to_box(d))
+            self.last_depth.append(canvas.read())
         return out_imgs[0], out_imgs[1], out_imgs[2], out_imgs[3]
 
 

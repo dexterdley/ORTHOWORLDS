@@ -13,7 +13,7 @@ Conventions:
 
 import math
 import numpy as np
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, DepthCanvas
 
 try:
     import gymnasium as gym
@@ -795,9 +795,16 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         return int(sx), int(sy), depth
 
     def _render_top_down(self, objects):
-        """Render top-down view."""
+        """Render top-down view. Also returns its depth map (DepthCanvas convention, see camera_utils)."""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_GROUND)
+
+        # Depth: height z -> Side image row (view_height / 2 - 100 z + 100) -> 2 * row / view_height - 1; near = up.
+        # Each shape's highest point (flat faces: their z; edge-on walls: top edge; wheel discs: cylinder top).
+        # The ground fill sits at the top of the Side view's ground rect (row view_height // 2 + 50).
+        canvas = DepthCanvas((self.view_width, self.view_height))
+        top_d = lambda z: 2 * (self.view_height / 2 - z * 100.0 + 100) / self.view_height - 1
+        canvas.surf.fill(canvas.color(2 * (self.view_height // 2 + 50) / self.view_height - 1))
 
         player_x = self.env.player_body.position.x
         player_y = self.env.player_body.position.y
@@ -812,6 +819,9 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 radius_px = int(obj['radius'] * 50.0)
                 pygame.draw.circle(surface, obj['color'], (sx, sy), radius_px)
                 pygame.draw.circle(surface, COLOR_RING_BORDER, (sx, sy), radius_px, 2)
+                c = canvas.color(top_d(obj['z']))
+                pygame.draw.circle(canvas.surf, c, (sx, sy), radius_px)
+                pygame.draw.circle(canvas.surf, c, (sx, sy), radius_px, 2)
             elif obj['type'] == 'polygon' or obj['type'] == 'edge':
                 points = []
                 for v in obj['vertices_3d']:
@@ -820,7 +830,10 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 if len(points) >= 3:
                     try:
                         pygame.draw.polygon(surface, obj['color'], points)
+                        c = canvas.color(top_d(max(v[2] for v in obj['vertices_3d'])))
+                        pygame.draw.polygon(canvas.surf, c, points)
                         pygame.gfxdraw.aapolygon(surface, points, (255, 255, 255))
+                        pygame.draw.polygon(canvas.surf, c, points, 1)
                     except (ValueError, OverflowError):
                         pass
             elif obj['type'] == 'cylinder':
@@ -828,6 +841,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 sx, sy = self._project_top_down(cx, cy, obj['z_top'], player_x, player_y)
                 radius_px = int(obj['radius'] * 50.0)
                 pygame.draw.circle(surface, obj['color'], (sx, sy), max(1, radius_px))
+                pygame.draw.circle(canvas.surf, canvas.color(top_d(obj['z_top'])), (sx, sy), max(1, radius_px))
 
         # Draw crosshair at center (player position)
         cx, cy = self.view_width // 2, self.view_height // 2
@@ -836,15 +850,23 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
-        ).copy()
+        ).copy(), canvas.read()
 
     def _render_rear(self, objects):
-        """Render rear view."""
+        """Render rear view. Also returns its depth map (DepthCanvas convention, see camera_utils)."""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
 
+        # Depth: forward ry -> Top row (view_height / 2 - 50 ry, Top rotated to the player's heading) -> 2 * row /
+        # view_height - 1, flipped so -1 = near = behind the player. Faces: mean ry; wheel circles: centre - radius.
+        # The ground rect is the ground slab filling the whole Top image: its near face is the near edge (-1).
+        canvas = DepthCanvas((self.view_width, self.view_height))
+        rear_d = lambda ry: 2 * ry * 50.0 / self.view_height
+
         # Draw ground
         pygame.draw.rect(surface, COLOR_GROUND,
+                         (0, self.view_height // 2 + 50, self.view_width, self.view_height // 2))
+        pygame.draw.rect(canvas.surf, canvas.color(-1.0),
                          (0, self.view_height // 2 + 50, self.view_width, self.view_height // 2))
 
         player_x = self.env.player_body.position.x
@@ -884,6 +906,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 _, sx, sy, r = geom
                 if 0 <= sx <= self.view_width and 0 <= sy <= self.view_height:
                     pygame.draw.circle(surface, color, (sx, sy), max(1, r))
+                    pygame.draw.circle(canvas.surf, canvas.color(rear_d(depth - r / 50.0)), (sx, sy), max(1, r))
             else:
                 points = geom
                 # Clip to screen bounds roughly
@@ -891,20 +914,31 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                             max(-100, min(self.view_height + 100, p[1]))) for p in points]
                 try:
                     pygame.draw.polygon(surface, color, clipped)
+                    c = canvas.color(rear_d(depth))
+                    pygame.draw.polygon(canvas.surf, c, clipped)
                     pygame.gfxdraw.aapolygon(surface, clipped, (200, 200, 200))
+                    pygame.draw.polygon(canvas.surf, c, clipped, 1)
                 except (ValueError, OverflowError):
                     pass
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
-        ).copy()
+        ).copy(), canvas.read()
 
     def _render_side(self, objects):
-        """Render side view."""
+        """Render side view. Also returns its depth map (DepthCanvas convention, see camera_utils)."""
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
 
+        # Depth: right rx -> Top column (view_width / 2 + 50 rx, Top rotated to the player's heading) -> 2 * col /
+        # view_width - 1, flipped so -1 = near = the player's right (depth here is -rx). Faces: mean; wheel circles:
+        # centre - radius. The ground rect is the ground slab filling the whole Top image: its near face is the near edge (-1).
+        canvas = DepthCanvas((self.view_width, self.view_height))
+        side_d = lambda neg_rx: 2 * neg_rx * 50.0 / self.view_width
+
         pygame.draw.rect(surface, COLOR_GROUND,
+                         (0, self.view_height // 2 + 50, self.view_width, self.view_height // 2))
+        pygame.draw.rect(canvas.surf, canvas.color(-1.0),
                          (0, self.view_height // 2 + 50, self.view_width, self.view_height // 2))
 
         player_x = self.env.player_body.position.x
@@ -941,19 +975,23 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                 _, sx, sy, r = geom
                 if 0 <= sx <= self.view_width and 0 <= sy <= self.view_height:
                     pygame.draw.circle(surface, color, (sx, sy), max(1, r))
+                    pygame.draw.circle(canvas.surf, canvas.color(side_d(depth - r / 50.0)), (sx, sy), max(1, r))
             else:
                 points = geom
                 clipped = [(max(-100, min(self.view_width + 100, p[0])),
                             max(-100, min(self.view_height + 100, p[1]))) for p in points]
                 try:
                     pygame.draw.polygon(surface, color, clipped)
+                    c = canvas.color(side_d(depth))
+                    pygame.draw.polygon(canvas.surf, c, clipped)
                     pygame.gfxdraw.aapolygon(surface, clipped, (200, 200, 200))
+                    pygame.draw.polygon(canvas.surf, c, clipped, 1)
                 except (ValueError, OverflowError):
                     pass
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
-        ).copy()
+        ).copy(), canvas.read()
 
     def _clip_polygon_near(self, poly_3d):
         """Sutherland-Hodgman clipping against near plane (depth >= 0.1)"""
@@ -1087,9 +1125,10 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         objects = self._get_3d_objects()
 
         # Render all four views
-        im_top_down = self._render_top_down(objects)
-        im_rear = self._render_rear(objects)
-        im_side = self._render_side(objects)
+        im_top_down, depth_top = self._render_top_down(objects)
+        im_rear, depth_rear = self._render_rear(objects)
+        im_side, depth_side = self._render_side(objects)
+        self.last_depth = [depth_top, depth_side, depth_rear]
         self.cam_x, self.cam_y, self.cam_z = self.cam_pos
         im_fpv = self._render_fpv(objects)
 

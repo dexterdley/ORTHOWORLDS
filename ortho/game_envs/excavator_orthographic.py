@@ -9,7 +9,7 @@ import pygame
 from pygame import gfxdraw
 import math
 import cv2
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, DepthCanvas
 from Box2D.b2 import (world, polygonShape, circleShape, revoluteJointDef)
 
 FPS = 50
@@ -410,7 +410,9 @@ class ExcavatorOrthographicWrapper(gym.Wrapper):
         
         sky_color = (200, 230, 255)
         for surf in [top_surf, rear_surf, side_surf, fpv_surf]: surf.fill(sky_color)
-        if not hasattr(base_env, 'chassis'): return np.zeros((600, 800, 3)), np.zeros((600, 800, 3)), np.zeros((600, 800, 3)), np.zeros((600, 800, 3))
+        if not hasattr(base_env, 'chassis'):
+            self.last_depth = [np.full((600, 800), np.inf, np.float32)] * 3
+            return np.zeros((600, 800, 3)), np.zeros((600, 800, 3)), np.zeros((600, 800, 3)), np.zeros((600, 800, 3))
 
         polys_3d = []
         
@@ -517,5 +519,16 @@ class ExcavatorOrthographicWrapper(gym.Wrapper):
                     gfxdraw.filled_polygon(surf, ipts, safe_color)
                 except Exception:
                     pass
+
+        # 5. Ortho depth (DepthCanvas convention): redraw the sorted lists, sort depth -> [-1, 1] box coords
+        W, H = self.VIEWPORT_W, self.VIEWPORT_H
+        self.last_depth = []
+        for proj_list, to_box in [(proj_top,  lambda d: 1 + 2 * d / H),   # -vy -> Side row (H - vy); near = up
+                                  (proj_side, lambda d: 2 * d / H),       # vz  -> Top row (vz + cy); near = -z
+                                  (proj_rear, lambda d: 2 * d / W)]:      # x   -> Top col (x + cx); near = -x
+            canvas = DepthCanvas((W, H))
+            for d, pts, _, _ in proj_list:
+                canvas.polygon(pts, to_box(d))
+            self.last_depth.append(canvas.read())
 
         return [np.transpose(pygame.surfarray.array3d(s), (1, 0, 2)) for s in [top_surf, rear_surf, side_surf, fpv_surf]]

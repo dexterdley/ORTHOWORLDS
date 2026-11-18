@@ -8,7 +8,7 @@ from pygame import gfxdraw
 import math
 import heapq
 from collections import deque
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, DepthCanvas
 try:
     from gymnasium import spaces
 except ImportError:
@@ -782,6 +782,7 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
         S = self.SCALE
 
         if getattr(base, 'player', None) is None:
+            self.last_depth = [np.full((VH, VW), np.inf, np.float32)] * 3
             return [np.zeros((VH, VW, 3), np.uint8) for _ in range(4)]
 
         top_surf  = pygame.Surface((VW, VH))
@@ -1093,18 +1094,27 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
         # G. Draw all views
         # ----------------------------------------------------------------
         self._draw_polys(proj_top,  top_surf)
+        # Ortho depth (DepthCanvas convention), mirrored draw for draw in [-1, 1] box coords.
+        # Top: vz -> Side row (ORTHO_GY - vz * OZ); near = up
+        top_canvas, rear_canvas, side_canvas = (DepthCanvas((VW, VH)) for _ in range(3))
+        for d, pts, _, _ in proj_top:
+            top_canvas.polygon(pts, 2 * (ORTHO_GY - d * OZ) / VH - 1)
 
         # Rear / Side: checkered ground band below the ground line (2 m tiles, scrolls with the car)
         gy_i = int(round(ORTHO_GY))
         t_px = tile * S * OZ
-        for surf, c_m in ((rear_surf, base.player.position.x), (side_surf, base.player.position.y)):
+        for surf, c_m, canvas in ((rear_surf, base.player.position.x, rear_canvas),
+                                  (side_surf, base.player.position.y, side_canvas)):
             pygame.draw.rect(surf, (30, 35, 30), (0, gy_i, VW, VH - gy_i))
+            # Ground cross-section at the section cut through the car: depth 0 (covers the checker tiles too)
+            pygame.draw.rect(canvas.surf, canvas.color(0.0), (0, gy_i, VW, VH - gy_i))
             k0 = int(math.floor((c_m - (cx / (S * OZ))) / tile))
             for k in range(k0, k0 + int(VW / t_px) + 2):
                 if k % 2 == 0:
                     x_l = (k * tile - c_m) * S * OZ + cx
                     pygame.draw.rect(surf, (44, 50, 44), (int(x_l), gy_i, int(t_px) + 1, VH - gy_i))
             pygame.draw.line(surf, (90, 100, 90), (0, gy_i), (VW, gy_i), 2)
+            pygame.draw.line(canvas.surf, canvas.color(0.0), (0, gy_i), (VW, gy_i), 2)
 
         # Gas front: Rear = translucent volume left of the front (drawn over scenery, under the car);
         # Side = translucent sheet behind the car at the front's depth, denser as it closes in
@@ -1121,6 +1131,12 @@ class ToxicGasEscapeOrthographicWrapper(gym.Wrapper):
 
         self._draw_polys(proj_rear, rear_surf)
         self._draw_polys(proj_side, side_surf)
+        for canvas, proj_list, to_box in ((rear_canvas, proj_rear, lambda d: 2 * d / VH),    # sy  -> Top row (cy - sy), flipped: near = South
+                                          (side_canvas, proj_side, lambda d: 2 * d / VW)):   # -sx -> Top col (sx + cx), flipped: near = East
+            for d, pts, c, _ in proj_list:
+                if len(c) == 3:   # RGBA = translucent gas overlay, does not occlude
+                    canvas.polygon(pts, to_box(d))
+        self.last_depth = [top_canvas.read(), side_canvas.read(), rear_canvas.read()]
         # FPV: floor (tiles, then decals) first, then everything else far-to-near
         self._draw_polys(proj_fpv,  fpv_surf,
                          key=lambda x: (0, x[3], -x[0]) if x[3] < 1 else (1, 0, -x[0]))

@@ -8,6 +8,7 @@ import random
 from types import SimpleNamespace
 
 import numpy as np
+import cv2
 import torch
 from tqdm import tqdm
 from stable_baselines3 import PPO
@@ -62,6 +63,8 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
     img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
 
     for _ in tqdm(range(n_steps), desc=f"Rollouts [{env_name}]", disable=not is_main()):
+        depth_t = np.stack([cv2.resize(d, (buffer.img_w, buffer.img_h), interpolation=cv2.INTER_NEAREST)
+                            for d in env.last_depth]).clip(-2, 2).astype(np.float16)
         if pose_hold <= 0:
           current_pose = random.choice(["Center", "Up", "Down", "Left", "Right"])
           pose_hold = random.randint(8, 16)
@@ -83,7 +86,8 @@ def collect_rollouts(env, agent, buffer, n_steps, seed, env_name="Bipedal Walker
 
         # Extract wrapper's stateful angles if available
         cam_state = _camera_state(env, current_pose)
-
+        cam_state["depth"] = depth_t
+        
         buffer.push(
             top_t=img_top,
             side_t=im_side,

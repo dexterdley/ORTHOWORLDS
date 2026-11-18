@@ -150,9 +150,8 @@ def train_ortho_trajectory_step(
 
     return total_loss, avg_per_view
 
-
 @torch.no_grad()
-def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, shift=3.0):
+def predict_next_view_latents(transformer, latents_t, prompt_embeds, memory_latents=None, steps=20, shift=3.0):
     """
     Simultaneously denoises all 4 orthographic views at t+1 via reverse Euler Flow Matching.
     Input:
@@ -176,17 +175,19 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, steps=20, s
         dt = sigma_curr - sigma_next
 
         t_tensor = torch.full((b,), sigma_curr * 1000.0, device=latents_t.device, dtype=transformer.dtype)
-        combined = torch.cat([latents_t, x_tau.to(dtype=transformer.dtype)], dim=2)  # (B, C, 8, h, w)
+
+        if memory_latents is None:
+            combined = torch.cat([latents_t, x_tau.to(dtype=transformer.dtype)], dim=2)
+        else:
+            combined = torch.cat([latents_t, memory_latents, x_tau.to(dtype=transformer.dtype)], dim=2)
 
         pred_velocity = transformer(
             hidden_states=combined,
             timestep=t_tensor,
             encoder_hidden_states=prompt_embeds,
-        ).sample[:, :, num_views : 2 * num_views].float()  # (B, C, 4, h, w)
+        ).sample[:, :, -num_views:].float()  # (B, C, 4, h, w)
         x_tau = x_tau - dt * pred_velocity
-
     return x_tau.to(dtype=transformer.dtype)
-
 
 @torch.no_grad()
 def predict_next_view_latents_sketch(transformer, latents_t, prompt_embeds, cam, steps=20, shift=3.0):

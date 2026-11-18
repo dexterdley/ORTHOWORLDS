@@ -1,10 +1,63 @@
 """
 camera_utils.py — Utilities for 3D FPV camera pose manipulation.
 Supports clean discrete arrow key poses: 'Center', 'Up', 'Down', 'Left', 'Right'.
+Also DepthCanvas: per-pixel depth for the painter's-algorithm ortho views (env.last_depth).
 """
 import math
 
+import numpy as np
+import pygame
+from pygame import gfxdraw
+
 CAMERA_POSES = ["Center", "Up", "Down", "Left", "Right"]
+
+
+class DepthCanvas:
+    """
+    Per-pixel depth for one painter's-algorithm view (the envs have no z-buffer). Draw the same shapes in the same
+    order as the RGB pass, each with its depth: polygon()/circle(), or any non-anti-aliased pygame draw call on
+    `surf` with colour `color(depth)`. read() returns an H x W float32 map holding, per pixel, the depth of the last
+    shape drawn there (the one the RGB shows); inf where nothing was drawn. Each shape is filled with a unique ID
+    colour, so depth is one value per shape.
+
+    env.last_depth convention: [Top, Side, Rear] = depth maps of render()[0], render()[2], render()[1], each the size
+    of that RGB image. Depth is the position along the view axis in [-1, 1] box coords: the coordinate the reference
+    image gives that axis (the render()[2] row for the Top view's axis, the Top image row/col otherwise), as 2p/size - 1,
+    sign-flipped if needed so -1 = the near side. Values outside [-1, 1] are geometry outside the reference image.
+    Per shape: a planar face uses its mean coordinate along the view axis; a shape drawn as the silhouette of a
+    volume (one polygon/circle per body) uses the volume's near extreme (the face the camera sees).
+    Decorative backdrops with no place in the world (horizon bands, floor strips) are not drawn: inf, like the sky.
+    But a ground band that the Top view shows as ground everywhere is that ground's near face (-1 if it fills Top).
+    """
+    def __init__(self, size):
+        self.surf = pygame.Surface(size, 0, 32)
+        self.surf.fill((0, 0, 0))
+        self.depths = [np.inf]
+
+    def color(self, depth):
+        i = len(self.depths)
+        self.depths.append(float(depth))
+        return (i >> 16, (i >> 8) & 255, i & 255)
+
+    def polygon(self, pts, depth):
+        """Outline then fill, like the RGB passes' gfxdraw.aapolygon + filled_polygon: a face seen edge-on (a wall or
+        ground plane) is only its outline."""
+        ipts, c = [(int(round(x)), int(round(y))) for x, y in pts], self.color(depth)
+        try:
+            gfxdraw.polygon(self.surf, ipts, c)
+            gfxdraw.filled_polygon(self.surf, ipts, c)
+        except Exception:
+            pass
+
+    def circle(self, x, y, r, depth):
+        try:
+            gfxdraw.filled_circle(self.surf, int(round(x)), int(round(y)), int(round(r)), self.color(depth))
+        except Exception:
+            pass
+
+    def read(self):
+        c = pygame.surfarray.array3d(self.surf).transpose(1, 0, 2).astype(np.int64)
+        return np.asarray(self.depths, np.float32)[(c[..., 0] << 16) | (c[..., 1] << 8) | c[..., 2]]
 
 def transform_to_camera_frame(vx, vy, vz, cam_x, cam_y, cam_z, yaw_rad, pitch_rad):
     """

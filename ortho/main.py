@@ -21,6 +21,15 @@ def add_diffusion_noise(latents, tau):
     noisy_latents = (1.0 - tau) * latents + tau * noise
     return noise, noisy_latents
 
+def lift_ortho(img, dep):
+    """Top/Side/Rear (B, 3, 3, H, W) in [-1, 1] + depth (B, 3, H, W) -> 3D points (x, up, z) and their colours, both kept
+    as images (B, 3, 3, H, W) in [-1, 1]. Same fixed layout as train_projector.py (Bipedal's)."""
+    B, _, H, W = dep.shape
+    r = ((torch.arange(H, device=dep.device) + .5) / H * 2 - 1).view(1, H, 1).expand(B, H, W)
+    c = ((torch.arange(W, device=dep.device) + .5) / W * 2 - 1).view(1, 1, W).expand(B, H, W)
+    xyz = [torch.stack(v, dim=1) for v in ((c, -dep[:, 0], r), (c, -r, dep[:, 1]), (dep[:, 2], -r, c))]
+    return torch.stack(xyz, dim=1).clamp(-1, 1), img
+
 @torch.no_grad()
 def validate_fpv(model, vae, val_clip, val_embeds, steps, shift):
     """
@@ -30,8 +39,15 @@ def validate_fpv(model, vae, val_clip, val_embeds, steps, shift):
     views_t, views_next_seq = val_clip[0], val_clip[1]
     curr_latents = encode_views_to_latents(vae, views_t[:, -1:], out_dtype=model.dtype)
     psnrs, gt_frames, pred_frames = [], [], []
+    #memory = [curr_latents]
+
+    gt_depth_t = torch.from_numpy(np.stack([c["depth"] for c in val_clip[4][0]]).astype(np.float32)).to(views_t.device)
+    xyz_t, rgb_t = lift_ortho(views_t[:, :3], gt_depth_t)
+    guided_latents = encode_views_to_latents(vae, torch.cat([xyz_t, rgb_t], dim=1), out_dtype=model.dtype)
+    memory = [guided_latents]
+
     for s, emb in enumerate(val_embeds):
-        curr_latents = predict_next_view_latents(model, curr_latents, emb, steps=steps, shift=shift)
+        curr_latents = predict_next_view_latents(model, curr_latents, emb, memory_latents=torch.cat(memory, dim=2), steps=steps, shift=shift)
         
         pred = decode_latents_to_views(vae, curr_latents)[:, 0].float() #images
         gt = (views_next_seq[s][:, -1].float() + 1.0) / 2.0
@@ -39,6 +55,7 @@ def validate_fpv(model, vae, val_clip, val_embeds, steps, shift):
         psnrs.append(_psnr(pred, gt))
         pred_frames.append(pred)
         gt_frames.append(gt)
+        memory.append(curr_latents)
     return psnrs, torch.stack(gt_frames, dim=1).cpu(), torch.stack(pred_frames, dim=1).cpu()
 
 
@@ -62,7 +79,6 @@ def main(args):
         registry, buffer, rollout_steps=args.rollout_length, num_envs=args.num_envs,
         device=device,
     )
-    
 
     # 2. Instantiate Model and LoRA
     model, vae, text_encoder, tokenizer = load_model(model_id=args.model_id, lora_rank=args.lora_rank)
@@ -80,8 +96,8 @@ def main(args):
     total_steps = args.epochs * args.steps_per_epoch
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
     
-    log_dir = f"./runs/main_debug"
-    ckpt_dir = f"./checkpoints/main_debug"
+    log_dir = f"./runs/main_debug_memory"
+    ckpt_dir = f"./checkpoints/main_debug_memory"
     writer = SummaryWriter(log_dir=log_dir)
     writer.add_text(
             "hyperparameters",
@@ -100,7 +116,10 @@ def main(args):
         with torch.no_grad():
             val_embeds.append(text_encoder(**val_tokens).last_hidden_state.to(device=device, dtype=model.dtype))
 
+    # ===============================
     # 3. Main Diffusion Training loop
+    # ===============================
+    
     global_step = 0
     for epoch in range(args.epochs):
         model.train()
@@ -115,6 +134,12 @@ def main(args):
                     seq_len=args.train_seq_len,
                 )
             
+            gt_depth_t = torch.from_numpy(np.stack([c["depth"] for c in camera_poses_seq[0]]).astype(np.float32)).to(views_t.device) # Temporarily use GT
+            xyz_t, rgb_t = lift_ortho(views_t[:, :3], gt_depth_t) # 3D model of frame t: every Top/Side/Rear pixel = its (x, up, z) + colour
+            guided_views = torch.cat([xyz_t, rgb_t], dim=1) # (B, 6, 3, H, W)
+            guided_latents = encode_views_to_latents(vae, guided_views, out_dtype=model.dtype)
+            memory = [guided_latents] # Simplest memory (No 3D)
+            
             # Take only the main FPV
             views_t = views_t[:,-1 : :]
             views_next_seq = [v[:,-1 : :] for v in views_next_seq]
@@ -122,6 +147,8 @@ def main(args):
             total_loss = 0.0
             avg_per_view = [0.0] * views_t.shape[1]
             curr_latents = encode_views_to_latents(vae, views_t, out_dtype=model.dtype)
+
+            #memory = [curr_latents] # Simplest memory (No 3D)
 
             # So pass the images into VAE to extract their latents, then build prompt
             for s in range(args.train_seq_len): # Unroll each sample in the training sequence
@@ -148,7 +175,11 @@ def main(args):
                 _, cond_latents_t = add_diffusion_noise(curr_latents, ctx_lvl)
                 noise, noisy_target_latents = add_diffusion_noise(target_latents, tau)
 
-                combined_latents = torch.cat([cond_latents_t, noisy_target_latents], dim=2).to(model.dtype)
+                # Memory
+                memory_latents = torch.cat(memory, dim=2)
+                _, memory_latents_t = add_diffusion_noise(memory_latents, ctx_lvl)
+
+                combined_latents = torch.cat([cond_latents_t, memory_latents_t, noisy_target_latents], dim=2).to(model.dtype)
 
                 # 5. Compute GT velocity: v_target = noise - x_0
                 target_velocity = noise - target_latents
@@ -161,7 +192,7 @@ def main(args):
                     encoder_hidden_states=prompt_embeds,
                 ).sample
 
-                pred_velocity = model_pred[:, :, num_views : 2 * num_views]
+                pred_velocity = model_pred[:, :, -num_views:] # Input [ cond_t | memory | noisy target ]
 
                 per_view_losses = [
                     F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
@@ -182,8 +213,10 @@ def main(args):
                     if sf_flag.any():
                         with torch.no_grad():
                             pred_latents[sf_flag] = predict_next_view_latents(
-                                model, curr_latents[sf_flag], prompt_embeds[sf_flag], steps=args.diffusion_steps, shift=args.shift)
+                                model, curr_latents[sf_flag], prompt_embeds[sf_flag], memory_latents=memory_latents[sf_flag], steps=args.diffusion_steps, shift=args.shift)
                     curr_latents = pred_latents
+
+                memory.append(curr_latents)
 
             optimizer.step()
             scheduler.step()

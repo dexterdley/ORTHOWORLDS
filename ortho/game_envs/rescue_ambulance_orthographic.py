@@ -41,7 +41,7 @@ try:
     import cv2
 except ImportError:
     cv2 = None
-from .camera_utils import orbit_camera_frame, orbit_camera_offset
+from .camera_utils import orbit_camera_frame, orbit_camera_offset, DepthCanvas
 
 FPS = 50
 
@@ -1082,7 +1082,7 @@ class RescueAmbulanceEnv(gym.Env):
         return self._scene_cache
 
     def top_items(self, W, H, zoom=TOP_ZOOM):
-        """Top-down draw list [(pts, color, tag)]: centred on the car, heading up (like CarRacing)."""
+        """Top-down draw list [(pts, color, tag, z)]: centred on the car, heading up (like CarRacing); z = item height."""
         scene = self.static_scene()
         cx, cy = self.car.hull.position
         a = float(self.car.hull.angle)
@@ -1103,7 +1103,7 @@ class RescueAmbulanceEnv(gym.Env):
             if visible(pts):
                 pts = _clip_screen(pts, W, H)
                 if len(pts) >= 3:
-                    items.append((pts, col, tag))
+                    items.append((pts, col, tag, 0.0))
         tops = []
         for obj in scene["objects"] + [_car_object(self.car)]:
             for pr in obj["prisms"]:
@@ -1111,12 +1111,12 @@ class RescueAmbulanceEnv(gym.Env):
             for verts, col in obj["decals"]:
                 tops.append((verts[0][2], [(v[0], v[1]) for v in verts], col, obj["tag"]))
         tops.sort(key=lambda it: it[0])
-        for _, poly, col, tag in tops:
+        for z, poly, col, tag in tops:
             pts = [proj(x, y) for x, y in poly]
             if visible(pts):
                 pts = _clip_screen(pts, W, H)
                 if len(pts) >= 3:
-                    items.append((pts, col, tag))
+                    items.append((pts, col, tag, z))
         return items
 
     # ------------------------------------------------------------------
@@ -1163,7 +1163,7 @@ def _tag_matches(tag, target):
 def _paint(surf, items, target=None):
     """Fill polygons in order. target=None: real colours (anti-aliased edges, like the MultiCar wrapper);
     otherwise binary mask paint (target white, everything else black, no anti-aliasing)."""
-    for pts, color, tag in items:
+    for pts, color, tag, _ in items:
         ipts = [(int(round(p[0])), int(round(p[1]))) for p in pts]
         if len(ipts) < 3:
             continue
@@ -1291,16 +1291,16 @@ class RescueAmbulanceOrthographicWrapper(gym.Wrapper):
 
     # ------------------------------------------------------------------
     def _object_items(self, objects, project, side_ok, top_ok, viewer, key_of):
-        """Project prism objects for one view and return their faces back-to-front."""
+        """Project prism objects for one view and return their faces back-to-front: [(pts, color, tag, key_of(face))]."""
         projected = []
         for obj in objects:
             parts = []
             for pr in obj["prisms"]:
-                pf = [(res, col) for verts, col in _prism_faces(pr, side_ok, top_ok)
+                pf = [(res, col, key_of(verts)) for verts, col in _prism_faces(pr, side_ok, top_ok)
                       for res in (project(verts),) if res is not None]
                 if pf:
-                    xs = [p[0] for res, _ in pf for p in res]
-                    ys = [p[1] for res, _ in pf for p in res]
+                    xs = [p[0] for res, _, _ in pf for p in res]
+                    ys = [p[1] for res, _, _ in pf for p in res]
                     parts.append({"faces": pf, "foot": pr["foot"], "key": key_of(pr["foot"]),
                                   "bbox": (min(xs), min(ys), max(xs), max(ys))})
             # Composite objects (the car): order their prisms with the same occlusion sort; decals last
@@ -1310,7 +1310,7 @@ class RescueAmbulanceOrthographicWrapper(gym.Wrapper):
                 if top_ok(verts[0][2]):
                     res = project(verts)
                     if res is not None:
-                        faces.append((res, col))
+                        faces.append((res, col, key_of(verts)))
             if not faces:
                 continue
             xs = [p[0] for f in faces for p in f[0]]
@@ -1320,11 +1320,12 @@ class RescueAmbulanceOrthographicWrapper(gym.Wrapper):
         items = []
         for k in _order_objects(projected, viewer):
             p = projected[k]
-            items.extend((f[0], f[1], p["obj"]["tag"]) for f in p["faces"])
+            items.extend((f[0], f[1], p["obj"]["tag"], f[2]) for f in p["faces"])
         return items
 
     def _draw_lists(self):
-        """Per-view draw lists [(pts, color, tag)] for the current state and camera (camera not modified)."""
+        """Per-view draw lists [(pts, color, tag, d)] for the current state and camera (camera not modified).
+        d = the item's own mean coordinate (m) along the view axis: height z (top), key_of (rear / side / fpv, far +)."""
         base = self.env.unwrapped
         W, H = self.WINDOW_W, self.WINDOW_H
         scene = base.static_scene()
@@ -1361,7 +1362,7 @@ class RescueAmbulanceOrthographicWrapper(gym.Wrapper):
                 return pts if len(pts) >= 3 else None
 
             def key_of(foot):
-                return sum((px - x) * axis_d[0] + (py - y) * axis_d[1] for px, py in foot) / len(foot)
+                return sum((p[0] - x) * axis_d[0] + (p[1] - y) * axis_d[1] for p in foot) / len(foot)
 
             return self._object_items(objs, project,
                                       lambda p, nx, ny: nx * vdir[0] + ny * vdir[1] > 1e-6,
@@ -1398,7 +1399,7 @@ class RescueAmbulanceOrthographicWrapper(gym.Wrapper):
         for poly, col, tag in scene["ground"]:
             pts = project([(px, py, 0.0) for px, py in poly])
             if pts is not None:
-                fpv.append((pts, col, tag))
+                fpv.append((pts, col, tag, key_of(poly)))
         fpv += self._object_items(scene["objects"] + [car_obj], project,
                                   lambda p, nx, ny: (cx_w - p[0]) * nx + (cy_w - p[1]) * ny > 1e-6,
                                   lambda z: cz_w > z, ("point", cx_w, cy_w), key_of)
@@ -1431,9 +1432,32 @@ class RescueAmbulanceOrthographicWrapper(gym.Wrapper):
         base = self.env.unwrapped
         if getattr(base, "car", None) is None:
             blank = np.zeros((VIDEO_H, VIDEO_W, 3), np.uint8)
+            self.last_depth = [np.full((VIDEO_H, VIDEO_W), np.inf, np.float32)] * 3
             return blank, blank, blank, blank
         self.cam_x, self.cam_y, self.cam_z = self.cam_pos
-        surfs = self._paint_views(self._draw_lists())
+        lists = self._draw_lists()
+        surfs = self._paint_views(lists)
+
+        # Ortho depth (DepthCanvas convention): redraw each list, own mean coordinate d -> [-1, 1] box coords,
+        # then the same downsizing as _surf_to_img (nearest neighbour)
+        W, H, S, Z = self.WINDOW_W, self.WINDOW_H, self.scale_factor, self.top_zoom
+        g = int(self.camera_height * S + H / 2)   # elevation row of the ground line (z = 0)
+        rows = ((np.arange(VIDEO_H) + 0.5) * H / VIDEO_H).astype(int)
+        cols = ((np.arange(VIDEO_W) + 0.5) * W / VIDEO_W).astype(int)
+        self.last_depth = []
+        for name, to_box, ground, ground_d in (
+                ("top", lambda z: 2 * (self.camera_height - z) * S / H, (0, 0, W, H), 0.0),  # z -> Side row; near = up
+                ("side", lambda k: 2 * Z * k / W, (0, g, W, H - g), -self.SIDE_CUT),  # -rel.r -> Top col W/2 + Z rel.r,
+                ("rear", lambda k: 2 * Z * k / H, (0, g, W, H - g), -self.REAR_CUT)):  # rel.f -> Top row H/2 - Z rel.f
+            # (side / rear flipped: near = right / behind). All items are planar faces (flat tops in Top; elevations
+            # cull edge-on faces), so d = the face's mean coordinate. Ground: the z = 0 plane fills Top; in the
+            # elevations only the band below the ground line is geometry, the ground slab cut by the section plane
+            # (its part above the ground line is a horizon backdrop and stays inf like the sky)
+            canvas = DepthCanvas((W, H))
+            pygame.draw.rect(canvas.surf, canvas.color(to_box(ground_d)), ground)
+            for pts, _, _, d in lists[name]:
+                canvas.polygon(pts, to_box(d))
+            self.last_depth.append(canvas.read()[np.ix_(rows, cols)])
         return tuple(_surf_to_img(s) for s in surfs)
 
     def render_masks(self, target):

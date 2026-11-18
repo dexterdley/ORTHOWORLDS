@@ -3,6 +3,10 @@ import numpy as np
 import pygame
 from pygame import gfxdraw
 import math
+try:
+    from .camera_utils import DepthCanvas
+except ImportError:  # imported as a top-level module from inside game_envs/
+    from camera_utils import DepthCanvas
 
 class BipedalOrthographicWrapper(gym.Wrapper):
     """
@@ -98,6 +102,7 @@ class BipedalOrthographicWrapper(gym.Wrapper):
 
         if base_env.hull is None:
             dummy = np.zeros((self.VIEWPORT_H, self.VIEWPORT_W, 3), dtype=np.uint8)
+            self.last_depth = [np.full((self.VIEWPORT_H, self.VIEWPORT_W), np.inf, np.float32)] * 3
             return dummy, dummy, dummy, dummy
 
         scroll_x = base_env.scroll * self.SCALE
@@ -256,6 +261,17 @@ class BipedalOrthographicWrapper(gym.Wrapper):
                     gfxdraw.filled_polygon(surf, ipts, safe_color)
                 except Exception:
                     pass
+
+        # --- 6. Ortho depth (DepthCanvas convention): redraw the sorted lists, sort depth -> [-1, 1] box coords ---
+        W, H = self.VIEWPORT_W, self.VIEWPORT_H
+        self.last_depth = []
+        for proj_list, to_box in [(proj_top,   lambda d: 1 + 2 * d / H),   # -vy -> Side row (H - vy); near = up
+                                  (proj_side,  lambda d: 2 * d / H),       # vz  -> Top row (vz + cy); near = -z
+                                  (proj_front, lambda d: 2 * d / W - 1)]:  # x   -> Top col; near = -x
+            canvas = DepthCanvas((W, H))
+            for d, pts, _, _ in proj_list:
+                canvas.polygon(pts, to_box(d))
+            self.last_depth.append(canvas.read())
 
         out_imgs = []
         for surf in [top_surf, front_surf, side_surf, fpv_surf]:
