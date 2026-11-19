@@ -387,8 +387,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--steps_per_epoch", type=int, default=200, help="Training steps per epoch")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for LoRA parameters")
-    parser.add_argument("--proj_lr", type=float, default=3e-3,
-                        help="Learning rate for the sketch projector (at the LoRA lr it barely leaves its copy-Rear init)")
+    parser.add_argument("--proj_lr", type=float, default=3e-3,help="Learning rate for the sketch projector (at the LoRA lr it barely leaves its copy-Rear init)")
     parser.add_argument("--save_every", type=int, default=2, help="Save checkpoint every N epochs")
     parser.add_argument("--eval_every", type=int, default=1, help="Generate and evaluate views every N epochs")
     parser.add_argument("--eval_steps", type=int, default=20, help="Number of Euler flow matching sampling steps per frame")

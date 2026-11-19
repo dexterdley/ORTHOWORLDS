@@ -1,3 +1,4 @@
+import cv2
 import os, sys
 import argparse
 import torch, numpy as np
@@ -8,13 +9,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 from buffer import OrthoTransitionBuffer
 from models import LinearProjector, _get_wan_latent_stats
-from data_rollout import get_registries, collect_all_envs_rollouts
+from data_rollout import get_registries, collect_all_envs_rollouts, _skip_intro, _camera_state
 from models import encode_views_to_latents, decode_latents_to_views
 from flow import train_ortho_flow_step, train_ortho_trajectory_step, predict_next_view_latents
-from utils import _build_registry, set_seed, _psnr, load_model, compose_player_prompts
+from utils import _build_registry, _build_heldout_registry, set_seed, _psnr, load_model, compose_player_prompts, _annotate_frame_pose
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-IMG_H, IMG_W = 96, 96
+IMG_H, IMG_W = 128, 128
 
 def add_diffusion_noise(latents, tau):
     noise = torch.randn_like(latents)
@@ -31,32 +32,53 @@ def lift_ortho(img, dep):
     return torch.stack(xyz, dim=1).clamp(-1, 1), img
 
 @torch.no_grad()
-def validate_fpv(model, vae, val_clip, val_embeds, steps, shift):
+def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, rollout_steps, steps, shift, seed, camera_pose="Right", use_memory=True):
     """
-    Autoregressive rollout: Model only sees its own predictions after frame 0
+    Autoregressive rollout: Model only sees its own predictions after frame 0 (live env, same protocol as validation.py)
     """
     model.eval()
-    views_t, views_next_seq = val_clip[0], val_clip[1]
+    obs, _ = env.reset(seed=seed)
+    obs = _skip_intro(env, env_name, obs)
+    env.action_space.seed(seed)
+
+    img_top, im_rear, im_side, im_fpv = env.render(camera_pose="Center")
+    views = np.stack([cv2.resize(x, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1) for x in [img_top, im_side, im_rear, im_fpv]])
+    views_t = torch.from_numpy(views).float().unsqueeze(0).to(device) / 127.5 - 1.0 # (1, 4, 3, H, W)
     curr_latents = encode_views_to_latents(vae, views_t[:, -1:], out_dtype=model.dtype)
-    psnrs, gt_frames, pred_frames = [], [], []
-    #memory = [curr_latents]
+    gt_frames, pred_frames = [], []
 
-    gt_depth_t = torch.from_numpy(np.stack([c["depth"] for c in val_clip[4][0]]).astype(np.float32)).to(views_t.device)
-    xyz_t, rgb_t = lift_ortho(views_t[:, :3], gt_depth_t)
-    guided_latents = encode_views_to_latents(vae, torch.cat([xyz_t, rgb_t], dim=1), out_dtype=model.dtype)
-    memory = [guided_latents]
+    if use_memory:
+        gt_depth_t = np.stack([cv2.resize(d, (IMG_W, IMG_H), interpolation=cv2.INTER_NEAREST) for d in env.last_depth]).clip(-2, 2) # as data_rollout.py
+        gt_depth_t = torch.from_numpy(gt_depth_t).float().unsqueeze(0).to(device)
+        xyz_t, rgb_t = lift_ortho(views_t[:, :3], gt_depth_t)
+        guided_latents = encode_views_to_latents(vae, torch.cat([xyz_t, rgb_t], dim=1), out_dtype=model.dtype)
+    
+    memory = [guided_latents] if use_memory else [curr_latents[:, :, :0]]
 
-    for s, emb in enumerate(val_embeds):
+    for s in range(rollout_steps):
+        action = agent.predict(obs, deterministic=True)[0] if hasattr(agent, "predict") else env.action_space.sample()
+        obs, _, terminated, truncated, _ = env.step(action)
+        _, _, _, next_fpv = env.render(camera_pose=camera_pose)
+
+        prompts_s = compose_player_prompts([np.atleast_1d(np.asarray(action, dtype=np.float32))], env_name=env_name, camera_pose=_camera_state(env, camera_pose))
+        text_inputs = tokenizer(prompts_s, padding="max_length", max_length=128, truncation=True, return_tensors="pt").to(text_encoder.device)
+        emb = text_encoder(**text_inputs).last_hidden_state.to(device=device, dtype=model.dtype)
+
         curr_latents = predict_next_view_latents(model, curr_latents, emb, memory_latents=torch.cat(memory, dim=2), steps=steps, shift=shift)
-        
+
         pred = decode_latents_to_views(vae, curr_latents)[:, 0].float() #images
-        gt = (views_next_seq[s][:, -1].float() + 1.0) / 2.0
-        
-        psnrs.append(_psnr(pred, gt))
+        gt = torch.from_numpy(cv2.resize(next_fpv, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1)).float().unsqueeze(0).to(device) / 255.0
+
         pred_frames.append(pred)
         gt_frames.append(gt)
-        memory.append(curr_latents)
-    return psnrs, torch.stack(gt_frames, dim=1).cpu(), torch.stack(pred_frames, dim=1).cpu()
+        curr_latents = encode_views_to_latents(vae, pred.unsqueeze(1) * 2.0 - 1.0, out_dtype=model.dtype) # Re-encode onto the VAE manifold, as validation.py
+        # memory.append(curr_latents) # Temp using 3D
+        if terminated or truncated:
+            break
+
+    env.close()
+    gt_video, pred_video = torch.stack(gt_frames, dim=1).cpu(), torch.stack(pred_frames, dim=1).cpu()
+    return _psnr(pred_video, gt_video), gt_video, pred_video
 
 
 def main(args):
@@ -64,26 +86,42 @@ def main(args):
 
     # 1. Build Envs and Buffer
     if args.hifi:
-     registry, _ = get_registries(args.hifi)
+        registry, heldout_registry = get_registries(args.hifi)
     else:
         registry = _build_registry()
+        heldout_registry =  _build_heldout_registry(obstacles=False)
 
-    reg_dict = dict(registry)
+    reg_dict = dict(registry + heldout_registry)
     buffer = OrthoTransitionBuffer(
             capacity=args.rollout_length * min(args.num_envs, len(registry)), 
             img_h=IMG_H, 
             img_w=IMG_W, 
             max_action_len=8
     )
-    active_envs, agents = collect_all_envs_rollouts(
-        registry, buffer, rollout_steps=args.rollout_length, num_envs=args.num_envs,
+
+    # Use cache if exists
+    rank = 0
+    cache_dir = (f"./buffer_cache/s{args.seed}_c{args.seed + rank}_r{rank}"
+                f"_e{args.num_envs}_n{args.rollout_length}_{IMG_H}px{'_hifi' if args.hifi else ''}")
+
+    cached = os.path.exists(os.path.join(cache_dir, "meta.pkl"))
+    print(cache_dir)
+
+    active_envs, agents = ([], {}) if cached else collect_all_envs_rollouts(
+        registry, buffer, rollout_steps=args.rollout_length, num_envs=args.num_envs, seed=args.seed + rank,
         device=device,
     )
+    if cached:
+        buffer.load(cache_dir)
+        print(f"[INFO] Loaded cached rollouts from {cache_dir} ({buffer.size} transitions)")
+    else:
+        buffer.save(cache_dir)
 
     # 2. Instantiate Model and LoRA
     model, vae, text_encoder, tokenizer = load_model(model_id=args.model_id, lora_rank=args.lora_rank)
     #import utils; utils.device = "cpu"   # load_model() leaves everything on CPU (UMT5 is ~11 GB)
-    # model.to(device); vae.to(device)
+    #model, vae, text_encoder, tokenizer = load_model(model_id=args.model_id, lora_rank=args.lora_rank)
+    #model.to(device); vae.to(device)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(
@@ -96,25 +134,18 @@ def main(args):
     total_steps = args.epochs * args.steps_per_epoch
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
     
-    log_dir = f"./runs/main_debug_memory"
-    ckpt_dir = f"./checkpoints/main_debug_memory"
+    run_name = f"main_{'memory' if args.use_memory else 'no_mem'}_s{args.seed}"
+    log_dir = f"./runs/{run_name}"
+    ckpt_dir = f"./checkpoints/{run_name}"
+
     writer = SummaryWriter(log_dir=log_dir)
     writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
     print(f"TensorBoard logging to: {log_dir}")
-
-    val_envs = ["Bipedal Walker"]
-
-    # Validation, sample from buffer
-    val_clip = buffer.sample_trajectory_batch(batch_size=1, seq_len=args.rollout_video_steps)
-    val_embeds = []
-    for s in range(args.rollout_video_steps):
-        val_prompts = compose_player_prompts(val_clip[2][s], env_name=val_clip[3][s], camera_pose=val_clip[4][s])
-        val_tokens = tokenizer(val_prompts, padding="max_length", max_length=128, truncation=True, return_tensors="pt").to(text_encoder.device)
-        with torch.no_grad():
-            val_embeds.append(text_encoder(**val_tokens).last_hidden_state.to(device=device, dtype=model.dtype))
+    
+    VAL_ENVS = ["Parkour Runner", "Lunar Lander", "MultiCar Racing"]
 
     # ===============================
     # 3. Main Diffusion Training loop
@@ -133,12 +164,11 @@ def main(args):
                     batch_size=args.batch_size,
                     seq_len=args.train_seq_len,
                 )
-            
-            gt_depth_t = torch.from_numpy(np.stack([c["depth"] for c in camera_poses_seq[0]]).astype(np.float32)).to(views_t.device) # Temporarily use GT
-            xyz_t, rgb_t = lift_ortho(views_t[:, :3], gt_depth_t) # 3D model of frame t: every Top/Side/Rear pixel = its (x, up, z) + colour
-            guided_views = torch.cat([xyz_t, rgb_t], dim=1) # (B, 6, 3, H, W)
-            guided_latents = encode_views_to_latents(vae, guided_views, out_dtype=model.dtype)
-            memory = [guided_latents] # Simplest memory (No 3D)
+            if args.use_memory:
+                gt_depth_t = torch.from_numpy(np.stack([c["depth"] for c in camera_poses_seq[0]]).astype(np.float32)).to(views_t.device) # Temporarily use GT
+                xyz_t, rgb_t = lift_ortho(views_t[:, :3], gt_depth_t) # 3D model of frame t: every Top/Side/Rear pixel = its (x, up, z) + colour
+                guided_views = torch.cat([xyz_t, rgb_t], dim=1) # (B, 6, 3, H, W)
+                guided_latents = encode_views_to_latents(vae, guided_views, out_dtype=model.dtype)
             
             # Take only the main FPV
             views_t = views_t[:,-1 : :]
@@ -147,8 +177,9 @@ def main(args):
             total_loss = 0.0
             avg_per_view = [0.0] * views_t.shape[1]
             curr_latents = encode_views_to_latents(vae, views_t, out_dtype=model.dtype)
-
-            #memory = [curr_latents] # Simplest memory (No 3D)
+            
+            # memory = [curr_latents] # Temp Simplest memory (No 3D)
+            memory = [guided_latents] if args.use_memory else [curr_latents[:, :, :0]]
 
             # So pass the images into VAE to extract their latents, then build prompt
             for s in range(args.train_seq_len): # Unroll each sample in the training sequence
@@ -204,7 +235,7 @@ def main(args):
                 total_loss += scaled_loss.item()
                 
                 for v_idx in range(num_views):
-                    avg_per_view[v_idx] += per_view_losses[v_idx] / float(args.train_seq_len)
+                    avg_per_view[v_idx] += per_view_losses[v_idx].item() / float(args.train_seq_len)
 
                 # 7. Self-forcing step, basically run inference during training and feed its own pred autoregressively
                 if not is_last_step:
@@ -216,7 +247,7 @@ def main(args):
                                 model, curr_latents[sf_flag], prompt_embeds[sf_flag], memory_latents=memory_latents[sf_flag], steps=args.diffusion_steps, shift=args.shift)
                     curr_latents = pred_latents
 
-                memory.append(curr_latents)
+                # memory.append(curr_latents) # Temp using 3D 
 
             optimizer.step()
             scheduler.step()
@@ -232,17 +263,30 @@ def main(args):
             global_step += 1
             writer.add_scalar("Train/Loss", total_loss, global_step)
             writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
+            writer.add_scalar("Train/SelfForcingProb", curr_self_forcing_prob, global_step)
+            writer.add_scalar("Train/Loss_3D_FPV", float(avg_per_view[0]), global_step)
 
-        # Validation need to loop across VAL_ENVS
+        # Validation across VAL_ENVS
         if (epoch + 1) % args.eval_every == 0:
-            env_name = val_envs[0]
-            clean_tag = env_name.replace(" ", "_").lower()
+            model.eval()
+            print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch + 1}")
 
-            psnrs, gt_video, pred_video = validate_fpv(model, vae, val_clip, val_embeds, steps=args.diffusion_steps, shift=args.shift)
-            writer.add_scalar("Train/SelfForcingProb", curr_self_forcing_prob, epoch + 1)
-            writer.add_scalar(f"Validation/{clean_tag}/Avg_PSNR", sum(psnrs) / len(psnrs), epoch + 1)
-            writer.add_video(f"Validation/{clean_tag}/FPV", pred_video, epoch + 1, fps=args.video_fps)
-            writer.add_video(f"GT/{clean_tag}/FPV", gt_video, epoch + 1, fps=args.video_fps)
+            for env_name in VAL_ENVS:
+                env, agent = reg_dict[env_name](), agents.get(env_name, agents.get("Bipedal Walker"))
+
+                # Next Validation Autoregressive rollouts
+                clean_tag = env_name.replace(" ", "_").lower()
+                psnr, gt_video, pred_video = validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, args.rollout_video_steps, steps=args.diffusion_steps, shift=args.shift, seed=args.seed + 1000, use_memory=args.use_memory)
+                vid_fpv_vis = torch.stack([_annotate_frame_pose(f, "Right") for f in pred_video[0]]).unsqueeze(0) # pose overlay, as validation.py
+                vid_gt_fpv_vis = torch.stack([_annotate_frame_pose(f, "Right") for f in gt_video[0]]).unsqueeze(0)
+
+                writer.add_scalar(f"Validation/{clean_tag}/PSNR/FPV", psnr, epoch + 1)
+                print(f"  [Epoch {epoch + 1}] [{env_name}] Autoregressive Video PSNR: FPV: {psnr:.2f}dB")
+                writer.add_video(f"Test/{clean_tag}/FPV", vid_fpv_vis, epoch + 1, fps=args.video_fps)
+                if args.log_gt:
+                    writer.add_video(f"GT/{clean_tag}/FPV", vid_gt_fpv_vis, epoch + 1, fps=args.video_fps)
+
+
             model.save_pretrained(os.path.join(ckpt_dir, f"epoch_{epoch+1}"))
 
     print("Ending Training")
@@ -269,6 +313,8 @@ def parse_args():
     parser.add_argument("--num_envs", type=int, default=1, help="Number of training envs")
     parser.add_argument("--hifi", action="store_true", default=False, help="Render with the Godot hi-fi envs")
     parser.add_argument("--shift", type=int, default=3, help="Diffusion logit shift")
+    parser.add_argument("--use_memory", action="store_true", default=False, help="Condition on the memory 3D latents (lifted Top/Side/Rear + depth of frame t)")
+    parser.add_argument("--log_gt", action="store_true", help="Also log the ground-truth validation videos (identical every epoch)")
     return parser.parse_args()
 
 if __name__ == "__main__":
