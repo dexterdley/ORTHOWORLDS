@@ -31,6 +31,18 @@ def lift_ortho(img, dep):
     xyz = [torch.stack(v, dim=1) for v in ((c, -dep[:, 0], r), (c, -r, dep[:, 1]), (dep[:, 2], -r, c))]
     return torch.stack(xyz, dim=1).clamp(-1, 1), img
 
+def rotate_3D(xyz, cams):
+    """xyz (B, 3 views, 3, H, W) box coords (x, up, z) -> same points in the target FPV camera's axes
+    (right, up, forward). Rotation only, as bipedal_orthographic.py:190-206."""
+    yaw   = torch.tensor([c["yaw"]   for c in cams], device=xyz.device).view(-1, 1, 1, 1)
+    pitch = torch.tensor([c["pitch"] for c in cams], device=xyz.device).view(-1, 1, 1, 1)
+    x, y, z = xyz[:, :, 0] * 1.5, xyz[:, :, 1], xyz[:, :, 2]   # 600x400 viewport -> equal units
+    cy, sy, cp, sp = yaw.cos(), yaw.sin(), pitch.cos(), pitch.sin()
+    right = sy * x + cy * z
+    up    = -cy * sp * x + cp * y + sy * sp * z
+    fwd   = cy * cp * x - sp * y - sy * cp * z
+    return (torch.stack([right, up, fwd], dim=2) / 2).clamp(-1, 1)
+
 @torch.no_grad()
 def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, rollout_steps, steps, shift, seed, camera_pose="Right", use_memory=True):
     """
@@ -50,21 +62,26 @@ def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, roll
     if use_memory:
         gt_depth_t = np.stack([cv2.resize(d, (IMG_W, IMG_H), interpolation=cv2.INTER_NEAREST) for d in env.last_depth]).clip(-2, 2) # as data_rollout.py
         gt_depth_t = torch.from_numpy(gt_depth_t).float().unsqueeze(0).to(device)
-        xyz_t, rgb_t = lift_ortho(views_t[:, :3], gt_depth_t)
-        guided_latents = encode_views_to_latents(vae, torch.cat([xyz_t, rgb_t], dim=1), out_dtype=model.dtype)
-    
-    memory = [guided_latents] if use_memory else [curr_latents[:, :, :0]]
+        memory = [lift_ortho(views_t[:, :3], gt_depth_t)] # write frame 0: (xyz, rgb)
+
+    memory_latents = curr_latents[:, :, :0]
 
     for s in range(rollout_steps):
         action = agent.predict(obs, deterministic=True)[0] if hasattr(agent, "predict") else env.action_space.sample()
         obs, _, terminated, truncated, _ = env.step(action)
-        _, _, _, next_fpv = env.render(camera_pose=camera_pose)
+        next_top, next_rear, next_side, next_fpv = env.render(camera_pose=camera_pose)
 
         prompts_s = compose_player_prompts([np.atleast_1d(np.asarray(action, dtype=np.float32))], env_name=env_name, camera_pose=_camera_state(env, camera_pose))
+        
+        if use_memory:
+            xyz_s = torch.cat([rotate_3D(m[0], [_camera_state(env, camera_pose)]) for m in memory], dim=1) # read: every stored frame, turned to the camera being predicted
+            guided_views = torch.cat([xyz_s] + [m[1] for m in memory], dim=1) # (B, 6 * len(memory), 3, H, W)
+            memory_latents = encode_views_to_latents(vae, guided_views, out_dtype=model.dtype)
+
         text_inputs = tokenizer(prompts_s, padding="max_length", max_length=128, truncation=True, return_tensors="pt").to(text_encoder.device)
         emb = text_encoder(**text_inputs).last_hidden_state.to(device=device, dtype=model.dtype)
 
-        curr_latents = predict_next_view_latents(model, curr_latents, emb, memory_latents=torch.cat(memory, dim=2), steps=steps, shift=shift)
+        curr_latents = predict_next_view_latents(model, curr_latents, emb, memory_latents=memory_latents, steps=steps, shift=shift)
 
         pred = decode_latents_to_views(vae, curr_latents)[:, 0].float() #images
         gt = torch.from_numpy(cv2.resize(next_fpv, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1)).float().unsqueeze(0).to(device) / 255.0
@@ -72,7 +89,12 @@ def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, roll
         pred_frames.append(pred)
         gt_frames.append(gt)
         curr_latents = encode_views_to_latents(vae, pred.unsqueeze(1) * 2.0 - 1.0, out_dtype=model.dtype) # Re-encode onto the VAE manifold, as validation.py
-        # memory.append(curr_latents) # Temp using 3D
+        
+        if use_memory and (s + 1) % 4 == 0: # write the frame just reached, every 4th as in training
+            views = np.stack([cv2.resize(x, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1) for x in [next_top, next_side, next_rear]])
+            depth = np.stack([cv2.resize(d, (IMG_W, IMG_H), interpolation=cv2.INTER_NEAREST) for d in env.last_depth]).clip(-2, 2)
+            memory.append(lift_ortho(torch.from_numpy(views).float().unsqueeze(0).to(device) / 127.5 - 1.0, torch.from_numpy(depth).float().unsqueeze(0).to(device)))
+            memory = memory[-2:]
         if terminated or truncated:
             break
 
@@ -119,9 +141,9 @@ def main(args):
 
     # 2. Instantiate Model and LoRA
     model, vae, text_encoder, tokenizer = load_model(model_id=args.model_id, lora_rank=args.lora_rank)
-    #import utils; utils.device = "cpu"   # load_model() leaves everything on CPU (UMT5 is ~11 GB)
-    #model, vae, text_encoder, tokenizer = load_model(model_id=args.model_id, lora_rank=args.lora_rank)
-    #model.to(device); vae.to(device)
+    # import utils; utils.device = "cpu"   # load_model() leaves everything on CPU (UMT5 is ~11 GB)
+    # model, vae, text_encoder, tokenizer = load_model(model_id=args.model_id, lora_rank=args.lora_rank)
+    # model.to(device); vae.to(device)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(
@@ -132,9 +154,12 @@ def main(args):
     )
 
     total_steps = args.epochs * args.steps_per_epoch
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
-    
-    run_name = f"main_{'memory' if args.use_memory else 'no_mem'}_s{args.seed}"
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
+    warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=200)
+    cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - 200, eta_min=args.lr * 0.1)
+    scheduler = optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[200])
+
+    run_name = f"main_{'memory_rotate' if args.use_memory else 'no_mem'}_s{args.seed}"
     log_dir = f"./runs/{run_name}"
     ckpt_dir = f"./checkpoints/{run_name}"
 
@@ -164,12 +189,9 @@ def main(args):
                     batch_size=args.batch_size,
                     seq_len=args.train_seq_len,
                 )
-            if args.use_memory:
-                gt_depth_t = torch.from_numpy(np.stack([c["depth"] for c in camera_poses_seq[0]]).astype(np.float32)).to(views_t.device) # Temporarily use GT
-                xyz_t, rgb_t = lift_ortho(views_t[:, :3], gt_depth_t) # 3D model of frame t: every Top/Side/Rear pixel = its (x, up, z) + colour
-                guided_views = torch.cat([xyz_t, rgb_t], dim=1) # (B, 6, 3, H, W)
-                guided_latents = encode_views_to_latents(vae, guided_views, out_dtype=model.dtype)
-            
+            ortho_seq = [views_t[:, :3]] + [v[:, :3] for v in views_next_seq] # Top/Side/Rear of frames t .. t+T
+            memory = [] # 3D frames written so far: (xyz, rgb)
+
             # Take only the main FPV
             views_t = views_t[:,-1 : :]
             views_next_seq = [v[:,-1 : :] for v in views_next_seq]
@@ -179,8 +201,9 @@ def main(args):
             curr_latents = encode_views_to_latents(vae, views_t, out_dtype=model.dtype)
             
             # memory = [curr_latents] # Temp Simplest memory (No 3D)
-            memory = [guided_latents] if args.use_memory else [curr_latents[:, :, :0]]
-
+            # memory = [guided_latents] if args.use_memory else [curr_latents[:, :, :0]]
+            memory_latents = curr_latents[:, :, :0]
+            
             # So pass the images into VAE to extract their latents, then build prompt
             for s in range(args.train_seq_len): # Unroll each sample in the training sequence
 
@@ -207,7 +230,16 @@ def main(args):
                 noise, noisy_target_latents = add_diffusion_noise(target_latents, tau)
 
                 # Memory
-                memory_latents = torch.cat(memory, dim=2)
+                # memory_latents = torch.cat(memory, dim=2)
+                if args.use_memory:
+                    if s % 4 == 0: # write the frame the model is at (t+s), every 4th
+                        gt_depth_s = torch.from_numpy(np.stack([c["depth"] for c in camera_poses_seq[s]]).astype(np.float32)).to(device) # Temporarily use GT
+                        memory.append(lift_ortho(ortho_seq[s], gt_depth_s)) # (xyz, rgb): every Top/Side/Rear pixel = its (x, up, z) + colour
+                        memory = memory[-2:]
+                    xyz_s = torch.cat([rotate_3D(m[0], camera_poses_seq[s]) for m in memory], dim=1) # read: every stored frame, turned to the camera being predicted
+                    guided_views = torch.cat([xyz_s] + [m[1] for m in memory], dim=1) # (B, 6 * len(memory), 3, H, W)
+                    memory_latents = encode_views_to_latents(vae, guided_views, out_dtype=model.dtype)
+
                 _, memory_latents_t = add_diffusion_noise(memory_latents, ctx_lvl)
 
                 combined_latents = torch.cat([cond_latents_t, memory_latents_t, noisy_target_latents], dim=2).to(model.dtype)
@@ -249,6 +281,7 @@ def main(args):
 
                 # memory.append(curr_latents) # Temp using 3D 
 
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -304,7 +337,7 @@ def parse_args():
     parser.add_argument("--ctx_noise_max", type=float, default=0.15, help="Max Gaussian noise added to conditioning context latents to prevent drift")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--steps_per_epoch", type=int, default=200, help="Training steps per epoch")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for LoRA parameters")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for LoRA parameters")
     parser.add_argument("--eval_every", type=int, default=1, help="Generate and evaluate views every N epochs")
     parser.add_argument("--diffusion_steps", type=int, default=8, help="Number of Euler flow matching sampling steps per frame")
     parser.add_argument("--rollout_video_steps", type=int, default=16, help="Autoregressive rollout steps for validation videos")
