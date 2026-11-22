@@ -14,7 +14,16 @@ from models import encode_views_to_latents, decode_latents_to_views
 from flow import train_ortho_flow_step, train_ortho_trajectory_step, predict_next_view_latents
 from utils import _build_registry, _build_heldout_registry, set_seed, _psnr, load_model, compose_player_prompts, _annotate_frame_pose
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+import contextlib
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from datetime import datetime, timedelta
+from utils import is_main
+
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(local_rank)
+device = f"cuda:{local_rank}"
+
 IMG_H, IMG_W = 128, 128
 
 def add_diffusion_noise(latents, tau):
@@ -88,7 +97,6 @@ def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, roll
 
         pred_frames.append(pred)
         gt_frames.append(gt)
-        curr_latents = encode_views_to_latents(vae, pred.unsqueeze(1) * 2.0 - 1.0, out_dtype=model.dtype) # Re-encode onto the VAE manifold, as validation.py
         
         if use_memory and (s + 1) % 4 == 0: # write the frame just reached, every 4th as in training
             views = np.stack([cv2.resize(x, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1) for x in [next_top, next_side, next_rear]])
@@ -104,7 +112,9 @@ def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, roll
 
 
 def main(args):
-    set_seed(args.seed)
+    dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+    set_seed(args.seed + rank)
 
     # 1. Build Envs and Buffer
     if args.hifi:
@@ -122,7 +132,6 @@ def main(args):
     )
 
     # Use cache if exists
-    rank = 0
     cache_dir = (f"./buffer_cache/s{args.seed}_c{args.seed + rank}_r{rank}"
                 f"_e{args.num_envs}_n{args.rollout_length}_{IMG_H}px{'_hifi' if args.hifi else ''}")
 
@@ -135,12 +144,14 @@ def main(args):
     )
     if cached:
         buffer.load(cache_dir)
-        print(f"[INFO] Loaded cached rollouts from {cache_dir} ({buffer.size} transitions)")
+        if is_main():
+            print(f"[INFO] Loaded cached rollouts from {cache_dir} ({buffer.size} transitions)")
     else:
         buffer.save(cache_dir)
 
     # 2. Instantiate Model and LoRA
     model, vae, text_encoder, tokenizer = load_model(model_id=args.model_id, lora_rank=args.lora_rank)
+    ddp_model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
     # import utils; utils.device = "cpu"   # load_model() leaves everything on CPU (UMT5 is ~11 GB)
     # model, vae, text_encoder, tokenizer = load_model(model_id=args.model_id, lora_rank=args.lora_rank)
     # model.to(device); vae.to(device)
@@ -159,16 +170,18 @@ def main(args):
     cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - 200, eta_min=args.lr * 0.1)
     scheduler = optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[200])
 
-    run_name = f"main_{'memory_rotate' if args.use_memory else 'no_mem'}_s{args.seed}"
+    run_name = f"main_{'memory_rotate_ddp' if args.use_memory else 'no_mem'}_s{args.seed}"
     log_dir = f"./runs/{run_name}"
     ckpt_dir = f"./checkpoints/{run_name}"
 
-    writer = SummaryWriter(log_dir=log_dir)
-    writer.add_text(
-            "hyperparameters",
-            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-        )
-    print(f"TensorBoard logging to: {log_dir}")
+    writer = None
+    if is_main():
+        writer = SummaryWriter(log_dir=log_dir)
+        writer.add_text(
+                "hyperparameters",
+                "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+            )
+        print(f"TensorBoard logging to: {log_dir}")
     
     VAL_ENVS = ["Parkour Runner", "Lunar Lander", "MultiCar Racing"]
 
@@ -182,7 +195,7 @@ def main(args):
         progress = epoch / max(1, args.epochs - 1)
         curr_self_forcing_prob = args.self_forcing_prob * min(1.0, progress * 1.5)
 
-        pbar = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch+1}/{args.epochs} (Self-pred Prob.={curr_self_forcing_prob:.2f})")
+        pbar = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch+1}/{args.epochs} (Self-pred Prob.={curr_self_forcing_prob:.2f})", disable=not is_main())
 
         for _ in pbar:
             views_t, views_next_seq, actions_seq, env_names_seq, camera_poses_seq = buffer.sample_trajectory_batch(
@@ -249,21 +262,24 @@ def main(args):
 
                 # 6. Forward pass
                 timesteps = (tau.flatten() * 1000.0).to(dtype=model.dtype)
-                model_pred = model(
-                    hidden_states=combined_latents,
-                    timestep=timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                ).sample
 
-                pred_velocity = model_pred[:, :, -num_views:] # Input [ cond_t | memory | noisy target ]
+                sync_ddp = ddp_model.no_sync() if not is_last_step else contextlib.nullcontext()
+                with sync_ddp:
+                    model_pred =  ddp_model(
+                        hidden_states=combined_latents,
+                        timestep=timesteps,
+                        encoder_hidden_states=prompt_embeds,
+                    ).sample
 
-                per_view_losses = [
-                    F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
-                    for idx in range(num_views)
-                ]
-                loss = sum(per_view_losses)
-                scaled_loss = loss / float(args.train_seq_len)
-                scaled_loss.backward()
+                    pred_velocity = model_pred[:, :, -num_views:] # Input [ cond_t | memory | noisy target ]
+
+                    per_view_losses = [
+                        F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
+                        for idx in range(num_views)
+                    ]
+                    loss = sum(per_view_losses)
+                    scaled_loss = loss / float(args.train_seq_len)
+                    scaled_loss.backward()
                 total_loss += scaled_loss.item()
                 
                 for v_idx in range(num_views):
@@ -285,6 +301,11 @@ def main(args):
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
+
+            stats = torch.tensor([total_loss] + avg_per_view, device=device)
+            dist.all_reduce(stats, op=dist.ReduceOp.AVG)
+            total_loss, avg_per_view = stats[0].item(), stats[1:].tolist()
+
             env_summary = "+".join(list(dict.fromkeys(env_names_seq[0]))[:2])
             pbar.set_postfix({
                     "Loss": f"{total_loss:.3f}",
@@ -294,13 +315,14 @@ def main(args):
 
             # Logging
             global_step += 1
-            writer.add_scalar("Train/Loss", total_loss, global_step)
-            writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
-            writer.add_scalar("Train/SelfForcingProb", curr_self_forcing_prob, global_step)
-            writer.add_scalar("Train/Loss_3D_FPV", float(avg_per_view[0]), global_step)
+            if is_main():
+                writer.add_scalar("Train/Loss", total_loss, global_step)
+                writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
+                writer.add_scalar("Train/SelfForcingProb", curr_self_forcing_prob, global_step)
+                writer.add_scalar("Train/Loss_3D_FPV", float(avg_per_view[0]), global_step)
 
         # Validation across VAL_ENVS
-        if (epoch + 1) % args.eval_every == 0:
+        if (epoch + 1) % args.eval_every == 0 and is_main():
             model.eval()
             print(f"\n[VALIDATION] Running autoregressive video rollouts for Epoch {epoch + 1}")
 
@@ -322,9 +344,16 @@ def main(args):
 
             model.save_pretrained(os.path.join(ckpt_dir, f"epoch_{epoch+1}"))
 
-    print("Ending Training")
-    model.save_pretrained(os.path.join(ckpt_dir, "final"))
-    writer.close()
+        # Keep ranks in step while rank 0 validates / saves
+        dist.barrier()
+
+    if is_main():
+        print("Ending Training")
+        model.save_pretrained(os.path.join(ckpt_dir, "final"))
+        writer.close()
+
+    dist.barrier()
+    dist.destroy_process_group()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Wan2.1 with LoRA across multiple Single Game Views (DDP)")
