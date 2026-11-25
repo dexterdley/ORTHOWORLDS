@@ -1058,8 +1058,19 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
             })
         return faces
 
-    def _project_top_down(self, shapes, player_pos):
-        """Top-down view: XY plane, centered on player."""
+    # Shared ortho layout (the one fixed layout lift_ortho / the 3D memory assume, as Bipedal's), all in the hull's
+    # heading frame: fwd = along the hull (cos a, sin a), right = (sin a, -cos a). Top cols = Side cols = fwd, Top rows =
+    # Rear cols = right, 30 px/m in both Top axes and along Side cols (the Rear spans the Top's 600 px of rows over its
+    # 800 px width: 40 px/m). Side depth = Top row (camera on the hull's left), Rear depth = Top col (camera behind).
+
+    @staticmethod
+    def _heading_frame(x, y, px, py, a):
+        """World (x, y) -> (fwd, right) offsets from the player in the hull's heading frame."""
+        dx, dy = x - px, y - py
+        return dx * math.cos(a) + dy * math.sin(a), dx * math.sin(a) - dy * math.cos(a)
+
+    def _project_top_down(self, shapes, player_pos, player_angle):
+        """Top-down view in the hull's heading frame, centered on player: forward = right of the image, right = down."""
         surface = pygame.Surface((self.view_w, self.view_h))
         surface.fill(COLOR_GROUND)
         canvas = DepthCanvas((self.view_w, self.view_h))
@@ -1069,19 +1080,22 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
         canvas.surf.fill(canvas.color(z_box(0.0)))
 
         px, py = player_pos
-        scale = 15.0  # pixels per meter
+        scale = 30.0  # pixels per meter, as the Side / Rear views
+
+        def to_screen(x, y):
+            fwd, right = self._heading_frame(x, y, px, py, player_angle)
+            return fwd * scale + self.view_w / 2, right * scale + self.view_h / 2
 
         # Sort by z (painter's algorithm)
         sorted_shapes = sorted(shapes, key=lambda s: s["z_sort"])
 
         for shape in sorted_shapes:
             verts = shape["verts"]
-            # Project: x -> screen_x, y -> screen_y (top-down)
+            # Project: forward -> screen_x, right -> screen_y (top-down)
             points = []
             for v in verts:
-                sx = int((v[0] - px) * scale + self.view_w / 2)
-                sy = int(self.view_h / 2 - (v[1] - py) * scale)
-                points.append((sx, sy))
+                sx, sy = to_screen(v[0], v[1])
+                points.append((int(sx), int(sy)))
 
             if len(points) >= 3:
                 # Clip to screen
@@ -1091,11 +1105,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
                     pygame.gfxdraw.aapolygon(surface, clipped, (0, 0, 0))
                     pygame.draw.polygon(canvas.surf, canvas.color(z_box(max(v[2] for v in verts))), clipped)
 
-        self._draw_explosions(
-            surface,
-            lambda x, y, z: ((x - px) * scale + self.view_w / 2, self.view_h / 2 - (y - py) * scale),
-            scale, scale,
-        )
+        self._draw_explosions(surface, lambda x, y, z: to_screen(x, y), scale, scale)
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
@@ -1109,48 +1119,40 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
             draw_fireball(surface, sx, sy, r * scale_x, r * scale_y, rgba)
 
     def _project_rear(self, shapes, player_pos, player_angle):
-        """Rear view: looking from behind the player (XZ plane from behind)."""
+        """Rear view: looking from behind the player along the hull heading (the hull's right on the screen right)."""
         surface = pygame.Surface((self.view_w, self.view_h))
         surface.fill(COLOR_SKY)
         canvas = DepthCanvas((self.view_w, self.view_h))
-        # Depth: hull-right offset ry (m) -> Top row H/2 + 15 ry (exact at heading 0; Top does not rotate with the hull),
-        # as 2 row / H - 1. This projection's camera sits on the hull's left (screen x = -forward), so near = left = -ry.
-        # Per face mean ry; faces seen edge-on (1-px lines) show their near edge (min ry).
+        # Depth: forward offset fwd (m) -> Top col W/2 + 30 fwd, as 2 col / W - 1; the camera is behind, so near = -fwd.
+        # Per face mean fwd; faces seen edge-on (1-px lines) show their near edge (min fwd).
         # Ground band: only its part below the ground line (z < 0, row 0.7 H) is geometry: the ground slab under the
         # Top image, whose near face is the near box face (-1)
-        ry_box = lambda ry: 30.0 * ry / self.view_h
+        fwd_box = lambda fwd: 60.0 * fwd / self.view_w
         pygame.draw.rect(canvas.surf, canvas.color(-1.0), (0, int(self.view_h * 0.7), self.view_w, self.view_h))
 
         # Draw ground
         pygame.draw.rect(
-            surface, COLOR_GROUND, (0, self.view_h // 2, self.view_w, self.view_h // 2)
+            surface, COLOR_GROUND, (0, int(self.view_h * 0.7), self.view_w, self.view_h)   # the slab only, as the depth
         )
 
         px, py = player_pos
-        # Rear view: camera behind player, looking forward
-        cam_angle = player_angle + math.pi  # looking from behind
-
-        scale = 30.0
+        scale = 30.0                                     # vertical: z * 2 * scale, as the Side view
+        lat_scale = scale * self.view_w / self.view_h   # 40 px/m: the hull's right spans the Top's rows
         sorted_shapes = sorted(shapes, key=lambda s: s["z_sort"])
 
         for shape in sorted_shapes:
             verts = shape["verts"]
             points = []
-            rys = []
+            fwds = []
             for v in verts:
-                # Transform to player-relative coords
-                dx = v[0] - px
-                dy = v[1] - py
-                # Rotate by -cam_angle to get view-space
-                rx = dx * math.cos(-cam_angle) - dy * math.sin(-cam_angle)
-                ry = dx * math.sin(-cam_angle) + dy * math.cos(-cam_angle)
+                fwd, right = self._heading_frame(v[0], v[1], px, py, player_angle)
                 rz = v[2]
 
-                # In rear view: rx is lateral, rz is vertical, ry is depth
-                sx = int(rx * scale + self.view_w / 2)
+                # In rear view: right is lateral, rz is vertical, fwd is depth
+                sx = int(right * lat_scale + self.view_w / 2)
                 sy = int(self.view_h - rz * scale * 2 - self.view_h * 0.3)
                 points.append((sx, sy))
-                rys.append(ry)
+                fwds.append(fwd)
 
             if len(points) >= 3:
                 clipped = self._clip_polygon_to_screen(points)
@@ -1158,61 +1160,52 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
                     pygame.draw.polygon(surface, shape["color"], clipped)
                     pygame.gfxdraw.aapolygon(surface, clipped, (0, 0, 0))
                     edge_on = len({p[0] for p in points}) == 1 or len({p[1] for p in points}) == 1
-                    pygame.draw.polygon(canvas.surf, canvas.color(ry_box(min(rys) if edge_on else sum(rys) / len(rys))),
+                    pygame.draw.polygon(canvas.surf, canvas.color(fwd_box(min(fwds) if edge_on else sum(fwds) / len(fwds))),
                                         clipped)
 
         def rear_to_screen(x, y, z):
-            dx, dy = x - px, y - py
-            rx = dx * math.cos(-cam_angle) - dy * math.sin(-cam_angle)
-            return (rx * scale + self.view_w / 2, self.view_h - z * scale * 2 - self.view_h * 0.3)
+            _, right = self._heading_frame(x, y, px, py, player_angle)
+            return (right * lat_scale + self.view_w / 2, self.view_h - z * scale * 2 - self.view_h * 0.3)
 
-        self._draw_explosions(surface, rear_to_screen, scale, scale * 2)
+        self._draw_explosions(surface, rear_to_screen, lat_scale, scale * 2)
 
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(surface)), axes=(1, 0, 2)
         ), canvas.read()
 
     def _project_side(self, shapes, player_pos, player_angle):
-        """Side view: looking from the right side of the player (YZ plane)."""
+        """Side view: from the hull's left, forward on the screen right (the shared layout's side)."""
         surface = pygame.Surface((self.view_w, self.view_h))
         surface.fill(COLOR_SKY)
         canvas = DepthCanvas((self.view_w, self.view_h))
-        # Depth: hull-right offset rx (m) -> Top row H/2 + 15 rx (exact at heading 0; Top does not rotate with the hull),
-        # as 2 row / H - 1, flipped: the camera is on the hull's right, so near = right = +rx.
-        # Per face mean rx; faces seen edge-on (1-px lines) show their near edge (max rx).
+        # Depth: hull-right offset right (m) -> Top row H/2 + 30 right, as 2 row / H - 1; the camera is on the hull's
+        # left, so near = left = -right. Per face mean right; faces seen edge-on (1-px lines) show their near edge (min).
         # Ground band: only its part below the ground line (z < 0, row 0.7 H) is geometry: the ground slab under the
         # Top image, whose near face is the near box face (-1)
-        rx_box = lambda rx: -30.0 * rx / self.view_h
+        right_box = lambda right: 60.0 * right / self.view_h
         pygame.draw.rect(canvas.surf, canvas.color(-1.0), (0, int(self.view_h * 0.7), self.view_w, self.view_h))
 
         pygame.draw.rect(
-            surface, COLOR_GROUND, (0, self.view_h // 2, self.view_w, self.view_h // 2)
+            surface, COLOR_GROUND, (0, int(self.view_h * 0.7), self.view_w, self.view_h)   # the slab only, as the depth
         )
 
         px, py = player_pos
-        # Side view: camera to the right, looking left
-        cam_angle = player_angle - math.pi / 2
-
         scale = 30.0
         sorted_shapes = sorted(shapes, key=lambda s: s["z_sort"])
 
         for shape in sorted_shapes:
             verts = shape["verts"]
             points = []
-            rxs = []
+            rights = []
             for v in verts:
-                dx = v[0] - px
-                dy = v[1] - py
-                # Rotate
-                rx = dx * math.cos(-cam_angle) - dy * math.sin(-cam_angle)
-                ry = dx * math.sin(-cam_angle) + dy * math.cos(-cam_angle)
+                fwd, right = self._heading_frame(v[0], v[1], px, py, player_angle)
                 rz = v[2]
 
-                # Side view: ry is lateral (forward/back), rz is vertical
-                sx = int(ry * scale + self.view_w / 2)
+                # Side view: fwd is lateral (forward/back), rz is vertical, right is depth
+                sx = int(fwd * scale + self.view_w / 2)
                 sy = int(self.view_h - rz * scale * 2 - self.view_h * 0.3)
                 points.append((sx, sy))
-                rxs.append(rx)
+                rights.append(right)
 
             if len(points) >= 3:
                 clipped = self._clip_polygon_to_screen(points)
@@ -1220,13 +1213,12 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
                     pygame.draw.polygon(surface, shape["color"], clipped)
                     pygame.gfxdraw.aapolygon(surface, clipped, (0, 0, 0))
                     edge_on = len({p[0] for p in points}) == 1 or len({p[1] for p in points}) == 1
-                    pygame.draw.polygon(canvas.surf, canvas.color(rx_box(max(rxs) if edge_on else sum(rxs) / len(rxs))),
+                    pygame.draw.polygon(canvas.surf, canvas.color(right_box(min(rights) if edge_on else sum(rights) / len(rights))),
                                         clipped)
 
         def side_to_screen(x, y, z):
-            dx, dy = x - px, y - py
-            ry = dx * math.sin(-cam_angle) + dy * math.cos(-cam_angle)
-            return (ry * scale + self.view_w / 2, self.view_h - z * scale * 2 - self.view_h * 0.3)
+            fwd, _ = self._heading_frame(x, y, px, py, player_angle)
+            return (fwd * scale + self.view_w / 2, self.view_h - z * scale * 2 - self.view_h * 0.3)
 
         self._draw_explosions(surface, side_to_screen, scale, scale * 2)
 
@@ -1442,7 +1434,7 @@ class TankDuelOrthographicWrapper(gym.Wrapper):
 
         player_pos = (env.player_body.position[0], env.player_body.position[1])
 
-        im_top_down, top_depth = self._project_top_down(shapes, player_pos)
+        im_top_down, top_depth = self._project_top_down(shapes, player_pos, env.player_body.angle)
         im_rear, rear_depth = self._project_rear(shapes, player_pos, env.player_body.angle)
         im_side, side_depth = self._project_side(shapes, player_pos, env.player_body.angle)
         self.last_depth = [top_depth, side_depth, rear_depth]

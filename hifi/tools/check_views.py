@@ -131,7 +131,7 @@ def reveal_sheet(name, t, env, renderer, hifi, revealed):
     renderer.reveal(True)
     frames = renderer.render()
     renderer.reveal(False)
-    rev = [env._fit(frames[(v, "rgb")]) for v in VIEWS]
+    rev = [env._view(v, frames[(v, "rgb")]) for v in VIEWS]
     diffs = [np.abs(a.astype(np.int16) - b.astype(np.int16)).max(-1) > 24 for a, b in zip(hifi, rev)]
     revealed[str(t)] = {v: round(float(d.mean()), 4) for v, d in zip(VIEWS, diffs)}
     rows = []

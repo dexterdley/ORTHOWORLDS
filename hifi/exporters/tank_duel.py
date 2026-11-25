@@ -1,12 +1,11 @@
 """
 Tank Duel (TankDuelEnv + TankDuelOrthographicWrapper), top-down.
 
-GymBox views (tank_duel_orthographic.py, 800x600):
-  top   15 px/m, north-up, centred on the player hull
-  rear  30 px/m lateral, 60 px/m vertical, z = 0 on row 420; draws the player-frame *forward*
-        axis horizontally (screen x = -forward), i.e. a mirrored side profile, not a rear view
-  side  30 px/m lateral, 60 px/m vertical, z = 0 on row 420, from the hull's right (forward to
-        the screen right)
+GymBox views (tank_duel_orthographic.py, 800x600), all in the shared ortho layout (hull heading frame):
+  top   30 px/m, forward to the screen right, the hull's right down, centred on the player hull
+  rear  a true rear view: 40 px/m lateral (so it spans the Top's rows), 60 px/m vertical, z = 0 on row 420
+  side  30 px/m lateral, 60 px/m vertical, z = 0 on row 420, from the hull's left (forward still to
+        the screen right, as the shared layout needs)
   fpv   orbit camera 4.5 m behind the hull centre along its heading at z = 2.5, looking at the
         pivot (hull x, y, 2.5); focal 400 px on 600 (vfov 73.7 deg), near clip 0.1 m; fake
         horizon (sky / sand split at the centre row)
@@ -19,7 +18,10 @@ Hi-fi decisions:
     barrel axis (1.25 m) so tracers leave the muzzle; explosions keep the env's z.
   * rear: a true rear view (camera behind the hull looking along its heading, the player's right
     on the screen right), 30 px/m on both axes (ortho size 20 m), z = 0 kept on row 420.
-  * side: same scale fix (30 px/m both axes), z = 0 on row 420, forward to the screen right.
+  * side: same scale fix (30 px/m both axes), z = 0 on row 420, camera on the hull's left; its frame is
+    mirrored (view_fix) to put forward on the screen right, as the shared layout needs.
+  * top: 30 px/m in the hull's heading frame, like GymBox; the rear frame keeps its central 20 m (the
+    Top's rows) stretched to 800 px (view_fix).
   * One consistent world: every object (cover, walls, desert props, the hill ring) is drawn in
     every view whose frame contains it. The only exception is the cutaway the real elevation
     cameras need (GymBox's floating slabs never cover the player): tanks / obstacles lying wholly
@@ -44,7 +46,7 @@ from game_envs.tank_duel_orthographic import (
 from .base import Exporter, P_top, cam_ortho, cam_persp, r, rv, vfov_from_focal, xf, xf_top
 
 W_PX, H_PX = 800, 600
-TOP_PPM = 15.0
+TOP_PPM = 30.0
 ELEV_PPM = 30.0
 GROUND_ROW = 420.0                     # GymBox rear/side: z = 0 on row 0.7 * 600
 ELEV_ZC = (GROUND_ROW - H_PX / 2.0) / ELEV_PPM   # height on the centre row of the true-scale views (4 m)
@@ -91,6 +93,8 @@ class TankDuelExporter(Exporter):
     title = "Tank Duel"
     fps = 50
     view_size = (W_PX, H_PX)
+    # rear: keep the Top's row span (H_PX / TOP_PPM m) of its W_PX / ELEV_PPM m width; side: mirror (camera on the left)
+    view_fix = {"rear": {"crop_w": (H_PX / TOP_PPM) / (W_PX / ELEV_PPM)}, "side": {"flip": True}}
     mask_groups = {"tank": ["player", "enemy"]}
 
     def __init__(self, **env_kwargs):
@@ -258,8 +262,8 @@ class TankDuelExporter(Exporter):
     def _views(self, b):
         a = b.player_body.angle
         fwd = (math.cos(a), math.sin(a))
-        left = (-math.sin(a), math.cos(a))   # side camera looks from the right towards the left
-        return {"rear": fwd, "side": left}
+        right = (math.sin(a), -math.cos(a))   # side camera looks from the left towards the right
+        return {"rear": fwd, "side": right}
 
     def _section(self, env, msg):
         b = env.unwrapped
@@ -269,7 +273,10 @@ class TankDuelExporter(Exporter):
     def cameras(self, env):
         b = env.unwrapped
         px, py = float(b.player_body.position[0]), float(b.player_body.position[1])
-        cams = [cam_ortho("top", P_top(px, py, 30.0), P_top(px, py, 0.0), (0.0, 0.0, -1.0), H_PX / TOP_PPM, 1.0, 40.0)]
+        a = b.player_body.angle
+        # top: hull heading frame, screen up = the hull's left (-sin a, cos a), so forward is on the screen right
+        cams = [cam_ortho("top", P_top(px, py, 30.0), P_top(px, py, 0.0), (-math.sin(a), 0.0, -math.cos(a)),
+                          H_PX / TOP_PPM, 1.0, 40.0)]
         size = H_PX / ELEV_PPM
         for view, axis in self._views(b).items():
             hidden, near = self._cut(b, axis)

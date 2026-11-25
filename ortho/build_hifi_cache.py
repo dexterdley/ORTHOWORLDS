@@ -4,9 +4,11 @@ for upload to a training box that can't. Builds one cache per DDP rank, named ex
 looks them up, so the remote finds them and skips collection.
 
 The two image arrays are written straight to disk (memmap): at 12 envs x 4096 steps one rank is ~59 GB.
+Per-step depth ([top, side, rear], float16) rides in camera_states["depth"], i.e. in meta.pkl (held in RAM).
 
   python hifi/tools/get_godot.py                      # Windows build: GPU rendering from WSL
   python ortho/build_hifi_cache.py --world_size 4 --num_envs 12 --rollout_steps 4096 --out ~/buffer_cache
+  python ortho/build_hifi_cache.py --world_size 1 --num_envs 1 --rollout_steps 4096 --img_size 128   # main.py --hifi
 Run from the repo root: PPO weights are read from ./checkpoints/ppo_<env>.pt (missing ones fall back to an
 untrained policy with only a [WARN] line).
 """
@@ -16,7 +18,7 @@ import pickle
 
 import numpy as np
 
-from data_rollout import get_registries, collect_all_envs_rollouts, IMG_H, IMG_W
+from data_rollout import get_registries, collect_all_envs_rollouts
 from utils import set_seed
 from buffer import OrthoTransitionBuffer
 
@@ -25,7 +27,7 @@ def main(args):
     registry, _ = get_registries(hifi=True)
     capacity = args.rollout_steps * min(args.num_envs, len(registry))
     for rank in (args.ranks if args.ranks else range(args.world_size)):
-        name = f"s{args.seed}_c{args.seed + rank}_r{rank}_e{args.num_envs}_n{args.rollout_steps}_{IMG_H}px_hifi"
+        name = f"s{args.seed}_c{args.seed + rank}_r{rank}_e{args.num_envs}_n{args.rollout_steps}_{args.img_size}px_hifi"
         cache_dir = os.path.join(os.path.expanduser(args.out), name)
         if os.path.exists(os.path.join(cache_dir, "meta.pkl")):
             print(f"[skip] {cache_dir} already built")
@@ -33,7 +35,7 @@ def main(args):
         os.makedirs(cache_dir, exist_ok=True)
 
         set_seed(args.seed + rank)   # same seeding as train_single_dist.main for this rank
-        buffer = OrthoTransitionBuffer(capacity=capacity, img_h=IMG_H, img_w=IMG_W, max_action_len=8)
+        buffer = OrthoTransitionBuffer(capacity=capacity, img_h=args.img_size, img_w=args.img_size, max_action_len=8)
         for k in ("views_t", "views_next"):   # swap the (still untouched) RAM arrays for on-disk ones
             shape = getattr(buffer, k).shape
             setattr(buffer, k, np.lib.format.open_memmap(os.path.join(cache_dir, f"{k}.npy"),
@@ -64,5 +66,6 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_envs", type=int, default=12)
     p.add_argument("--rollout_steps", type=int, default=2048)
+    p.add_argument("--img_size", type=int, default=224, help="Must match the trainer's IMG_H: 224 train_single_dist.py, 128 main.py")
     p.add_argument("--out", default="./buffer_cache", help="Cache root; keep it off OneDrive / /mnt/c")
     main(p.parse_args())

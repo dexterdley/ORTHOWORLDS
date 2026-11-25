@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from buffer import OrthoTransitionBuffer
 from data_rollout import collect_all_envs_rollouts
-from utils import _build_registry, set_seed
+from utils import _build_registry, _build_heldout_registry, set_seed
 
 import numpy as np
 from PIL import Image
@@ -20,6 +20,54 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_H, IMG_W = 96, 96
 OUT_DIR = os.path.join("runs", "projector")
 
+def silhouette_cover(mask):
+    """Fraction of the Side / Rear foreground that the hull of `mask` (B, 3, H, W) still projects onto (per sample)."""
+    top, side, rear = mask.unbind(1)
+    occ = top[:, None] & side[:, :, None] & rear[:, :, :, None]
+    cover = lambda proj, m: (proj & m).flatten(1).sum(1) / m.flatten(1).sum(1).clamp(min=1)
+    return (cover(occ.any(2), side) + cover(occ.any(3), rear)) / 2
+
+def fg_mask(views, thresh=0.05, ground_cover=0.97, return_floor=False):
+    """(B, 3, 3, H, W) in [-1, 1] -> (B, 3, H, W) bool foreground. Empty everywhere = the elevations' sky (the Side's
+    top-left colour), and in each view its own top-left colour. The Top's corner colour is the one ambiguity: a void
+    drawn in its own colour, or the ground filling the whole Top. It is taken as ground when the hull then explains
+    (nearly) all of the Side / Rear silhouettes, and no fewer than with it carved away."""
+    far = lambda c: (views - c).abs().amax(2) > thresh
+    not_sky = far(views[:, 1:2, :, :1, :1])
+    m = not_sky & far(views[..., :1, :1])
+    m_ground = m.clone()
+    m_ground[:, 0] = not_sky[:, 0]
+    cover_ground, cover_void = silhouette_cover(m_ground), silhouette_cover(m)
+    use_ground = (cover_ground >= ground_cover) & (cover_ground >= cover_void - 1e-3)
+    m[use_ground, 0] = not_sky[use_ground, 0]
+    if not return_floor:
+        return m
+    floor = ~far(views[..., :1, :1])[:, 0] & use_ground[:, None, None]   # (B, H, W) Top pixels showing the ground
+    return m, floor
+
+def hull_depth(mask, empty=2.0, ground=None):
+    """Foreground masks (B, 3, H, W) of Top[z, x], Side[u, x], Rear[u, z] (H == W) -> visual-hull depth per view: first
+    occupied coordinate along each view's depth axis, `empty` (= GT's clipped background) where the hull is empty.
+    ground (B, H, W): Top pixels that show the ground. Seen from above, nothing stands on them, so their column keeps
+    only the occupancy joined to the bottom (removes ghosts, e.g. far walls spanning the whole Side / Rear)."""
+    top, side, rear = mask.unbind(1)
+    occ = top[:, None] & side[:, :, None] & rear[:, :, :, None]           # (B, u, z, x) bool
+    if ground is not None:
+        up = occ.flip(1)                                                  # u' = 0 at the bottom
+        started = up.cumsum(1, dtype=torch.int16) > 0
+        bottom_run = up & (up | ~started).to(torch.uint8).cumprod(1).bool()
+        occ = torch.where(ground[:, None], bottom_run.flip(1), occ)
+    c = (torch.arange(mask.shape[-1], device=mask.device) + .5) / mask.shape[-1] * 2 - 1
+    return torch.stack([c[occ.byte().argmax(d)].masked_fill(~occ.any(d), empty) for d in (1, 2, 3)], 1)
+
+def with_hull(rgb, drop=0.0):
+    """Top/Side/Rear RGB (B, 3, 3, H, W) -> (B, 3, 4, H, W): RGB + hull depth; `drop` of samples get -2 (= no hull)."""
+    with torch.no_grad():
+        mask, floor = fg_mask(rgb, return_floor=True)
+        hull = hull_depth(mask, ground=floor)
+        if drop > 0:
+            hull[torch.rand(hull.shape[0], device=hull.device) < drop] = -2.0
+    return torch.cat([rgb, hull[:, :, None]], dim=2)
 
 def save_gif_frame(grid, xyz, rgb, xyz_gt, rgb_gt, step):
     """GIF frame: the RGB / GT depth / predicted depth grid (Top | Side | Rear), then the 3D points lifted from the GT
@@ -50,16 +98,16 @@ def save_gif_frame(grid, xyz, rgb, xyz_gt, rgb_gt, step):
 class OrthoDepthNet(nn.Module):
     """Top/Side/Rear -> each view's nearness map (B, 3, H, W). One transformer over all three views' patches: a view
     can't see its own depth axis, but the other two views can."""
-    def __init__(self, patch=8, dim=192, layers=6, heads=6):
+    def __init__(self, patch=8, dim=192, layers=6, heads=6, in_ch=3):
         super().__init__()
         self.p = patch
-        self.embed = nn.Conv2d(3, dim, patch, patch)
+        self.embed = nn.Conv2d(in_ch, dim, patch, patch)
         self.pos = nn.Parameter(torch.randn(1, 3 * (IMG_H // patch) * (IMG_W // patch), dim) * 0.02)   # per view + position
         self.blocks = nn.TransformerEncoder(nn.TransformerEncoderLayer(dim, heads, 4 * dim, 0.0, activation="gelu",
                                                                        batch_first=True, norm_first=True), layers)
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, patch * patch)                             # nearness for every patch pixel
-        self.refine = nn.Sequential(nn.Conv2d(4, 32, 3, padding=1), nn.GELU(), nn.Conv2d(32, 1, 3, padding=1))
+        self.refine = nn.Sequential(nn.Conv2d(in_ch + 1, 32, 3, padding=1), nn.GELU(), nn.Conv2d(32, 1, 3, padding=1))
 
     def forward(self, views):                                                 # (B, 3, 3, H, W) in [-1, 1]
         B, V, _, H, W = views.shape
@@ -119,7 +167,7 @@ def main(args):
     )
 
     # Initialize model and optimizer
-    model = OrthoDepthNet().to(device)
+    model = OrthoDepthNet(in_ch=4).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-5)
     warmup = 200
     scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, milestones=[warmup], schedulers=[
@@ -145,10 +193,9 @@ def main(args):
         # imgs = ((views_t[:, :3] + 1) / 2).permute(0, 1, 3, 4, 2).cpu().numpy()
         # xyz_points, rgb_points = lift_ortho(imgs[i], depth[i])
         
-
         # import pdb; pdb.set_trace()
-
-        pred_depth = model(views_t[:, :3]) # Forward pass: predict depth from Top, Side, Rear
+        # pred_depth = model(views_t[:, :3]) # Forward pass: predict depth from Top, Side, Rear
+        pred_depth = model(with_hull(views_t[:, :3], args.hull_dropout))
 
         # Depth loss per orthographic view
         loss_top = F.l1_loss(pred_depth[:, 0], gt_depth[:, 0])
@@ -167,7 +214,8 @@ def main(args):
 
             model.eval()
             with torch.no_grad():
-                check_pred = model(check_views[:, :3])                             # (1, 3, H, W) depth
+                #check_pred = model(check_views[:, :3])                             # (1, 3, H, W) depth
+                check_pred = model(with_hull(check_views[:, :3]))
                 to_img = lambda d: ((1 - d.clamp(-1, 1)) / 2)[None].expand(3, -1, -1)   # display only: near bright, far/nothing black
                 rgb_row = torch.cat(check_gt[0].unbind(0), dim=-1)                  # (3, H, 3W)
                 gt_row = to_img(torch.cat(check_depth[0].unbind(0), dim=-1))
@@ -179,7 +227,7 @@ def main(args):
                                append_images=frames[1:], duration=200, loop=0)
     
     if (epoch + 1) % 500 == 0:
-        torch.save(model.state_dict(), os.path.join(OUT_DIR, "ortho_depth.pt"))
+        torch.save(model.state_dict(), os.path.join(OUT_DIR, "ortho_depth_hull.pt"))
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Top/Side/Rear -> 3D Gaussians, supervised by re-rendering the ortho views")
@@ -190,6 +238,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_envs", type=int, default=1)
     parser.add_argument("--hifi", type=str, default=None)
+    parser.add_argument("--hull_dropout", type=float, default=0.2, help="fraction of training samples without the hull")
     return parser.parse_args()
 
 if __name__ == "__main__":

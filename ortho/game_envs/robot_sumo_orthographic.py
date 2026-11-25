@@ -739,11 +739,20 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
 
         return objects
 
-    def _project_top_down(self, x, y, z, player_x, player_y):
-        """Top-down projection (looking down Z axis)."""
+    # Shared ortho layout (the one fixed layout lift_ortho / the 3D memory assume, as Bipedal's), all in the player's
+    # heading frame (rx = right, ry = forward): Top cols = Side cols = forward, Top rows = Rear cols = right, 50 px/m
+    # in both Top axes (the Rear spans the Top's 400 px of rows over its 600 px width: 75 px/m). Side depth = Top row
+    # (camera on the player's left), Rear depth = Top col (camera behind).
+
+    def _project_top_down(self, x, y, z, player_x, player_y, player_angle):
+        """Top-down projection in the player's heading frame: forward = right of the image, the player's right = down."""
+        dx = x - player_x
+        dy = y - player_y
+        rx = dx * math.cos(-player_angle) - dy * math.sin(-player_angle)
+        ry = dx * math.sin(-player_angle) + dy * math.cos(-player_angle)
         scale = 50.0
-        sx = self.view_width / 2 + (x - player_x) * scale
-        sy = self.view_height / 2 - (y - player_y) * scale
+        sx = self.view_width / 2 + ry * scale
+        sy = self.view_height / 2 + rx * scale
         return int(sx), int(sy)
 
     def _project_rear(self, x, y, z, player_x, player_y, player_angle):
@@ -756,8 +765,8 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         ry = dx * math.sin(-player_angle) + dy * math.cos(-player_angle)
 
         scale = 50.0
-        # Rear view: X is left-right, Z is up-down, Y is depth
-        sx = self.view_width / 2 + rx * scale
+        # Rear view: right rx is left-right (75 px/m, so it spans the Top's rows), Z is up-down, forward ry is depth
+        sx = self.view_width / 2 + rx * scale * self.view_width / self.view_height
         sy = self.view_height / 2 - z * scale * 2 + 100
         depth = ry
         return int(sx), int(sy), depth
@@ -770,10 +779,10 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         ry = dx * math.sin(-player_angle) + dy * math.cos(-player_angle)
 
         scale = 50.0
-        # Side view: Y is forward-back (horizontal), Z is up-down
+        # Side view: Y is forward-back (horizontal), Z is up-down; camera on the player's left, so depth = right rx
         sx = self.view_width / 2 + ry * scale
         sy = self.view_height / 2 - z * scale * 2 + 100
-        depth = -rx
+        depth = rx
         return int(sx), int(sy), depth
 
     def _project_fpv(self, x, y, z, player_x, player_y, player_angle):
@@ -808,6 +817,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
 
         player_x = self.env.player_body.position.x
         player_y = self.env.player_body.position.y
+        player_angle = self.env.player_body.angle
 
         # Sort by Z (painter's algorithm)
         sorted_objects = sorted(objects, key=lambda o: o['z_center'])
@@ -815,7 +825,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         for obj in sorted_objects:
             if obj['type'] == 'circle_floor':
                 cx, cy = obj['center']
-                sx, sy = self._project_top_down(cx, cy, obj['z'], player_x, player_y)
+                sx, sy = self._project_top_down(cx, cy, obj['z'], player_x, player_y, player_angle)
                 radius_px = int(obj['radius'] * 50.0)
                 pygame.draw.circle(surface, obj['color'], (sx, sy), radius_px)
                 pygame.draw.circle(surface, COLOR_RING_BORDER, (sx, sy), radius_px, 2)
@@ -825,7 +835,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
             elif obj['type'] == 'polygon' or obj['type'] == 'edge':
                 points = []
                 for v in obj['vertices_3d']:
-                    px, py = self._project_top_down(v[0], v[1], v[2], player_x, player_y)
+                    px, py = self._project_top_down(v[0], v[1], v[2], player_x, player_y, player_angle)
                     points.append((px, py))
                 if len(points) >= 3:
                     try:
@@ -838,7 +848,7 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
                         pass
             elif obj['type'] == 'cylinder':
                 cx, cy = obj['center']
-                sx, sy = self._project_top_down(cx, cy, obj['z_top'], player_x, player_y)
+                sx, sy = self._project_top_down(cx, cy, obj['z_top'], player_x, player_y, player_angle)
                 radius_px = int(obj['radius'] * 50.0)
                 pygame.draw.circle(surface, obj['color'], (sx, sy), max(1, radius_px))
                 pygame.draw.circle(canvas.surf, canvas.color(top_d(obj['z_top'])), (sx, sy), max(1, radius_px))
@@ -857,11 +867,11 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
 
-        # Depth: forward ry -> Top row (view_height / 2 - 50 ry, Top rotated to the player's heading) -> 2 * row /
-        # view_height - 1, flipped so -1 = near = behind the player. Faces: mean ry; wheel circles: centre - radius.
+        # Depth: forward ry -> Top col (view_width / 2 + 50 ry) -> 2 * col / view_width - 1; -1 = near = behind the
+        # player. Faces: mean ry; wheel circles: centre - radius.
         # The ground rect is the ground slab filling the whole Top image: its near face is the near edge (-1).
         canvas = DepthCanvas((self.view_width, self.view_height))
-        rear_d = lambda ry: 2 * ry * 50.0 / self.view_height
+        rear_d = lambda ry: 2 * ry * 50.0 / self.view_width
 
         # Draw ground
         pygame.draw.rect(surface, COLOR_GROUND,
@@ -930,11 +940,11 @@ class RobotSumoOrthographicWrapper(gym.Wrapper):
         surface = pygame.Surface((self.view_width, self.view_height))
         surface.fill(COLOR_SKY)
 
-        # Depth: right rx -> Top column (view_width / 2 + 50 rx, Top rotated to the player's heading) -> 2 * col /
-        # view_width - 1, flipped so -1 = near = the player's right (depth here is -rx). Faces: mean; wheel circles:
-        # centre - radius. The ground rect is the ground slab filling the whole Top image: its near face is the near edge (-1).
+        # Depth: right rx -> Top row (view_height / 2 + 50 rx) -> 2 * row / view_height - 1; -1 = near = the player's
+        # left (the camera's side; farther = larger rx, drawn first). Faces: mean; wheel circles: centre - radius.
+        # The ground rect is the ground slab filling the whole Top image: its near face is the near edge (-1).
         canvas = DepthCanvas((self.view_width, self.view_height))
-        side_d = lambda neg_rx: 2 * neg_rx * 50.0 / self.view_width
+        side_d = lambda rx: 2 * rx * 50.0 / self.view_height
 
         pygame.draw.rect(surface, COLOR_GROUND,
                          (0, self.view_height // 2 + 50, self.view_width, self.view_height // 2))

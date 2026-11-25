@@ -106,17 +106,31 @@ class HiFiOrthographicWrapper:
             self.sync_scene()
         self.renderer.state(self.state_message(camera_pose))
         frames = self.renderer.render()
-        out = tuple(self._fit(frames[(v, "rgb")]) for v in VIEWS)
+        out = tuple(self._view(v, frames[(v, "rgb")]) for v in VIEWS)
         if "mask" in self.aov:
-            self.last_masks = {v: self._fit(frames[(v, "mask")], nearest=True) for v in VIEWS}
+            self.last_masks = {v: self._view(v, frames[(v, "mask")], nearest=True) for v in VIEWS}
         if "depth" in self.aov:
-            self.last_depth = {v: depth_metres(self._fit(frames[(v, "depth")], nearest=True)) for v in VIEWS}
+            self.last_depth = {v: depth_metres(self._view(v, frames[(v, "depth")], nearest=True)) for v in VIEWS}
         return out
 
     def _fit(self, img, nearest=False):
         w, h = self.exporter.view_size
         if img.shape[1] != w or img.shape[0] != h:
             img = cv2.resize(img, (w, h), interpolation=cv2.INTER_NEAREST if nearest else cv2.INTER_AREA)
+        return np.ascontiguousarray(img)
+
+    def _view(self, view, img, nearest=False):
+        """_fit, then the exporter's view_fix for this view (crop the central columns + stretch back, mirror)."""
+        img = self._fit(img, nearest)
+        fix = self.exporter.view_fix.get(view)
+        if fix:
+            h, w = img.shape[:2]
+            if fix.get("crop_w"):
+                k = int(round(w * fix["crop_w"]))
+                x0 = (w - k) // 2
+                img = cv2.resize(img[:, x0:x0 + k], (w, h), interpolation=cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR)
+            if fix.get("flip"):
+                img = img[:, ::-1]
         return np.ascontiguousarray(img)
 
     def render_masks(self, target):

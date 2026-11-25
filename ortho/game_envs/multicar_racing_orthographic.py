@@ -88,17 +88,29 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
         top_down_img = self.env.render()
         base_env = self.env.unwrapped
         
-        # 1. Setup surfaces for the three custom views
+        # 1. Setup surfaces for the four custom views.
+        # Shared ortho layout (the one fixed layout lift_ortho / the 3D memory assume, as Bipedal's), all in the car's
+        # heading frame (rx = right, ry = forward): Top cols = Side cols = forward, Top rows = Rear cols = right,
+        # scale_factor px/m in both Top axes and along Side cols (the Rear spans the Top's rows over its width:
+        # scale_factor * W / H px/m). Side depth = Top row (camera on the car's left), Rear depth = Top col (camera
+        # behind). Only geometry is drawn: the elevations' ground is the slab under the field, from the ground line down.
+        top_surf = pygame.Surface((self.WINDOW_W, self.WINDOW_H))
         rear_surf = pygame.Surface((self.WINDOW_W, self.WINDOW_H))
         side_surf = pygame.Surface((self.WINDOW_W, self.WINDOW_H))
         fpv_surf = pygame.Surface((self.WINDOW_W, self.WINDOW_H))
-        
+
         sky_color = (135, 206, 235)
-        ground_rect = (0, self.WINDOW_H // 2, self.WINDOW_W, self.WINDOW_H // 2)
-        
-        for surf in [rear_surf, side_surf, fpv_surf]:
+        top_scale = self.scale_factor
+        rear_scale = self.scale_factor * self.WINDOW_W / self.WINDOW_H
+        top_reach = self.WINDOW_W / 2 / top_scale          # the Top's half extent behind / ahead of the car (m)
+        ground_row = int(round(self.WINDOW_H / 2 + self.camera_height * self.scale_factor))   # height 0 in Side / Rear
+
+        fpv_surf.fill(sky_color)
+        pygame.draw.rect(fpv_surf, base_env.bg_color, (0, self.WINDOW_H // 2, self.WINDOW_W, self.WINDOW_H // 2))
+        for surf in [rear_surf, side_surf]:
             surf.fill(sky_color)
-            pygame.draw.rect(surf, base_env.bg_color, ground_rect)
+            pygame.draw.rect(surf, base_env.bg_color, (0, ground_row, self.WINDOW_W, self.WINDOW_H - ground_row))
+        top_surf.fill(base_env.bg_color)
 
         if base_env.car is None or not base_env.road_poly:
             self.last_depth = [np.full(top_down_img.shape[:2], np.inf, np.float32)] * 3
@@ -234,7 +246,7 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                         polys.append((side_poly, tire_side_c, 2))
 
         # 2. Camera Coordinates and Frame Vectors
-        proj_polys_rear, proj_polys_side, proj_polys_fpv = [], [], []
+        proj_polys_top, proj_polys_rear, proj_polys_side, proj_polys_fpv = [], [], [], []
         
         self.cam_x, self.cam_y, self.cam_z = self.cam_pos
 
@@ -258,8 +270,8 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
         up_z = cos_p
 
         for p_vertices, color, layer in polys:
-            pts_r, pts_s, pts_f = [], [], []
-            depths_rear, depths_side, depths_fpv = [], [], []
+            pts_t, pts_r, pts_s, pts_f = [], [], [], []
+            depths_rear, depths_side, depths_fpv, heights = [], [], [], []
             valid_cam = True
             valid_fpv = True
             
@@ -274,20 +286,24 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                 zh = self.camera_height - vh
                 
                 depth_cam = ry + self.camera_dist
-                if depth_cam < 2.5: 
+                if ry < -top_reach:   # the Rear only keeps what the Top's box holds behind the car
                     valid_cam = False
-                
+
+                # 0. Orthographic Top (heading frame: forward -> screen right, right -> screen down)
+                pts_t.append((ry * top_scale + self.WINDOW_W / 2, rx * top_scale + self.WINDOW_H / 2))
+                heights.append(vh)
+
                 # A. Orthographic Rear
-                px_r = (rx * self.scale_factor) + self.WINDOW_W / 2
+                px_r = (rx * rear_scale) + self.WINDOW_W / 2
                 py_r = (zh * self.scale_factor) + self.WINDOW_H / 2
                 pts_r.append((px_r, py_r))
                 depths_rear.append(depth_cam)
-                
-                # B. Orthographic Side
+
+                # B. Orthographic Side (camera on the car's left: farther = more to the right)
                 px_s = (ry * self.scale_factor) + self.WINDOW_W / 2
                 py_s = (zh * self.scale_factor) + self.WINDOW_H / 2
                 pts_s.append((px_s, py_s))
-                depths_side.append(-rx) # Lateral axis becomes side view depth
+                depths_side.append(rx) # Lateral axis becomes side view depth
                 
                 # C. True 3D Perspective (FPV)
                 dx_w = vx - self.cam_x
@@ -306,6 +322,9 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                     pts_f.append((px_f, py_f))
                     depths_fpv.append(d_c)
 
+            if len(pts_t) >= 3 and max(heights) - min(heights) < 1e-6:   # horizontal faces (the rest are edge-on)
+                proj_polys_top.append((heights[0], pts_t, color, layer))
+
             if valid_cam and len(pts_r) >= 3:
                 avg_d = sum(depths_rear) / len(depths_rear)
                 proj_polys_rear.append((avg_d, pts_r, color, layer))
@@ -318,13 +337,15 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
                 avg_ds = sum(depths_side) / len(depths_side)
                 proj_polys_side.append((avg_ds, pts_s, color, layer))
                 
-        # 3. Z-Index Sort for Painter's Algorithm
+        # 3. Z-Index Sort for Painter's Algorithm (Top: by height, then layer)
+        proj_polys_top.sort(key=lambda x: (x[0], x[3]))
         proj_polys_rear.sort(key=lambda x: (x[3], -x[0]))
         proj_polys_side.sort(key=lambda x: (x[3], -x[0]))
         proj_polys_fpv.sort(key=lambda x: (x[3], -x[0]))
         
         # 4. Draw to surfaces
-        draw_lists = [(rear_surf, proj_polys_rear), 
+        draw_lists = [(top_surf, proj_polys_top),
+                      (rear_surf, proj_polys_rear), 
                       (side_surf, proj_polys_side), 
                       (fpv_surf, proj_polys_fpv)]
                       
@@ -344,35 +365,30 @@ class MultiCarOrthographicWrapper(gym.Wrapper):
         target_shape = (top_down_img.shape[1], top_down_img.shape[0])
         out_imgs = []
         
-        for surf in [rear_surf, side_surf, fpv_surf]:
+        for surf in [top_surf, rear_surf, side_surf, fpv_surf]:
             img = pygame.surfarray.array3d(surf)
             img = np.transpose(img, (1, 0, 2))
             img_resized = cv2.resize(img, target_shape, interpolation=cv2.INTER_AREA)
             out_imgs.append(img_resized)
             
-        # 6. Ortho depth (DepthCanvas convention), [-1, 1] box coords; flipped / resized like the RGB (nearest)
-        # Top = CarRacing's own render: car-frame point (rx, ry) at (rx * zoom + W/2, ry * zoom + H/4), then a vertical
-        # flip; zoom animates 0.1 * SCALE -> ZOOM * SCALE (0.6 -> 16.2) over the first second. Field, grass and road all
-        # lie at height 0 (field polygon only); then Car.draw() wheels + hull at their top-face heights.
+        # 6. Ortho depth (DepthCanvas convention), [-1, 1] box coords; resized like the RGB (nearest).
+        # Top: the field (height 0) everywhere, then the same horizontal faces as the RGB; height -> Side row, near = up.
+        # Side: right -> Top row (rx * s + H/2), near = left. Rear: forward -> Top col (ry * s + W/2), near = behind.
+        # The ground slab under the field fills the whole Top, so its face below the ground line is the near box face.
         W, H = self.WINDOW_W, self.WINDOW_H
-        zoom = 0.6 * max(1 - base_env.t, 0) + 16.2 * min(base_env.t, 1)
-        to_top = lambda x, y: (((x - car_x) * cos_a - (y - car_y) * sin_a) * zoom + W / 2,
-                               ((x - car_x) * sin_a + (y - car_y) * cos_a) * zoom + H / 4)
         h_box = lambda h: 2 * (self.camera_height - h) * self.scale_factor / H   # height -> Side row; near = up
         canvas = DepthCanvas((W, H))
-        canvas.polygon([to_top(x, y) for x, y in [(PLAYFIELD, PLAYFIELD), (PLAYFIELD, -PLAYFIELD),
-                                                  (-PLAYFIELD, -PLAYFIELD), (-PLAYFIELD, PLAYFIELD)]], h_box(0.0))
-        for obj in base_env.car.drawlist:
-            h = CAR_HEIGHT if obj is base_env.car.hull else WHEEL_HEIGHT
-            for f in obj.fixtures:
-                pygame.draw.polygon(canvas.surf, canvas.color(h_box(h)), [to_top(*(f.body.transform * v)) for v in f.shape.vertices])
-        self.last_depth = [cv2.flip(canvas.read(), 0)]
-        for proj_list, to_box in [(proj_polys_side, lambda d: 2 * d * zoom / W),                               # -rx -> Top col (rx * zoom + W/2), flipped; near = +rx
-                                  (proj_polys_rear, lambda d: 2 * (d - self.camera_dist) * zoom / H - 0.5)]:  # ry + dist -> Top row (3H/4 - ry * zoom), flipped; near = -ry
+        canvas.surf.fill(canvas.color(h_box(0.0)))
+        for h, pts, _, _ in proj_polys_top:
+            canvas.polygon(pts, h_box(h))
+        self.last_depth = [canvas.read()]
+        for proj_list, to_box in [(proj_polys_side, lambda d: 2 * d * top_scale / H),
+                                  (proj_polys_rear, lambda d: 2 * (d - self.camera_dist) * top_scale / W)]:
             canvas = DepthCanvas((W, H))
+            pygame.draw.rect(canvas.surf, canvas.color(-1.0), (0, ground_row, W, H - ground_row))
             for d, pts, _, _ in proj_list:
                 canvas.polygon(pts, to_box(d))
             self.last_depth.append(canvas.read())
         self.last_depth = [cv2.resize(d, target_shape, interpolation=cv2.INTER_NEAREST) for d in self.last_depth]
 
-        return top_down_img, out_imgs[0], out_imgs[1], out_imgs[2]
+        return out_imgs[0], out_imgs[1], out_imgs[2], out_imgs[3]

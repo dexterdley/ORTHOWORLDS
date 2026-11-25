@@ -150,6 +150,10 @@ class Exporter:
     heldout = False          # held-out obstacle-transfer env (ortho/utils.py _build_heldout_registry)
     camera_fix = None        # str: why cam_log() deliberately differs from the wrapper (a GymBox camera bug fix)
     mask_groups = {}         # render_masks() aliases: {"obstacle": ["hurdle", "crate", ...]} (classes or ids)
+    # Per-view fix-ups applied after rendering, to rgb / mask / depth alike, for frames an isotropic Godot ortho camera
+    # cannot produce directly (the shared ortho layout needs some views mirrored or stretched):
+    # {view: {"crop_w": f, "flip": bool}} keeps the central f of the columns (stretched back to full width), then mirrors.
+    view_fix = {}
 
     def __init__(self, **env_kwargs):
         self.env_kwargs = env_kwargs

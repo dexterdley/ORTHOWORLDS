@@ -3,6 +3,7 @@ import os, sys
 import argparse
 import torch, numpy as np
 from tqdm import tqdm
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
@@ -52,8 +53,28 @@ def rotate_3D(xyz, cams):
     fwd   = cy * cp * x - sp * y - sy * cp * z
     return (torch.stack([right, up, fwd], dim=2) / 2).clamp(-1, 1)
 
+def convert_grayscale(views):
+    """ RGB -> grayscale """
+    luma = torch.tensor([0.299, 0.587, 0.114], device=views.device, dtype=views.dtype).view(1, 1, 3, 1, 1)
+    return (views * luma).sum(2, keepdim=True).repeat(1, 1, 3, 1, 1)
+
+class StructureNet(nn.Module):
+    """Small latent-space model: FPV latent at t + prompt (action, camera) -> grayscale structure latent at t+1."""
+    def __init__(self, c=16, width=128, text_dim=4096):
+        super().__init__()
+        self.inp, self.out = nn.Conv2d(c, width, 3, padding=1), nn.Conv2d(width, c, 3, padding=1)
+        self.film = nn.Linear(text_dim, 2 * width)
+        self.blocks = nn.ModuleList(nn.Sequential(nn.GroupNorm(8, width), nn.SiLU(), nn.Conv2d(width, width, 3, padding=d, dilation=d)) for d in (1, 2, 4, 8))
+
+    def forward(self, latents, emb): # (B, C, 1, h, w), (B, L, D) -> (B, C, 1, h, w)
+        scale, shift = self.film(emb.float().mean(1))[..., None, None].chunk(2, dim=1)
+        x = self.inp(latents[:, :, 0].float()) * (1 + scale) + shift
+        for blk in self.blocks:
+            x = x + blk(x)
+        return self.out(x).unsqueeze(2)
+
 @torch.no_grad()
-def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, rollout_steps, steps, shift, seed, camera_pose="Right", use_memory=True):
+def validate_fpv(model, snet, vae, text_encoder, tokenizer, env, agent, env_name, rollout_steps, steps, shift, seed, camera_pose="Right", use_memory=True):
     """
     Autoregressive rollout: Model only sees its own predictions after frame 0 (live env, same protocol as validation.py)
     """
@@ -66,7 +87,7 @@ def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, roll
     views = np.stack([cv2.resize(x, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1) for x in [img_top, im_side, im_rear, im_fpv]])
     views_t = torch.from_numpy(views).float().unsqueeze(0).to(device) / 127.5 - 1.0 # (1, 4, 3, H, W)
     curr_latents = encode_views_to_latents(vae, views_t[:, -1:], out_dtype=model.dtype)
-    gt_frames, pred_frames = [], []
+    gt_frames, pred_frames, struct_frames = [], [], []
 
     if use_memory:
         gt_depth_t = np.stack([cv2.resize(d, (IMG_W, IMG_H), interpolation=cv2.INTER_NEAREST) for d in env.last_depth]).clip(-2, 2) # as data_rollout.py
@@ -90,13 +111,17 @@ def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, roll
         text_inputs = tokenizer(prompts_s, padding="max_length", max_length=128, truncation=True, return_tensors="pt").to(text_encoder.device)
         emb = text_encoder(**text_inputs).last_hidden_state.to(device=device, dtype=model.dtype)
 
-        curr_latents = predict_next_view_latents(model, curr_latents, emb, memory_latents=memory_latents, steps=steps, shift=shift)
+        # curr_latents = predict_next_view_latents(model, curr_latents, emb, memory_latents=memory_latents, steps=steps, shift=shift)
+        structure = snet(curr_latents, emb).to(model.dtype) # 1) structure of t+1, 2) paint the target given it
+        curr_latents = predict_next_view_latents(model, curr_latents, emb, memory_latents=torch.cat([memory_latents, structure], dim=2), steps=steps, shift=shift)
 
         pred = decode_latents_to_views(vae, curr_latents)[:, 0].float() #images
         gt = torch.from_numpy(cv2.resize(next_fpv, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1)).float().unsqueeze(0).to(device) / 255.0
+        pred_struct = decode_latents_to_views(vae, structure)[:, 0].float()
 
         pred_frames.append(pred)
         gt_frames.append(gt)
+        struct_frames.append(pred_struct)
         
         if use_memory and (s + 1) % 4 == 0: # write the frame just reached, every 4th as in training
             views = np.stack([cv2.resize(x, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1) for x in [next_top, next_side, next_rear]])
@@ -107,8 +132,10 @@ def validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, roll
             break
 
     env.close()
-    gt_video, pred_video = torch.stack(gt_frames, dim=1).cpu(), torch.stack(pred_frames, dim=1).cpu()
-    return _psnr(pred_video, gt_video), gt_video, pred_video
+    gt_video = torch.stack(gt_frames, dim=1).cpu()
+    pred_video = torch.stack(pred_frames, dim=1).cpu()
+    struct_video = torch.stack(struct_frames, dim=1).cpu()
+    return _psnr(pred_video, gt_video), gt_video, pred_video, struct_video
 
 
 def main(args):
@@ -156,7 +183,9 @@ def main(args):
     # model, vae, text_encoder, tokenizer = load_model(model_id=args.model_id, lora_rank=args.lora_rank)
     # model.to(device); vae.to(device)
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    snet = DDP(StructureNet(text_dim=text_encoder.config.d_model).to(device), device_ids=[local_rank]) # small structure model
+    #trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_params = [p for p in list(model.parameters()) + list(snet.parameters()) if p.requires_grad]
     optimizer = optim.AdamW(
         trainable_params,
         lr=args.lr,
@@ -165,12 +194,12 @@ def main(args):
     )
 
     total_steps = args.epochs * args.steps_per_epoch
-    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.lr * 0.1)
     warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=200)
     cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - 200, eta_min=args.lr * 0.1)
     scheduler = optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[200])
 
-    run_name = f"main_{'memory_rotate_ddp' if args.use_memory else 'no_mem'}_s{args.seed}"
+    # run_name = f"main_{'memory_rotate_ddp' if args.use_memory else 'no_mem'}_s{args.seed}"
+    run_name = f"main_{'memory_rotate_ddp' if args.use_memory else 'no_mem'}_gray2_s{args.seed}"
     log_dir = f"./runs/{run_name}"
     ckpt_dir = f"./checkpoints/{run_name}"
 
@@ -188,7 +217,6 @@ def main(args):
     # ===============================
     # 3. Main Diffusion Training loop
     # ===============================
-    
     global_step = 0
     for epoch in range(args.epochs):
         model.train()
@@ -210,7 +238,7 @@ def main(args):
             views_next_seq = [v[:,-1 : :] for v in views_next_seq]
             
             total_loss = 0.0
-            avg_per_view = [0.0] * views_t.shape[1]
+            avg_per_view = [0.0, 0.0] * views_t.shape[1]
             curr_latents = encode_views_to_latents(vae, views_t, out_dtype=model.dtype)
             
             # memory = [curr_latents] # Temp Simplest memory (No 3D)
@@ -220,7 +248,10 @@ def main(args):
             # So pass the images into VAE to extract their latents, then build prompt
             for s in range(args.train_seq_len): # Unroll each sample in the training sequence
 
+                struct_views_next_seq = convert_grayscale(views_next_seq[s])
+                struct_latents = encode_views_to_latents(vae, struct_views_next_seq, out_dtype=model.dtype)
                 target_latents = encode_views_to_latents(vae, views_next_seq[s], out_dtype=model.dtype)
+                
                 b, c, num_views, h, w = target_latents.shape
 
                 # Build prompt then tokenize
@@ -233,6 +264,10 @@ def main(args):
                 text_inputs = tokenizer( prompts_s, padding="max_length", max_length=128, truncation=True, return_tensors="pt").to(text_encoder.device)
                 prompt_embeds = text_encoder(**text_inputs).last_hidden_state.to(device=device, dtype=model.dtype)
                 is_last_step = (s == args.train_seq_len - 1)
+
+                # Predict structure
+                pred_struct_latents = snet(curr_latents, prompt_embeds)
+                struct_loss = F.mse_loss(pred_struct_latents, struct_latents.float())
 
                 u = torch.sigmoid(torch.randn(b, 1, 1, 1, 1, device=device))
                 tau = args.shift * u / (1 + (args.shift - 1) * u)
@@ -255,7 +290,8 @@ def main(args):
 
                 _, memory_latents_t = add_diffusion_noise(memory_latents, ctx_lvl)
 
-                combined_latents = torch.cat([cond_latents_t, memory_latents_t, noisy_target_latents], dim=2).to(model.dtype)
+                # combined_latents = torch.cat([cond_latents_t, memory_latents_t, noisy_target_latents], dim=2).to(model.dtype)
+                combined_latents = torch.cat([cond_latents_t, memory_latents_t, pred_struct_latents.detach(), noisy_target_latents], dim=2).to(model.dtype) # Always use
 
                 # 5. Compute GT velocity: v_target = noise - x_0
                 target_velocity = noise - target_latents
@@ -277,13 +313,14 @@ def main(args):
                         F.mse_loss(pred_velocity[:, :, idx], target_velocity[:, :, idx])
                         for idx in range(num_views)
                     ]
-                    loss = sum(per_view_losses)
+                    loss = sum(per_view_losses) + struct_loss
                     scaled_loss = loss / float(args.train_seq_len)
                     scaled_loss.backward()
                 total_loss += scaled_loss.item()
                 
                 for v_idx in range(num_views):
                     avg_per_view[v_idx] += per_view_losses[v_idx].item() / float(args.train_seq_len)
+                avg_per_view[1] += struct_loss.item() / float(args.train_seq_len)
 
                 # 7. Self-forcing step, basically run inference during training and feed its own pred autoregressively
                 if not is_last_step:
@@ -292,7 +329,8 @@ def main(args):
                     if sf_flag.any():
                         with torch.no_grad():
                             pred_latents[sf_flag] = predict_next_view_latents(
-                                model, curr_latents[sf_flag], prompt_embeds[sf_flag], memory_latents=memory_latents[sf_flag], steps=args.diffusion_steps, shift=args.shift)
+                                #model, curr_latents[sf_flag], prompt_embeds[sf_flag], memory_latents=memory_latents[sf_flag], steps=args.diffusion_steps, shift=args.shift)
+                                model, curr_latents[sf_flag], prompt_embeds[sf_flag], memory_latents=torch.cat([memory_latents[sf_flag], pred_struct_latents[sf_flag].detach().to(model.dtype)], dim=2), steps=args.diffusion_steps, shift=args.shift)
                     curr_latents = pred_latents
 
                 # memory.append(curr_latents) # Temp using 3D 
@@ -320,6 +358,7 @@ def main(args):
                 writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
                 writer.add_scalar("Train/SelfForcingProb", curr_self_forcing_prob, global_step)
                 writer.add_scalar("Train/Loss_3D_FPV", float(avg_per_view[0]), global_step)
+                writer.add_scalar("Train/Loss_structure", float(avg_per_view[1]), global_step)
 
         # Validation across VAL_ENVS
         if (epoch + 1) % args.eval_every == 0 and is_main():
@@ -331,11 +370,15 @@ def main(args):
 
                 # Next Validation Autoregressive rollouts
                 clean_tag = env_name.replace(" ", "_").lower()
-                psnr, gt_video, pred_video = validate_fpv(model, vae, text_encoder, tokenizer, env, agent, env_name, args.rollout_video_steps, steps=args.diffusion_steps, shift=args.shift, seed=args.seed + 1000, use_memory=args.use_memory)
+                psnr, gt_video, pred_video, struct_video = validate_fpv(model, snet.module, vae, text_encoder, tokenizer, env, agent, env_name, args.rollout_video_steps, steps=args.diffusion_steps, shift=args.shift, seed=args.seed + 1000, use_memory=args.use_memory)
                 vid_fpv_vis = torch.stack([_annotate_frame_pose(f, "Right") for f in pred_video[0]]).unsqueeze(0) # pose overlay, as validation.py
                 vid_gt_fpv_vis = torch.stack([_annotate_frame_pose(f, "Right") for f in gt_video[0]]).unsqueeze(0)
 
                 writer.add_scalar(f"Validation/{clean_tag}/PSNR/FPV", psnr, epoch + 1)
+                gt_struct = convert_grayscale(gt_video) # GT structure (same luma as training)
+                writer.add_scalar(f"Validation/{clean_tag}/PSNR/Structure", _psnr(struct_video, gt_struct), epoch + 1)
+                writer.add_video(f"Test/{clean_tag}/Structure", torch.cat([gt_struct, struct_video, pred_video], dim=-1), epoch + 1, fps=args.video_fps) # [GT grey | predicted structure | painted RGB]
+
                 print(f"  [Epoch {epoch + 1}] [{env_name}] Autoregressive Video PSNR: FPV: {psnr:.2f}dB")
                 writer.add_video(f"Test/{clean_tag}/FPV", vid_fpv_vis, epoch + 1, fps=args.video_fps)
                 if args.log_gt:
@@ -343,13 +386,14 @@ def main(args):
 
 
             model.save_pretrained(os.path.join(ckpt_dir, f"epoch_{epoch+1}"))
-
+            torch.save(snet.module.state_dict(), os.path.join(ckpt_dir, f"epoch_{epoch+1}", "structure_net.pt"))
         # Keep ranks in step while rank 0 validates / saves
         dist.barrier()
 
     if is_main():
         print("Ending Training")
         model.save_pretrained(os.path.join(ckpt_dir, "final"))
+        torch.save(snet.module.state_dict(), os.path.join(ckpt_dir, "final", "structure_net.pt"))
         writer.close()
 
     dist.barrier()

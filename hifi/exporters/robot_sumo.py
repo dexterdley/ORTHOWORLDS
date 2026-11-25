@@ -5,16 +5,20 @@ A robot's forward (plow side) is its local +y: world heading (-sin a, cos a); it
 (cos a, sin a). Body box 0.8 x 1.0 m, 1.5 m tall; two free-spinning wheels (r 0.25) on revolute
 joints at local (+-0.48, 0); plow box 1.2 x 0.3 m (0.8 m tall) on a motorised hinge at (0, 0.6).
 
-GymBox views (robot_sumo_orthographic.py, 800x600):
-  top   50 px/m, north-up, centred on the player body (plus a crosshair overlay)
-  rear  player frame from behind: screen x = 400 + right * 50, screen y = 400 - 100 z (vertical
-        stretched 2x), painter-sorted by forward depth (nothing is cut away)
-  side  screen x = 400 + forward * 50 from the robot's right, same 2x vertical
+GymBox views (robot_sumo_orthographic.py, 800x600), all in the shared ortho layout (player heading frame):
+  top   50 px/m, forward to the screen right, the robot's right down, centred on the player body
+        (plus a crosshair overlay)
+  rear  player frame from behind: screen x = 400 + right * 66.7 (so it spans the Top's rows),
+        screen y = 400 - 100 z (vertical stretched 2x), painter-sorted by forward depth
+  side  screen x = 400 + forward * 50 from the robot's left (forward still on the screen right, as the
+        shared layout needs), same 2x vertical
   fpv   orbit camera 2 m behind the body along its heading at z = 2.0, looking at the pivot
         (body x, y, 2.0); focal 200 px on 600 (vfov 112.6 deg), near clip 0.1 m; HUD crosshair
 Hi-fi fixes: rear / side are true-scale ortho elevations (50 px/m on both axes, ortho size 12 m)
 with z = 0 kept on row 400 (the centre row is z = 2 m); the cameras sit 7 m out (inside the
 hall), so near objects occlude like GymBox's depth sort. Crosshair overlays are dropped.
+Shared layout (view_fix): the side camera really sits on the robot's left, so its frame is mirrored
+to put forward on the right; the rear frame keeps its central 12 m (the Top's rows) stretched to 800 px.
 Masks: ids "player", "player_plow", "player_wheel0/1" (class "player") and the same with
 "opponent"; ring / hall are unregistered occluders.
 """
@@ -40,6 +44,8 @@ class RobotSumoExporter(Exporter):
     fps = 50
     view_size = (W_PX, H_PX)
     mask_groups = {"robot": ["player", "opponent"]}
+    # rear: keep the Top's row span (H_PX / TOP_PPM m) of its W_PX / ELEV_PPM m width; side: mirror (camera on the left)
+    view_fix = {"rear": {"crop_w": (H_PX / TOP_PPM) / (W_PX / ELEV_PPM)}, "side": {"flip": True}}
 
     def __init__(self, **env_kwargs):
         super().__init__(**env_kwargs)
@@ -94,12 +100,13 @@ class RobotSumoExporter(Exporter):
         look = P_top(px, py, ELEV_ZC)
         cx, cy, cz = env.cam_pos
         return [
-            cam_ortho("top", P_top(px, py, 20.0), P_top(px, py, 0.0), (0.0, 0.0, -1.0), H_PX / TOP_PPM, 1.0, 25.0),
+            # top: heading frame, screen up = the robot's left (so forward is on the screen right, its right down)
+            cam_ortho("top", P_top(px, py, 20.0), P_top(px, py, 0.0), (-rx, 0.0, ry), H_PX / TOP_PPM, 1.0, 25.0),
             # rear: behind the robot looking along its heading (its right on the screen right)
             cam_ortho("rear", P_top(px - fx * CAM_BACK, py - fy * CAM_BACK, ELEV_ZC), look, (0.0, 1.0, 0.0), size, 0.3,
                       CAM_BACK + 30.0),
-            # side: from the robot's right looking left (forward on the screen right)
-            cam_ortho("side", P_top(px + rx * CAM_BACK, py + ry * CAM_BACK, ELEV_ZC), look, (0.0, 1.0, 0.0), size, 0.3,
+            # side: from the robot's left looking right (forward on the screen left; view_fix mirrors it)
+            cam_ortho("side", P_top(px - rx * CAM_BACK, py - ry * CAM_BACK, ELEV_ZC), look, (0.0, 1.0, 0.0), size, 0.3,
                       CAM_BACK + 30.0),
             cam_persp("fpv", P_top(cx, cy, cz), P_top(px, py, env.camera_height), (0.0, 1.0, 0.0),
                       vfov_from_focal(200.0, H_PX), 0.1, 400.0),

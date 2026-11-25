@@ -20,13 +20,56 @@ IMG_H, IMG_W = 224, 224
 
 
 def get_registries(hifi=False):
-    """(train_registry, heldout_registry): GymBox by default, Godot hi-fi with --hifi."""
+    """(train_registry, heldout_registry): GymBox by default, Godot hi-fi with --hifi. The hi-fi envs also render
+    depth, converted to GymBox's env.last_depth after every render, so collect_rollouts stores it like the low-fi."""
     if not hifi:
         return _build_registry(), _build_heldout_registry()
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hifi"))
     from wrappers import build_hifi_registry, build_hifi_heldout_registry
-    return build_hifi_registry(), build_hifi_heldout_registry()
+    aov = ("rgb", "depth")
+    return ([(name, _with_box_depth(make)) for name, make in build_hifi_registry(aov=aov)],
+            [(name, _with_box_depth(make)) for name, make in build_hifi_heldout_registry(aov=aov)])
+
+
+# Each view's depth axis is read along another view's image axis (same layout as lift_ortho / hull_depth)
+_PARTNER = {"top": ("side", "row"), "side": ("top", "row"), "rear": ("top", "col")}
+
+
+def hifi_box_depth(env):
+    """Godot depth dict (metres along each ortho camera's axis, `far` where nothing is hit) -> GymBox-style
+    [top, side, rear]: the surface point's coordinate along the partner view's image axis, in [-1, 1] across that
+    view, 2 where nothing is hit. Not sign-flipped to make -1 = near (DepthCanvas does that): the true coordinate
+    keeps the lifted points where they are when a hi-fi camera sits on the +1 side."""
+    from exporters.base import _basis
+    cams = {c["view"]: c for c in env.exporter.cameras(env.env)}
+    w, h = env.exporter.size                                              # Godot frame (KEEP_HEIGHT: size = height)
+    out = []
+    for v in ("top", "side", "rear"):
+        p, axis = _PARTNER[v]
+        pos_v, fwd_v, _, _ = _basis(cams[v])
+        pos_p, _, right_p, up_p = _basis(cams[p])
+        if axis == "row":                                                 # rows run down: coordinate = -y / half height
+            a, b, half = -(pos_v - pos_p) @ up_p, -(fwd_v @ up_p), cams[p]["size"] / 2
+        else:                                                             # cols run right: coordinate = x / half width
+            a, b, half = (pos_v - pos_p) @ right_p, fwd_v @ right_p, cams[p]["size"] / 2 * w / h
+        d = env.last_depth[v]
+        out.append(np.where(d >= 0.999 * cams[v]["far"], 2.0, (a + b * d) / half).astype(np.float32))
+    return out
+
+
+def _with_box_depth(make):
+    """Wraps a hi-fi env factory so env.last_depth is hifi_box_depth's [top, side, rear] after every render."""
+    def factory():
+        env = make()
+        render = env.render
+        def render_box_depth(*a, **k):
+            out = render(*a, **k)
+            env.last_depth = hifi_box_depth(env)
+            return out
+        env.render = render_box_depth
+        return env
+    return factory
 
 
 def _skip_intro(env, env_name, obs):
