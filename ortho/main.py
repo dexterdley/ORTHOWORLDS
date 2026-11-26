@@ -59,19 +59,21 @@ def convert_grayscale(views):
     return (views * luma).sum(2, keepdim=True).repeat(1, 1, 3, 1, 1)
 
 class StructureNet(nn.Module):
-    """Small latent-space model: FPV latent at t + prompt (action, camera) -> grayscale structure latent at t+1."""
+    """FPV latent at t + grey latent at t + prompt -> grey structure latent at t+1, as grey(t) + change."""
     def __init__(self, c=16, width=128, text_dim=4096):
         super().__init__()
-        self.inp, self.out = nn.Conv2d(c, width, 3, padding=1), nn.Conv2d(width, c, 3, padding=1)
+        self.inp = nn.Conv2d(2 * c, width, 3, padding=1)            # [RGB latent | grey latent] of frame t
+        self.out = nn.Conv2d(width, c, 3, padding=1)
+        nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)  # starts as an exact copy of grey(t)
         self.film = nn.Linear(text_dim, 2 * width)
         self.blocks = nn.ModuleList(nn.Sequential(nn.GroupNorm(8, width), nn.SiLU(), nn.Conv2d(width, width, 3, padding=d, dilation=d)) for d in (1, 2, 4, 8))
 
-    def forward(self, latents, emb): # (B, C, 1, h, w), (B, L, D) -> (B, C, 1, h, w)
+    def forward(self, latents, base, emb):  # (B, C, 1, h, w) x2, (B, L, D) -> (B, C, 1, h, w)
         scale, shift = self.film(emb.float().mean(1))[..., None, None].chunk(2, dim=1)
-        x = self.inp(latents[:, :, 0].float()) * (1 + scale) + shift
+        x = self.inp(torch.cat([latents[:, :, 0], base[:, :, 0]], dim=1).float()) * (1 + scale) + shift
         for blk in self.blocks:
             x = x + blk(x)
-        return self.out(x).unsqueeze(2)
+        return base.float() + self.out(x).unsqueeze(2)
 
 @torch.no_grad()
 def validate_fpv(model, snet, vae, text_encoder, tokenizer, env, agent, env_name, rollout_steps, steps, shift, seed, camera_pose="Right", use_memory=True):
@@ -87,6 +89,7 @@ def validate_fpv(model, snet, vae, text_encoder, tokenizer, env, agent, env_name
     views = np.stack([cv2.resize(x, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1) for x in [img_top, im_side, im_rear, im_fpv]])
     views_t = torch.from_numpy(views).float().unsqueeze(0).to(device) / 127.5 - 1.0 # (1, 4, 3, H, W)
     curr_latents = encode_views_to_latents(vae, views_t[:, -1:], out_dtype=model.dtype)
+    curr_struct = encode_views_to_latents(vae, convert_grayscale(views_t[:, -1:]), out_dtype=model.dtype)
     gt_frames, pred_frames, struct_frames = [], [], []
 
     if use_memory:
@@ -111,9 +114,9 @@ def validate_fpv(model, snet, vae, text_encoder, tokenizer, env, agent, env_name
         text_inputs = tokenizer(prompts_s, padding="max_length", max_length=128, truncation=True, return_tensors="pt").to(text_encoder.device)
         emb = text_encoder(**text_inputs).last_hidden_state.to(device=device, dtype=model.dtype)
 
-        # curr_latents = predict_next_view_latents(model, curr_latents, emb, memory_latents=memory_latents, steps=steps, shift=shift)
-        structure = snet(curr_latents, emb).to(model.dtype) # 1) structure of t+1, 2) paint the target given it
+        structure = snet(curr_latents, curr_struct, emb).to(model.dtype)
         curr_latents = predict_next_view_latents(model, curr_latents, emb, memory_latents=torch.cat([memory_latents, structure], dim=2), steps=steps, shift=shift)
+        curr_struct = structure
 
         pred = decode_latents_to_views(vae, curr_latents)[:, 0].float() #images
         gt = torch.from_numpy(cv2.resize(next_fpv, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA).transpose(2, 0, 1)).float().unsqueeze(0).to(device) / 255.0
@@ -240,7 +243,8 @@ def main(args):
             total_loss = 0.0
             avg_per_view = [0.0, 0.0] * views_t.shape[1]
             curr_latents = encode_views_to_latents(vae, views_t, out_dtype=model.dtype)
-            
+            curr_struct = encode_views_to_latents(vae, convert_grayscale(views_t), out_dtype=model.dtype)
+
             # memory = [curr_latents] # Temp Simplest memory (No 3D)
             # memory = [guided_latents] if args.use_memory else [curr_latents[:, :, :0]]
             memory_latents = curr_latents[:, :, :0]
@@ -266,7 +270,7 @@ def main(args):
                 is_last_step = (s == args.train_seq_len - 1)
 
                 # Predict structure
-                pred_struct_latents = snet(curr_latents, prompt_embeds)
+                pred_struct_latents = snet(curr_latents, curr_struct, prompt_embeds)
                 struct_loss = F.mse_loss(pred_struct_latents, struct_latents.float())
 
                 u = torch.sigmoid(torch.randn(b, 1, 1, 1, 1, device=device))
@@ -275,6 +279,7 @@ def main(args):
 
                 # Add diffusion noise
                 _, cond_latents_t = add_diffusion_noise(curr_latents, ctx_lvl)
+                _, noisy_pred_struct_latents = add_diffusion_noise(curr_latents, ctx_lvl)
                 noise, noisy_target_latents = add_diffusion_noise(target_latents, tau)
 
                 # Memory
@@ -291,7 +296,7 @@ def main(args):
                 _, memory_latents_t = add_diffusion_noise(memory_latents, ctx_lvl)
 
                 # combined_latents = torch.cat([cond_latents_t, memory_latents_t, noisy_target_latents], dim=2).to(model.dtype)
-                combined_latents = torch.cat([cond_latents_t, memory_latents_t, pred_struct_latents.detach(), noisy_target_latents], dim=2).to(model.dtype) # Always use
+                combined_latents = torch.cat([cond_latents_t, memory_latents_t, noisy_pred_struct_latents.detach(), noisy_target_latents], dim=2).to(model.dtype) # Always use
 
                 # 5. Compute GT velocity: v_target = noise - x_0
                 target_velocity = noise - target_latents
@@ -326,12 +331,16 @@ def main(args):
                 if not is_last_step:
                     sf_flag = torch.rand(b, device=curr_latents.device) < curr_self_forcing_prob
                     pred_latents = target_latents.clone()
+                    next_struct = struct_latents.clone()
                     if sf_flag.any():
                         with torch.no_grad():
                             pred_latents[sf_flag] = predict_next_view_latents(
-                                #model, curr_latents[sf_flag], prompt_embeds[sf_flag], memory_latents=memory_latents[sf_flag], steps=args.diffusion_steps, shift=args.shift)
-                                model, curr_latents[sf_flag], prompt_embeds[sf_flag], memory_latents=torch.cat([memory_latents[sf_flag], pred_struct_latents[sf_flag].detach().to(model.dtype)], dim=2), steps=args.diffusion_steps, shift=args.shift)
+                                model, curr_latents[sf_flag], prompt_embeds[sf_flag], 
+                                memory_latents=torch.cat([memory_latents[sf_flag], pred_struct_latents[sf_flag].detach().to(model.dtype)], dim=2),
+                                steps=args.diffusion_steps, shift=args.shift)
+                        next_struct[sf_flag] = pred_struct_latents[sf_flag].detach().to(model.dtype)
                     curr_latents = pred_latents
+                    curr_struct = next_struct
 
                 # memory.append(curr_latents) # Temp using 3D 
 
@@ -377,16 +386,16 @@ def main(args):
                 writer.add_scalar(f"Validation/{clean_tag}/PSNR/FPV", psnr, epoch + 1)
                 gt_struct = convert_grayscale(gt_video) # GT structure (same luma as training)
                 writer.add_scalar(f"Validation/{clean_tag}/PSNR/Structure", _psnr(struct_video, gt_struct), epoch + 1)
-                writer.add_video(f"Test/{clean_tag}/Structure", torch.cat([gt_struct, struct_video, pred_video], dim=-1), epoch + 1, fps=args.video_fps) # [GT grey | predicted structure | painted RGB]
+                writer.add_video(f"Test/{clean_tag}/Structure", struct_video, epoch + 1, fps=args.video_fps) # predicted struct
 
                 print(f"  [Epoch {epoch + 1}] [{env_name}] Autoregressive Video PSNR: FPV: {psnr:.2f}dB")
                 writer.add_video(f"Test/{clean_tag}/FPV", vid_fpv_vis, epoch + 1, fps=args.video_fps)
                 if args.log_gt:
                     writer.add_video(f"GT/{clean_tag}/FPV", vid_gt_fpv_vis, epoch + 1, fps=args.video_fps)
 
-
             model.save_pretrained(os.path.join(ckpt_dir, f"epoch_{epoch+1}"))
             torch.save(snet.module.state_dict(), os.path.join(ckpt_dir, f"epoch_{epoch+1}", "structure_net.pt"))
+        
         # Keep ranks in step while rank 0 validates / saves
         dist.barrier()
 
