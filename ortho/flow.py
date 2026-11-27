@@ -151,7 +151,7 @@ def train_ortho_trajectory_step(
     return total_loss, avg_per_view
 
 @torch.no_grad()
-def predict_next_view_latents(transformer, latents_t, prompt_embeds, memory_latents=None, steps=20, shift=3.0):
+def predict_next_view_latents(transformer, latents_t, prompt_embeds, memory_latents=None, steps=20, shift=3.0, residual=False):
     """
     Simultaneously denoises all 4 orthographic views at t+1 via reverse Euler Flow Matching.
     Input:
@@ -164,6 +164,8 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, memory_late
 
     # Keep Euler state in float32 to prevent bfloat16 rounding stagnation
     x_tau = torch.randn((b, c, num_views, h, w), device=latents_t.device, dtype=torch.float32)
+    if residual:
+        x_tau = x_tau + latents_t.float()
 
     # Shifted timestep schedule from 1.0 -> 0.0
     sigmas = torch.linspace(1.0, 0.0, steps + 1, device=latents_t.device, dtype=torch.float32)
@@ -188,48 +190,6 @@ def predict_next_view_latents(transformer, latents_t, prompt_embeds, memory_late
         ).sample[:, :, -num_views:].float()  # (B, C, 4, h, w)
         x_tau = x_tau - dt * pred_velocity
     return x_tau.to(dtype=transformer.dtype)
-
-@torch.no_grad()
-def predict_next_view_residual_latents(transformer, latents_t, prompt_embeds, memory_latents=None, steps=20, shift=3.0, state=None, delta_scale=None):
-    """
-    Residual delta + LSTM-style state: the flow generates the change (next - current) / delta_scale, conditioned on
-    [current | memory | motion state], and the result is current + delta_scale * change.
-    Input:
-      latents_t: (B, C, 1, h, w) - clean FPV latent at time t
-      state:     (B, C, 1, h, w) - motion state from MotionGRU
-    Output:
-      latents_next: (B, C, 1, h, w) - predicted FPV latent at time t+1
-    """
-    b, c, num_views, h, w = latents_t.shape
-    latents_t = latents_t.to(dtype=transformer.dtype)
-
-    # Keep Euler state in float32 to prevent bfloat16 rounding stagnation
-    x_tau = torch.randn((b, c, num_views, h, w), device=latents_t.device, dtype=torch.float32)
-
-    # Shifted timestep schedule from 1.0 -> 0.0
-    sigmas = torch.linspace(1.0, 0.0, steps + 1, device=latents_t.device, dtype=torch.float32)
-    sigmas = (shift * sigmas) / (1.0 + (shift - 1.0) * sigmas)
-
-    for step_i in range(steps):
-        sigma_curr = sigmas[step_i]
-        sigma_next = sigmas[step_i + 1]
-        dt = sigma_curr - sigma_next
-
-        t_tensor = torch.full((b,), sigma_curr * 1000.0, device=latents_t.device, dtype=transformer.dtype)
-
-        if memory_latents is None:
-            combined = torch.cat([latents_t, x_tau.to(dtype=transformer.dtype)], dim=2)
-        else:
-            combined = torch.cat([latents_t, memory_latents, x_tau.to(dtype=transformer.dtype)], dim=2)
-
-        pred_velocity = transformer(
-            hidden_states=combined,
-            timestep=t_tensor,
-            encoder_hidden_states=prompt_embeds,
-        ).sample[:, :, -num_views:].float()  # (B, C, 4, h, w)
-        x_tau = x_tau - dt * pred_velocity
-    return x_tau.to(dtype=transformer.dtype)
-
 
 @torch.no_grad()
 def predict_next_view_latents_sketch(transformer, latents_t, prompt_embeds, cam, steps=20, shift=3.0):

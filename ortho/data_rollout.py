@@ -226,4 +226,8 @@ class ReplayEnv:
         self.started = True
         top, side, rear, fpv = np.ascontiguousarray(v.transpose(0, 2, 3, 1))   # buffer order is top, side, rear, fpv
         return top, rear, side, fpv
+    @property
+    def last_depth(self):
+        """Cached depth of the frame render() last returned, as env.last_depth ([top, side, rear])."""
+        return [d.astype(np.float32) for d in self.buf.camera_states[min(self.i, self.buf.size - 1)]["depth"]]
     def close(self): pass
